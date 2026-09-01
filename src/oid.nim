@@ -111,12 +111,6 @@ func matches*(p: OidPrefix, o: Oid): bool =
     if (o.b[whole] and 0xF0'u8) != p.b[whole]: return false
   true
 
-func isFull*(p: OidPrefix): bool = p.nybbles == OidHexLen
-
-func toOid*(p: OidPrefix): Oid =
-  ## Only meaningful for a full-length prefix.
-  result.b = p.b
-
 func lowerBound*(p: OidPrefix): Oid =
   ## The smallest OID the abbreviation can name; the pack index binary-searches
   ## from here.
@@ -125,13 +119,3 @@ func lowerBound*(p: OidPrefix): Oid =
 func toOid*(d: Sha1Digest): Oid =
   for i in 0 ..< OidLen: result.b[i] = d[i]
 
-func toDigest*(o: Oid): Sha1Digest =
-  for i in 0 ..< OidLen: result[i] = o.b[i]
-
-func readOid*(buf: openArray[byte], at: int): Oid =
-  ## Pull 20 raw bytes out of a buffer.
-  for i in 0 ..< OidLen: result.b[i] = buf[at + i]
-
-func toBytes*(o: Oid): string =
-  result = newString(OidLen)
-  for i in 0 ..< OidLen: result[i] = char(o.b[i])

@@ -69,55 +69,61 @@ proc discoverGitDir(startDir: string): tuple[gitDir, workTree: string] =
 
 # -- the extension gate (plan.md 6.1) ---------------------------------------
 
+const
+  anyValue = ""    ## the extension is understood whatever it is set to
+  noValue = "\x00" ## understood, but no value of it is one gittle can honor
+
+  knownExtensions = [
+    # name                  the one value gittle accepts, and why not otherwise
+    ("noop",               anyValue, ""),
+    ("preciousobjects",    anyValue, ""),  # honored by gc, which never deletes
+    ("worktreeconfig",     anyValue, ""),  # supported; no on-disk format changes
+    ("relativeworktrees",  anyValue, ""),  # likewise
+    ("objectformat",       "sha1",
+      "gittle implements SHA-1 only (plan.md R4)."),
+    ("refstorage",         "files",
+      "gittle supports only the 'files' ref backend.\n" &
+      "  Convert with real git:  git refs migrate --ref-format=files\n" &
+      "  (that command cannot migrate a repository that has worktrees)"),
+    ("compatobjectformat", noValue,
+      "gittle cannot read a dual-hash repository."),
+    ("partialclone",       noValue,
+      "gittle has no promisor remotes; every object must be present."),
+    ("submodulepathconfig", noValue,
+      "gittle does not support submodules."),
+  ]
+    ## The gate, as a table.  `worktreeConfig` and `relativeWorktrees` matter
+    ## more than they look: a naive "refuse anything listed" gate would reject
+    ## a perfectly ordinary repository because someone once ran
+    ## `git config --worktree`.
+
 proc gateRefusal(key, value, why: string): string =
-  result = "cannot operate on this repository\n"
-  result.add "  " & key & " = " & value & "\n"
-  result.add "  " & why
+  "cannot operate on this repository\n  " & key & " = " & value & "\n  " & why
 
 proc checkExtensions(r: Repository) =
   ## `Documentation/technical/repository-version.adoc` is explicit: an
   ## implementation that does not understand a listed extension key *or its
   ## value* MUST NOT operate on the repository.  Refusing is the specified
-  ## behavior, so the gate is general rather than a reftable special case.
+  ## behavior, so the gate is general rather than a reftable special case --
+  ## which costs about the same and also handles every extension git adds later.
   let version = r.cfg.getInt("core.repositoryFormatVersion", 0)
-  if version > 1:
-    fail(gateRefusal("core.repositoryFormatVersion", $version,
-      "gittle understands repository format versions 0 and 1."))
+  failIf(version > 1, gateRefusal("core.repositoryFormatVersion", $version,
+    "gittle understands repository format versions 0 and 1."))
 
   for e in r.cfg.withPrefix("extensions"):
     let name = e.key[len("extensions.") .. ^1].toLowerAscii
-    let v = e.value.toLowerAscii
-    # `noop` and `preciousObjects` are respected at any format version; every
-    # other extension is only meaningful at version 1.
-    case name
-    of "noop":
-      discard
-    of "preciousobjects":
-      discard  # honored by gc, which never deletes when it is set
-    of "objectformat":
-      if v != "sha1":
-        fail(gateRefusal(e.key, e.value,
-          "gittle implements SHA-1 only (plan.md R4)."))
-    of "refstorage":
-      if v != "files":
-        fail(gateRefusal(e.key, e.value,
-          "gittle supports only the 'files' ref backend.\n" &
-          "  Convert with real git:  git refs migrate --ref-format=files\n" &
-          "  (that command cannot migrate a repository that has worktrees)"))
-    of "worktreeconfig", "relativeworktrees":
-      discard  # both supported; neither changes an on-disk format
-    of "compatobjectformat":
-      fail(gateRefusal(e.key, e.value,
-        "gittle cannot read a dual-hash repository."))
-    of "partialclone":
-      fail(gateRefusal(e.key, e.value,
-        "gittle has no promisor remotes; every object must be present."))
-    of "submodulepathconfig":
-      fail(gateRefusal(e.key, e.value, "gittle does not support submodules."))
-    else:
-      if version >= 1:
-        fail(gateRefusal(e.key, e.value,
-          "gittle does not know this repository extension."))
+    var known = false
+    for (n, accept, why) in knownExtensions:
+      if n != name: continue
+      known = true
+      # `noop` and `preciousObjects` are respected at any format version; the
+      # rest are only meaningful at version 1, but refusing a value we cannot
+      # honor is right either way.
+      failIf(accept != anyValue and accept != e.value.toLowerAscii,
+             gateRefusal(e.key, e.value, why))
+      break
+    failIf(not known and version >= 1, gateRefusal(e.key, e.value,
+      "gittle does not know this repository extension."))
 
 # -- opening ----------------------------------------------------------------
 
@@ -268,8 +274,8 @@ proc refs*(r: Repository): RefStore =
 proc headRefName*(r: Repository): string =
   ## The branch HEAD names, whether or not it exists yet.  In a repository with
   ## no commits this is the branch a first commit would create.
-  let (found, rf) = r.refs.readRef(headRef)
-  if found and rf.isSymbolic: rf.symTarget else: headRef
+  let rf = r.refs.readRef(headRef)
+  if rf.found and rf.isSymbolic: rf.symTarget else: headRef
 
 proc resolveOid*(r: Repository, name: string): Oid =
   ## Turn a name into an object ID, in git's order of preference:
@@ -294,26 +300,21 @@ proc resolveOid*(r: Repository, name: string): Oid =
          "not a valid object name: " & name)
 
   var found: seq[Oid]
-  # Loose objects live in fan-out directories named by the first byte, so a
-  # prefix of one nybble has to look in sixteen of them.
+  # Loose objects sit in fan-out directories named by their first byte, so a
+  # one-nybble abbreviation has to look in sixteen of them and any longer one
+  # in exactly one.  `walkDir` on a directory that is not there yields nothing.
   let hex = ($pre.lowerBound)[0 ..< pre.nybbles]
+  var subdirs: seq[string]
+  if pre.nybbles == 1:
+    for n in "0123456789abcdef": subdirs.add hex & n
+  else:
+    subdirs.add hex[0 ..< 2]
   for d in r.objDirs:
-    if pre.nybbles == 1:
-      for n in 0 .. 15:
-        let sub = d / (hex & "0123456789abcdef"[n])
-        if not dirExists(sub): continue
-        for kind, path in walkDir(sub):
-          var o: Oid
-          if tryParseOid(sub.lastPathPart & path.lastPathPart, o) and
-             pre.matches(o) and o notin found:
-            found.add o
-    else:
-      let sub = d / hex[0 ..< 2]
-      if not dirExists(sub): continue
-      for kind, path in walkDir(sub):
+    for sub in subdirs:
+      for _, path in walkDir(d / sub):
         var o: Oid
-        if tryParseOid(hex[0 ..< 2] & path.lastPathPart, o) and
-           pre.matches(o) and o notin found:
+        if tryParseOid(sub & path.lastPathPart, o) and pre.matches(o) and
+           o notin found:
           found.add o
   r.loadPacks()
   for p in r.packs:

@@ -120,10 +120,3 @@ func matchFrom(pat: string, pi: int, s: string, si: int,
 func globMatch*(pattern, s: string, flags: set[GlobFlag] = {}): bool =
   ## Does `s` match `pattern` in full?
   matchFrom(pattern, 0, s, 0, flags)
-
-func hasGlobChars*(s: string): bool =
-  ## Is there any wildcard here at all?  Callers use this to take a cheaper
-  ## path -- a literal prefix comparison -- when there is nothing to match.
-  for c in s:
-    if c in {'*', '?', '[', '\\'}: return true
-  false

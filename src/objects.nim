@@ -45,9 +45,6 @@ func parseObjectType*(s: string): ObjectType =
 
 func isDelta*(t: ObjectType): bool = t == otOfsDelta or t == otRefDelta
 
-func isRealType*(t: ObjectType): bool =
-  t in {otCommit, otTree, otBlob, otTag}
-
 func packTypeFromInt*(n: int): ObjectType =
   case n
   of 1: otCommit
@@ -104,9 +101,6 @@ const maxLooseHeader = 64
 func loosePath*(objdir: string, o: Oid): string =
   let h = $o
   objdir / h[0 ..< 2] / h[2 ..< OidHexLen]
-
-proc looseExists*(objdir: string, o: Oid): bool =
-  fileExists(loosePath(objdir, o))
 
 proc readLooseHeaderAt*(path: string): tuple[kind: ObjectType, size: int] =
   ## Type and size without inflating the body -- what `cat-file -t` and `-s`

@@ -33,6 +33,40 @@ proc fail*(msg: string) {.noreturn.} =
 proc failIf*(cond: bool, msg: string) {.inline.} =
   if cond: fail(msg)
 
+proc interpolate*(format: string, atom: proc (name: string): string): string =
+  ## Expand a git-style format string.
+  ##
+  ## Three things are recognised, and they are the same three wherever git
+  ## takes a `--format`: `%(name)` calls `atom`, `%%` is a literal per cent, and
+  ## `%xx` is a byte written as two hex digits -- which is how a format string
+  ## carries a tab or a NUL through a shell that would otherwise eat it.
+  var i = 0
+  while i < format.len:
+    if format[i] != '%':
+      result.add format[i]
+      inc i
+    elif i + 1 < format.len and format[i+1] == '%':
+      result.add '%'
+      i += 2
+    elif i + 1 < format.len and format[i+1] == '(':
+      let close = format.find(')', i + 2)
+      failIf(close < 0, "unterminated %( in format string")
+      result.add atom(format[i+2 ..< close])
+      i = close + 1
+    else:
+      failIf(i + 2 >= format.len, "unterminated % in format string")
+      var v = 0
+      for c in format[i+1 .. i+2]:
+        let d = case c
+                of '0'..'9': ord(c) - ord('0')
+                of 'a'..'f': ord(c) - ord('a') + 10
+                of 'A'..'F': ord(c) - ord('A') + 10
+                else: -1
+        failIf(d < 0, "bad %-escape '%" & format[i+1 .. i+2] & "' in format string")
+        v = v * 16 + d
+      result.add char(v)
+      i += 3
+
 proc readWholeFile*(path: string): string =
   ## Like `readFile`, but reports the path when it fails.
   try:
@@ -64,8 +98,3 @@ proc writeFileAtomic*(path, data: string, mode: int = 0o444) =
   except CatchableError:
     removeFile(tmp)
     raise
-
-proc isHexDigits*(s: string): bool =
-  for c in s:
-    if c notin HexDigits: return false
-  s.len > 0

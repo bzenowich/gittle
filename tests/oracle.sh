@@ -518,32 +518,77 @@ check "both reflogs recorded it" "1 1" \
 git -C "$REFS" update-ref HEAD "$H"
 report "update-ref" "write, CAS, delete, deref, validation"
 
-# --stdin is a transaction: all of it happens, or none of it does.
-printf 'create refs/heads/t1 %s\nupdate refs/heads/t2 %s\n' "$H" "$H" \
-  | "$GITTLE" -C "$REFS" update-ref --stdin
-check "--stdin applied the batch" "$H $H" \
-  "$(git -C "$REFS" rev-parse refs/heads/t1 refs/heads/t2 | tr '\n' ' ' | sed 's/ $//')"
-printf 'create refs/heads/t3 %s\ncreate refs/heads/t1 %s\n' "$H" "$H" \
-  | "$GITTLE" -C "$REFS" update-ref --stdin >/dev/null 2>&1 \
-  && bad "--stdin should fail on a duplicate create" || ok
-git -C "$REFS" rev-parse refs/heads/t3 >/dev/null 2>&1 \
-  && bad "--stdin left a ref behind after failing" || ok
-printf 'verify refs/heads/t1 %s\ndelete refs/heads/t2\n' "$H" \
-  | "$GITTLE" -C "$REFS" update-ref --stdin
-git -C "$REFS" rev-parse refs/heads/t2 >/dev/null 2>&1 \
-  && bad "--stdin delete did nothing" || ok
-printf 'verify refs/heads/t1 %s\n' "$H1" \
-  | "$GITTLE" -C "$REFS" update-ref --stdin >/dev/null 2>&1 \
-  && bad "--stdin verify should fail on the wrong value" || ok
-# -z: the same batch, NUL-separated
-printf 'update refs/heads/t4\0%s\0\0' "$H" \
-  | "$GITTLE" -C "$REFS" update-ref -z --stdin
-check "--stdin -z" "$H" "$(git -C "$REFS" rev-parse refs/heads/t4)"
-printf 'symref-update refs/heads/sym\0refs/heads/t1\0' \
-  | "$GITTLE" -C "$REFS" update-ref -z --stdin
-check "--stdin symref-update" "refs/heads/t1" \
-  "$(git -C "$REFS" symbolic-ref refs/heads/sym)"
-report "update-ref --stdin" "transaction, verify, -z, symref"
+# --stdin: run the identical command stream through git and through gittle and
+# require the same exit status, the same stdout, and the same refs afterwards.
+# Comparing against git rather than against a hand-written expectation is what
+# caught `symref-update` dereferencing, `option no-deref` being mandatory for
+# two verbs, and `start` without `commit` meaning abort.
+STDIN_A="$WORK/stdin-git"; STDIN_B="$WORK/stdin-gittle"
+mk_stdin_repo() {  # a fixed date, so both copies get the same commit ID
+  rm -rf "$1"; git init -q "$1"
+  ( cd "$1" && echo a > f && git add f \
+    && GIT_COMMITTER_DATE='1700000000 +0000' GIT_AUTHOR_DATE='1700000000 +0000' \
+       git commit -qm one \
+    && git branch b1 && git branch b2 \
+    && git symbolic-ref refs/heads/s refs/heads/b1 ) >/dev/null 2>&1
+}
+mk_stdin_repo "$WORK/stdin-seed"
+SH=$(git -C "$WORK/stdin-seed" rev-parse HEAD)
+
+stdin_ok=1; nstdin=0
+try_stdin() {  # try_stdin <stream> <flags> <name>
+  mk_stdin_repo "$STDIN_A"; mk_stdin_repo "$STDIN_B"; nstdin=$((nstdin+1))
+  printf "$1" > "$WORK/stream"
+  git -C "$STDIN_A" update-ref $2 --stdin < "$WORK/stream" \
+    > "$WORK/out.git" 2>/dev/null; ea=$?
+  "$GITTLE" -C "$STDIN_B" update-ref $2 --stdin < "$WORK/stream" \
+    > "$WORK/out.gittle" 2>/dev/null; eb=$?
+  ra=$(git -C "$STDIN_A" for-each-ref --format='%(refname) %(objectname) %(symref)')
+  rb=$(git -C "$STDIN_B" for-each-ref --format='%(refname) %(objectname) %(symref)')
+  if [ "$ea" != "$eb" ] || [ "$ra" != "$rb" ] || \
+     ! cmp -s "$WORK/out.git" "$WORK/out.gittle"; then
+    stdin_ok=0
+    printf '  %-40s git=%s gittle=%s\n' "$3" "$ea" "$eb"
+    diff <(echo "$ra") <(echo "$rb") | head -4
+    diff "$WORK/out.git" "$WORK/out.gittle" | head -3
+  fi
+}
+try_stdin "update refs/heads/b1 $SH\n" "" "update"
+try_stdin "update refs/heads/b2 $SH $SH\n" "" "update with old"
+try_stdin "update refs/heads/b1 $SH 0000000000000000000000000000000000000000\n" "" "old=null"
+try_stdin "delete refs/heads/b1\n" "" "delete"
+try_stdin "delete refs/heads/nope\n" "" "delete missing"
+try_stdin 'update refs/heads/b1 ""\n' "" "empty new value is a delete"
+try_stdin "update refs/heads/b1 $SH \"\"\n" "" "empty old value"
+try_stdin "create refs/heads/new $SH\n" "" "create"
+try_stdin "create refs/heads/b1 $SH\n" "" "create existing"
+try_stdin "verify refs/heads/b1 $SH\n" "" "verify"
+try_stdin "verify refs/heads/b1\n" "" "verify with no value"
+try_stdin "bogus x\n" "" "unknown command"
+try_stdin "start\nupdate refs/heads/b1 $SH\ncommit\n" "" "start/commit"
+try_stdin "start\nupdate refs/heads/new $SH\n" "" "start without commit aborts"
+try_stdin "start\nupdate refs/heads/new $SH\nabort\n" "" "start/abort"
+try_stdin "start\nstart\n" "" "double start"
+try_stdin "prepare\nupdate refs/heads/b1 $SH\n" "" "update after prepare"
+try_stdin "update refs/heads/new $SH\nprepare\ncommit\n" "" "prepare then commit"
+try_stdin "commit\nupdate refs/heads/b1 $SH\n" "" "command after commit"
+try_stdin "commit\nstart\nupdate refs/heads/new $SH\ncommit\n" "" "new transaction after commit"
+try_stdin "option no-deref\nsymref-delete refs/heads/s\n" "" "no-deref + symref-delete"
+try_stdin "symref-delete refs/heads/s\n" "" "symref-delete needs no-deref"
+try_stdin "option bogus\n" "" "unknown option"
+try_stdin "option no-deref\nupdate refs/heads/s $SH\n" "" "no-deref update on a symref"
+try_stdin "symref-update refs/heads/s refs/heads/b2\n" "" "symref-update dereferences"
+try_stdin "option no-deref\nsymref-update refs/heads/s refs/heads/b2\n" "" "no-deref symref-update"
+try_stdin "symref-create refs/heads/ns refs/heads/b2\n" "" "symref-create"
+try_stdin "update refs/heads/b1\0$SH\0\0" -z "z: empty old value"
+try_stdin "update refs/heads/b1\0$SH\0" -z "z: missing old record"
+try_stdin "update refs/heads/b1\0\0\0" -z "z: empty new value"
+try_stdin "delete refs/heads/b1\0\0" -z "z: delete"
+try_stdin "symref-create refs/heads/n\0refs/heads/b1\0" -z "z: symref-create"
+try_stdin "symref-update refs/heads/s\0refs/heads/b2\0" -z "z: symref-update"
+try_stdin "option no-deref\0symref-verify refs/heads/s\0refs/heads/b1\0" -z "z: symref-verify"
+[ $stdin_ok = 1 ] && { ok; report "update-ref --stdin" "$nstdin streams match git exactly"; } \
+                  || bad "update-ref --stdin"
 
 # A held lock must stop a second writer rather than corrupt the ref.
 touch "$REFS/.git/refs/heads/t1.lock"

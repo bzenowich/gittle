@@ -46,11 +46,11 @@ proc cmdSymbolicRef*(c: Ctx, args: seq[string]): int =
 
   if del:
     failIf(rest.len != 1, usageText)
-    let (found, r) = store.readRef(rest[0])
-    if not found or not r.isSymbolic:
+    let r = store.readRef(rest[0])
+    if not r.found or not r.isSymbolic:
       # `-q` is about a ref that is not symbolic; a ref that does not exist at
       # all is still an error, the same as git's.
-      failIf(not found, "cannot delete '" & rest[0] & "': no such ref")
+      failIf(not r.found, "cannot delete '" & rest[0] & "': no such ref")
       if quiet: return 1
       fail("cannot delete '" & rest[0] & "': not a symbolic ref")
     store.deleteRef(rest[0], noDeref = true)
@@ -67,8 +67,8 @@ proc cmdSymbolicRef*(c: Ctx, args: seq[string]): int =
     return 0
 
   failIf(rest.len != 1, usageText)
-  let (found, r) = store.readRef(rest[0])
-  if not found or not r.isSymbolic:
+  let r = store.readRef(rest[0])
+  if not r.found or not r.isSymbolic:
     # Not a symbolic ref: exit 1 silently under `-q`, complain otherwise.  A
     # detached HEAD is exactly this case, which is why `-q` exists.
     if quiet: return 1

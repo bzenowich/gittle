@@ -172,34 +172,90 @@ reason to reject it — and the result was a repository `git fsck` calls broken.
 The check needs the object database, which `refs.nim` deliberately does not
 depend on, so it arrives as a callback the way the identity does.
 
+## The minimization pass
+
+After both phases were passing, the code was reviewed against
+`msgpack-coap-example.c`: twenty thousand lines of MessagePack and CoAP library
+reduced to about a hundred, by writing code shaped like the bytes on the wire
+rather than like the library's API, and by collapsing families of near-identical
+cases into a table.
+
+The line count went from 2,841 to 2,753 — but the reduction was about 125 lines,
+because the same pass *added* 40 to `update-ref` by fixing what it found. That
+is the real result: **six compatibility bugs, all in `update-ref --stdin`, all
+of them things the documented grammar does not say.**
+
+| What git actually does | What gittle did |
+|---|---|
+| `symref-update` **dereferences** — on a symbolic ref it rewrites what that ref points at, not the ref | rewrote the ref itself |
+| `symref-delete` and `symref-verify` **require** a preceding `option no-deref` | accepted them without it |
+| `start` with no `commit` **aborts** at end of input | committed |
+| `start`, `prepare`, `commit` and `abort` each print `<verb>: ok` on stdout | printed nothing |
+| An update to the null object ID is a **delete** | refused it as invalid |
+| With `-z`, a *missing* old-value record is an error and an *empty* one means "unspecified"; without `-z` an empty one means "must not exist" | treated all three the same |
+
+Every one of these was found the same way: by feeding an identical command
+stream to git and to gittle and comparing exit status, stdout and the resulting
+refs — not by re-reading the documentation. `tests/oracle.sh` now does that over
+34 streams, which replaced five hand-written assertions that had agreed with a
+misreading.
+
+Two other defects fell out of the same review:
+
+* **`ZlibError` was not a `GittleError`,** so a corrupt packfile would have
+  produced a Nim traceback instead of `gittle: truncated zlib stream`. It is
+  gone; `zlib.nim` uses the same `fail` as everything else.
+* **`allRefs` was quadratic** — it kept the names it had seen in a `seq` and
+  searched it linearly. Fine for ten refs, not for the ten thousand tags a
+  large repository has.
+
+What actually shrank, and why:
+
+* **Three inflate loops became one** with two knobs (`limit`, `drain`). 55 lines
+  to 30.
+* **The repository extension gate became a table** of name, accepted value and
+  refusal text. The nine-branch `case` is now a nine-line array and a six-line
+  loop, and adding an extension git invents later is one row.
+* **`update-ref`'s eight commands became a table** of what each takes and does.
+  Reading the grammar no longer means reconstructing it from nested
+  conditionals — and it is what made the `-z` record-counting bug visible.
+* **`config.nim` scans lines once**, for both the reader and the writer. They
+  had been two walks over the same syntax, which is exactly how a variable the
+  reader sees and the writer misses turns into a silent duplicate.
+* **`for-each-ref` implements `:short` once** per family of atom instead of four
+  times, and the `%(…)` interpolation loop is shared with `cat-file --batch`.
+* **`readRef` returns a `Ref`** whose empty name means "not found", rather than
+  a `(found, Ref)` tuple.
+* **11 exported symbols had no caller anywhere** and were deleted.
+
 ## Budget
 
 ```
                                     budgeted   actual
-refs: loose + packed-refs                300      501   refs + refname
-config: flat INI subset                  150      291   parser 138, writer 153
-pathspec + ignore (shared glob)          500       87   arrived early
-support: sha1, zlib, paths, errors       400      264
-object store                             800      487
-extension gate + worktree config          60       55
-command dispatch, arg parsing, 53 cmds  2,000      919   6 commands + driver
+refs: loose + packed-refs                300      480   refs + refname
+config: flat INI subset                  150      261   reader and writer, one scanner
+pathspec + ignore (shared glob)          500       83   arrived early
+support: sha1, zlib, paths, errors       400      219
+object store                             800      473
+extension gate + worktree config          60       28   now a table
+command dispatch, arg parsing, 53 cmds  2,000      911   6 commands + driver
 ```
 
 Two lines are over and one number is a warning.
 
-**`refs` is 501 against 300.** The budget line said "loose + packed-refs" and
+**`refs` is 480 against 300.** The budget line said "loose + packed-refs" and
 the phase delivered rather more: a two-phase transaction, lock files, reflog
 writing, and the per-worktree path rule. Reflog writing has no budget line of
 its own anywhere, and the transaction is what `fetch` and `receive-pack` are
 defined in terms of, so phase 8 should get some of this back rather than
 paying again.
 
-**`config` is 291 against 150.** The parser is 138 — on budget. The other 153
-is the *writer*, which the budget never accounted for, and which is a line
-editor rather than a serializer precisely so that `config set` does not
-destroy a hand-written file's comments and layout.
+**`config` is 261 against 150.** The budget line covered a parser. What is
+there is a parser *and* a writer — a line editor rather than a serializer,
+precisely so that `config set` does not destroy a hand-written file's comments
+and layout — sharing a single pass over the lines.
 
-**The command layer is 919 of 2,000 with 6 of 53 commands done.** plan.md says
+**The command layer is 911 of 2,000 with 6 of 53 commands done.** plan.md says
 to guard this number above all others, so: it is not yet a problem, but it is
 not comfortable either. `update-ref` (240) and `for-each-ref` (231) are half of
 it, and both are genuinely large — one implements a transaction language, the
@@ -207,7 +263,7 @@ other a format engine that git spends 3,000 lines on. Most of the remaining 47
 commands are far smaller, but this is the number to watch in phase 4, where
 `add`, `commit` and `log` all land at once.
 
-Total: 2,841 lines of code (4,218 including comments) of the ~9,000 budgeted,
+Total: 2,753 lines of code (4,239 including comments) of the ~9,000 budgeted,
 with phases 1 and 2 of 10 complete.
 
 ## Notes carried forward
@@ -233,9 +289,10 @@ with phases 1 and 2 of 10 complete.
   implemented" rather than an empty column.
 - **`--merged`, `--contains` and their negations refuse with a message naming
   phase 6**, rather than silently listing everything.
-- **`update-ref --no-deref` stays out of scope** (docs/10), but `option
-  no-deref` in a `--stdin` stream is accepted and ignored rather than failing
-  a caller's script over a word that changes nothing it asked for.
+- **`option no-deref` in a `--stdin` stream is honored**, because git requires
+  it before `symref-delete` and `symref-verify` and changes what every other
+  command does. The `--no-deref` *command-line flag* stays out of scope
+  (docs/10).
 - **`config --system` is out of scope** (docs/11), so the merge is global,
   local, worktree, then `-c`. A single static binary with no install prefix has
   no system file to read.

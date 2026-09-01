@@ -62,20 +62,14 @@ proc peelTo(r: Repository, start: Oid, want: ObjectType): GitObject =
 # -- batch mode -------------------------------------------------------------
 
 proc emitFormat(fmt: string, o: Oid, kind: ObjectType, size: int) =
-  var i = 0
-  while i < fmt.len:
-    if fmt[i] == '%' and i + 1 < fmt.len and fmt[i+1] == '(':
-      let close = fmt.find(')', i + 2)
-      failIf(close < 0, "unterminated %( in format")
-      case fmt[i+2 ..< close]
-      of "objectname": stdout.write $o
-      of "objecttype": stdout.write $kind
-      of "objectsize": stdout.write $size
-      else: fail("unknown format atom '%(" & fmt[i+2 ..< close] & ")'")
-      i = close + 1
-    else:
-      stdout.write fmt[i]
-      inc i
+  ## `--batch`'s vocabulary is three atoms wide; the interpolation itself is
+  ## the same one `for-each-ref` uses.
+  stdout.write interpolate(fmt, proc (atom: string): string =
+    case atom
+    of "objectname": $o
+    of "objecttype": $kind
+    of "objectsize": $size
+    else: fail("unknown format atom '%(" & atom & ")'"))
   stdout.write "\n"
 
 proc runBatch(c: Ctx, fmt: string, withContents: bool): int =

@@ -20,7 +20,7 @@ back byte for byte, the loose objects gittle writes are byte-identical to
 git's, and so is a config file after nine edits. `git fsck --strict` is clean
 after everything gittle writes. Phase 3 — the index and trees — is next.
 
-2,841 lines of the ~9,000 budgeted.
+2,753 lines of the ~9,000 budgeted.
 
 - [`docs/plan.md`](docs/plan.md) — goals, design rules, scope, budget, the ten
   decisions, build order. **Read this first.**

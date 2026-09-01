@@ -51,7 +51,7 @@
 ## Reflog writing lives here too, because a ref update is the only thing that
 ## ever appends to one.  The `reflog` command that reads them back is phase 6.
 
-import std/[os, strutils, algorithm, sequtils, posix]
+import std/[os, strutils, algorithm, sequtils, sets, posix]
 import oid, objects, refname, ident, util
 
 const
@@ -96,6 +96,12 @@ type
     packedLoaded: bool
 
 func isSymbolic*(r: Ref): bool = r.symTarget.len > 0
+
+func found*(r: Ref): bool = r.name.len > 0
+  ## A ref with no name is one that is not there.  Reading a ref that does not
+  ## exist is not an error -- creating a branch and checking whether one is
+  ## already present both depend on that -- so absence needs a representation,
+  ## and the name is already it.
 
 # ---------------------------------------------------------------------------
 # Where things live
@@ -146,19 +152,18 @@ proc parseRefContents(text, path: string): Ref =
   failIf(not tryParseOid(body, result.oid),
          "invalid object name in " & path & ": '" & body & "'")
 
-proc readLooseRef(s: RefStore, name: string): tuple[found: bool, r: Ref] =
+proc readLooseRef(s: RefStore, name: string): Ref =
   let path = s.refPath(name)
-  if not fileExists(path): return (false, Ref())
+  if not fileExists(path): return
   var raw: string
   try:
     raw = readFile(path)
   except IOError, OSError:
     # A ref that vanished between the `fileExists` and the read is simply
     # absent; another process packing refs does exactly this.
-    return (false, Ref())
-  result.r = parseRefContents(raw, path)
-  result.r.name = name
-  result.found = true
+    return
+  result = parseRefContents(raw, path)
+  result.name = name
 
 proc loadPackedRefs(s: RefStore) =
   ## Parse `packed-refs` once per process.
@@ -191,27 +196,20 @@ proc loadPackedRefs(s: RefStore) =
     s.packed.add r
   sort(s.packed, proc (a, b: Ref): int = cmp(a.name, b.name))
 
-proc lookupPacked(s: RefStore, name: string): tuple[found: bool, r: Ref] =
+proc readRef*(s: RefStore, name: string): Ref =
+  ## Read one ref by its full name, without following symbolic refs.
+  ## Loose first: a loose ref shadows a packed one of the same name.
+  result = s.readLooseRef(name)
+  if result.found: return
   s.loadPackedRefs()
   var lo = 0
   var hi = s.packed.len
   while lo < hi:
     let mid = (lo + hi) div 2
     let c = cmp(s.packed[mid].name, name)
-    if c == 0: return (true, s.packed[mid])
+    if c == 0: return s.packed[mid]
     elif c < 0: lo = mid + 1
     else: hi = mid
-  (false, Ref())
-
-proc readRef*(s: RefStore, name: string): tuple[found: bool, r: Ref] =
-  ## Read one ref by its full name, without following symbolic refs.
-  ## Loose first: a loose ref shadows a packed one of the same name.
-  result = s.readLooseRef(name)
-  if result.found: return
-  result = s.lookupPacked(name)
-
-proc refExists*(s: RefStore, name: string): bool =
-  s.readRef(name).found
 
 proc resolveRef*(s: RefStore, name: string):
     tuple[found: bool, finalName: string, oid: Oid] =
@@ -224,8 +222,8 @@ proc resolveRef*(s: RefStore, name: string):
   ## created, which is what `commit` needs to know.
   var current = name
   for _ in 0 ..< maxSymrefDepth:
-    let (found, r) = s.readRef(current)
-    if not found:
+    let r = s.readRef(current)
+    if not r.found:
       return (false, current, nullOid)
     if r.isSymbolic:
       current = r.symTarget
@@ -237,45 +235,28 @@ proc resolveRef*(s: RefStore, name: string):
 # Iteration
 # ---------------------------------------------------------------------------
 
-iterator walkLooseRefs(dir, prefix: string): tuple[name, path: string] =
-  ## Every file under `dir`, yielding `prefix`-relative names.  Recursion is
-  ## explicit rather than `walkDirRec` so a broken symlink or a directory that
-  ## disappears mid-walk cannot abort the whole listing.
-  var stack = @[(dir, prefix)]
-  while stack.len > 0:
-    let (d, p) = stack.pop()
-    if not dirExists(d): continue
-    var entries: seq[tuple[kind: PathComponent, path: string]]
-    try:
-      for kind, path in walkDir(d): entries.add (kind, path)
-    except OSError:
-      continue
-    for (kind, path) in entries:
-      let name = p & path.lastPathPart
-      case kind
-      of pcDir, pcLinkToDir: stack.add (path, name & "/")
-      else:
-        if not path.lastPathPart.endsWith(lockSuffix):
-          yield (name, path)
-
 proc allRefs*(s: RefStore, prefix = refsPrefix): seq[Ref] =
   ## Every ref under `prefix`, loose and packed merged, sorted by name.
   ##
   ## Both worktree-private and shared refs are included, since a caller asking
-  ## for "the refs" means the ones visible from here.
-  var seen = newSeq[string]()
+  ## for "the refs" means the ones visible from here.  `walkDirRec` with
+  ## `checkDir = false` yields nothing for a directory that is absent, which is
+  ## the ordinary state of `refs/` in a repository whose refs are all packed.
+  var seen = initHashSet[string]()
 
-  # Both directories are walked: the common one holds the shared refs, and a
-  # linked worktree's own directory holds its private ones.  Outside a worktree
-  # the two are the same path, so the second walk is skipped.
+  # Two directories: the common one holds the shared refs, and a linked
+  # worktree's own holds its private ones.  Outside a worktree they are the
+  # same path, so the second walk is skipped.
   var bases = @[s.commonDir]
   if s.gitDir != s.commonDir: bases.add s.gitDir
   for base in bases:
-    for (name, _) in walkLooseRefs(base / prefix, prefix):
+    for rel in walkDirRec(base / prefix, relative = true, checkDir = false):
+      if rel.endsWith(lockSuffix): continue
+      let name = prefix & rel
       if name in seen: continue
-      let (found, r) = s.readLooseRef(name)
-      if found:
-        seen.add name
+      let r = s.readLooseRef(name)
+      if r.found:
+        seen.incl name
         result.add r
 
   s.loadPackedRefs()
@@ -436,7 +417,6 @@ type
     state: TxState
 
 func isPrepared*(tx: RefTransaction): bool = tx.state == txPrepared
-func isClosed*(tx: RefTransaction): bool = tx.state == txClosed
 
 # -- locks ------------------------------------------------------------------
 
@@ -558,14 +538,17 @@ proc pruneEmptyRefDirs(s: RefStore, name: string) =
 proc newTransaction*(s: RefStore): RefTransaction =
   RefTransaction(store: s, state: txOpen)
 
-proc add*(tx: RefTransaction, u: RefUpdate) =
+proc add*(tx: RefTransaction, update: RefUpdate) =
   ## Queue a change.  Nothing is locked or checked until `prepare`.
+  var u = update
   failIf(tx.state != txOpen, "ref transaction is no longer open")
   failIf(not isValidRefname(u.name, {rfAllowOneLevel}),
          "invalid ref name: '" & u.name & "'")
-  if u.kind == ruSet:
-    failIf(u.newOid.isNull,
-           "refusing to set '" & u.name & "' to the null object ID")
+  if u.kind == ruSet and u.newOid.isNull:
+    # git spells a delete as an update to the null object ID, which is how
+    # `update-ref --stdin` deletes a ref and checks its old value in one
+    # command.  Take it at its word rather than refusing.
+    u.kind = ruDelete
   if u.kind == ruSetSymbolic:
     failIf(not isValidRefname(u.newTarget, {rfAllowOneLevel}),
            "invalid ref target: '" & u.newTarget & "'")
@@ -601,8 +584,8 @@ proc verifyOld(s: RefStore, u: RefUpdate, name: string) =
   ## The compare half of compare-and-swap, run with the lock held -- which is
   ## the only way the answer stays true long enough to act on.
   if u.haveOldTarget:
-    let (found, rf) = s.readRef(name)
-    failIf(not found or not rf.isSymbolic,
+    let rf = s.readRef(name)
+    failIf(not rf.found or not rf.isSymbolic,
            "cannot lock ref '" & u.name & "': expected a symbolic ref with " &
            "target '" & u.oldTarget & "'")
     failIf(rf.symTarget != u.oldTarget,
@@ -642,14 +625,17 @@ proc prepare*(tx: RefTransaction) =
     for u in tx.updates:
       var p = Plan(msg: u.msg, target: u.name)
 
-      # Following a symbolic ref is the default: `update-ref HEAD <oid>` moves
-      # the branch HEAD names rather than turning HEAD into a direct ref.  The
-      # `symref-*` commands and `--no-deref` opt out.
-      if not u.noDeref and u.kind != ruSetSymbolic:
+      # Following a symbolic ref is the default for *every* kind of update:
+      # `update-ref HEAD <oid>` moves the branch HEAD names rather than turning
+      # HEAD into a direct ref, and -- less obviously -- `symref-update` on a
+      # symbolic ref rewrites what it points at, not the ref itself.  Only a
+      # caller that passes `noDeref` acts on the named ref directly, which is
+      # what the `symbolic-ref` command and `option no-deref` do.
+      if not u.noDeref:
         var depth = 0
         while true:
-          let (found, rf) = s.readRef(p.target)
-          if not found or not rf.isSymbolic: break
+          let rf = s.readRef(p.target)
+          if not rf.found or not rf.isSymbolic: break
           if p.alias.len == 0: p.alias = p.target
           inc depth
           failIf(depth > maxSymrefDepth,
@@ -757,10 +743,13 @@ proc deleteRef*(s: RefStore, name: string, oldOid = nullOid, checkOld = false,
                      haveOldOid: checkOld, noDeref: noDeref, msg: msg)
 
 proc writeSymRef*(s: RefStore, name, target: string, msg = "") =
-  ## Make `name` a symbolic ref pointing at `target`.
+  ## Make `name` itself a symbolic ref pointing at `target`.
+  ##
+  ## `noDeref` is deliberate: `symbolic-ref A B` must rewrite A even when A is
+  ## already a symbolic ref, or the command could never repoint one.
   withTransaction(s, tx):
     tx.add RefUpdate(kind: ruSetSymbolic, name: name, newTarget: target,
-                     msg: msg)
+                     noDeref: true, msg: msg)
 
 proc newRefStore*(gitDir, commonDir: string, policy: LogRefsPolicy,
                   identFn: proc (): Ident {.closure.},

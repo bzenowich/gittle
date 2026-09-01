@@ -20,10 +20,96 @@ type
 func isNameChar(c: char): bool =
   c.isAlphaNumeric or c == '-'
 
+# ---------------------------------------------------------------------------
+# One pass over the lines, two consumers
+# ---------------------------------------------------------------------------
+#
+# Reading a configuration file and *editing* one need the same thing: which
+# line is a section header, which is a variable, and which section is in force.
+# The reader then parses values; the editor replaces a line.  Scanning once and
+# sharing the result keeps the two from drifting apart -- a variable the reader
+# sees and the editor does not is a `config set` that silently adds a duplicate.
+
+type
+  LineKind = enum lkOther, lkSection, lkVariable
+
+  ScannedLine = object
+    kind: LineKind
+    section: string     ## the section in force here, lowercased
+    subsection: string  ## its subsection, case preserved -- git treats
+                        ## `[remote "Origin"]` and `[remote "origin"]` as two
+    hasSub: bool
+    name: string        ## for lkVariable, the lowercased variable name
+    indent: string      ## whatever whitespace the author used
+    keyText: string     ## the name exactly as written, so an edit can keep it
+    valueAt: int        ## where the value starts, or -1 for an implicit true
+
+proc scanLines(lines: openArray[string], path: string): seq[ScannedLine] =
+  var section = ""
+  var subsection = ""
+  var hasSub = false
+  for lineNo, line in lines.pairs:
+    var sl = ScannedLine(kind: lkOther, section: section,
+                         subsection: subsection, hasSub: hasSub, valueAt: -1)
+    var i = 0
+    while i < line.len and line[i] in {' ', '\t'}: inc i
+
+    if i < line.len and line[i] notin {'#', ';'}:
+      if line[i] == '[':
+        inc i
+        let nameStart = i
+        while i < line.len and (isNameChar(line[i]) or line[i] == '.'): inc i
+        section = line[nameStart ..< i].toLowerAscii
+        subsection = ""
+        hasSub = false
+        while i < line.len and line[i] in {' ', '\t'}: inc i
+        if i < line.len and line[i] == '"':
+          inc i
+          while i < line.len and line[i] != '"':
+            if line[i] == '\\' and i + 1 < line.len: inc i
+            subsection.add line[i]
+            inc i
+          failIf(i >= line.len,
+                 path & ":" & $(lineNo + 1) & ": unterminated subsection")
+          inc i
+          hasSub = true
+          while i < line.len and line[i] in {' ', '\t'}: inc i
+        failIf(i >= line.len or line[i] != ']',
+               path & ":" & $(lineNo + 1) & ": bad section header")
+        sl = ScannedLine(kind: lkSection, section: section,
+                         subsection: subsection, hasSub: hasSub, valueAt: -1)
+      else:
+        let nameStart = i
+        while i < line.len and isNameChar(line[i]): inc i
+        if i > nameStart:
+          sl.kind = lkVariable
+          sl.name = line[nameStart ..< i].toLowerAscii
+          sl.indent = line[0 ..< nameStart]
+          sl.keyText = line[nameStart ..< i]
+          while i < line.len and line[i] in {' ', '\t'}: inc i
+          # No `=` at all is an implicit true; anything else here is malformed.
+          if i < line.len:
+            failIf(line[i] != '=',
+                   path & ":" & $(lineNo + 1) & ": bad config line")
+            inc i
+            while i < line.len and line[i] in {' ', '\t'}: inc i
+            sl.valueAt = i
+    result.add sl
+
+func fullSection(sl: ScannedLine): string =
+  if sl.hasSub: sl.section & "." & sl.subsection else: sl.section
+
+# ---------------------------------------------------------------------------
+# Reading
+# ---------------------------------------------------------------------------
+
 proc parseValue(line: string, start: int, path: string, lineNo: int,
                 more: var bool): string =
-  ## Read a value starting at `start`.  Sets `more` if the line ended with a
-  ## backslash continuation.
+  ## Read a value starting at `start`.
+  ##
+  ## Quoting protects leading and trailing whitespace and the comment
+  ## characters; a backslash at end of line continues onto the next, which
+  ## `more` reports.
   var i = start
   var quoted = false
   var lastNonSpace = -1
@@ -52,80 +138,35 @@ proc parseValue(line: string, start: int, path: string, lineNo: int,
       else: fail(path & ":" & $lineNo & ": bad escape '\\" & e & "'")
       lastNonSpace = result.len
       continue
-    if quoted or c notin {' ', '\t'}:
-      result.add c
-      lastNonSpace = result.len
-    else:
-      result.add c
+    result.add c
+    if quoted or c notin {' ', '\t'}: lastNonSpace = result.len
     inc i
-  if quoted: fail(path & ":" & $lineNo & ": unterminated quote")
-  if lastNonSpace >= 0: result.setLen(lastNonSpace) else: result.setLen(0)
+  failIf(quoted, path & ":" & $lineNo & ": unterminated quote")
+  result.setLen(max(lastNonSpace, 0))
 
 proc parseConfig*(text, path: string): Config =
-  var section = ""
-  var lineNo = 0
-  var pending = ""     ## key waiting for a continued value
-  var pendingVal = ""
-  for rawLine in text.splitLines:
-    inc lineNo
-    var line = rawLine
-    if pending.len > 0:
-      var more = false
-      pendingVal.add parseValue(line, 0, path, lineNo, more)
-      if more: continue
-      result.entries.add ConfigEntry(key: pending, value: pendingVal)
-      pending = ""
-      pendingVal = ""
-      continue
-
-    var i = 0
-    while i < line.len and line[i] in {' ', '\t'}: inc i
-    if i >= line.len or line[i] in {'#', ';'}: continue
-
-    if line[i] == '[':
+  let lines = text.splitLines
+  let scanned = scanLines(lines, path)
+  var i = 0
+  while i < lines.len:
+    let sl = scanned[i]
+    if sl.kind != lkVariable:
       inc i
-      let nameStart = i
-      while i < line.len and (isNameChar(line[i]) or line[i] == '.'): inc i
-      section = line[nameStart ..< i].toLowerAscii
-      while i < line.len and line[i] in {' ', '\t'}: inc i
-      if i < line.len and line[i] == '"':
-        inc i
-        var sub = ""
-        while i < line.len and line[i] != '"':
-          if line[i] == '\\' and i + 1 < line.len: inc i
-          sub.add line[i]
-          inc i
-        if i >= line.len: fail(path & ":" & $lineNo & ": unterminated subsection")
-        inc i
-        section = section & "." & sub  # subsection case is significant
-        while i < line.len and line[i] in {' ', '\t'}: inc i
-      if i >= line.len or line[i] != ']':
-        fail(path & ":" & $lineNo & ": bad section header")
       continue
-
-    # variable
-    let nameStart = i
-    while i < line.len and isNameChar(line[i]): inc i
-    let name = line[nameStart ..< i].toLowerAscii
-    if name.len == 0: fail(path & ":" & $lineNo & ": bad config line")
-    if section.len == 0: fail(path & ":" & $lineNo & ": variable outside a section")
-    let key = section & "." & name
-    while i < line.len and line[i] in {' ', '\t'}: inc i
-    if i >= line.len:
+    failIf(sl.section.len == 0,
+           path & ":" & $(i + 1) & ": variable outside a section")
+    let key = fullSection(sl) & "." & sl.name
+    if sl.valueAt < 0:
       result.entries.add ConfigEntry(key: key, value: "true", isBool: true)
-      continue
-    if line[i] != '=': fail(path & ":" & $lineNo & ": bad config line")
-    inc i
-    while i < line.len and line[i] in {' ', '\t'}: inc i
-    var more = false
-    let v = parseValue(line, i, path, lineNo, more)
-    if more:
-      pending = key
-      pendingVal = v
     else:
+      var more = false
+      var v = parseValue(lines[i], sl.valueAt, path, i + 1, more)
+      while more and i + 1 < lines.len:
+        inc i
+        more = false
+        v.add parseValue(lines[i], 0, path, i + 1, more)
       result.entries.add ConfigEntry(key: key, value: v)
-  if pending.len > 0:
-    result.entries.add ConfigEntry(key: pending, value: pendingVal)
+    inc i
 
 proc globalConfigPath*(): string =
   ## The user's own configuration file.
@@ -240,64 +281,6 @@ func sectionHeader(k: SplitKey): string =
                                                     .replace("\"", "\\\"") & "\"]"
   else: "[" & k.section & "]"
 
-type
-  LineKind = enum lkOther, lkSection, lkVariable
-
-  ScannedLine = object
-    ## One line of the file, classified enough to decide whether it is the
-    ## line we are looking for.
-    kind: LineKind
-    section: string     ## the section in force at this line, lowercased
-    subsection: string
-    hasSub: bool
-    name: string        ## for lkVariable, the lowercased variable name
-    indent: string      ## whatever whitespace the author used
-    keyText: string     ## the key exactly as written, so it can be preserved
-
-proc scanLines(lines: seq[string]): seq[ScannedLine] =
-  ## Classify every line, carrying the current section forward.  Nothing here
-  ## interprets values: this pass only has to find the right *line*.
-  var section = ""
-  var subsection = ""
-  var hasSub = false
-  for line in lines:
-    var sl = ScannedLine(kind: lkOther, section: section,
-                         subsection: subsection, hasSub: hasSub)
-    var i = 0
-    while i < line.len and line[i] in {' ', '\t'}: inc i
-    if i < line.len and line[i] notin {'#', ';'}:
-      if line[i] == '[':
-        inc i
-        let start = i
-        while i < line.len and (line[i].isAlphaNumeric or line[i] in {'-', '.'}):
-          inc i
-        section = line[start ..< i].toLowerAscii
-        subsection = ""
-        hasSub = false
-        while i < line.len and line[i] in {' ', '\t'}: inc i
-        if i < line.len and line[i] == '"':
-          inc i
-          var sub = ""
-          while i < line.len and line[i] != '"':
-            if line[i] == '\\' and i + 1 < line.len: inc i
-            sub.add line[i]
-            inc i
-          subsection = sub
-          hasSub = true
-        sl.kind = lkSection
-        sl.section = section
-        sl.subsection = subsection
-        sl.hasSub = hasSub
-      else:
-        let start = i
-        while i < line.len and (line[i].isAlphaNumeric or line[i] == '-'): inc i
-        if i > start:
-          sl.kind = lkVariable
-          sl.name = line[start ..< i].toLowerAscii
-          sl.indent = line[0 ..< start]
-          sl.keyText = line[start ..< i]
-    result.add sl
-
 func sameSection(sl: ScannedLine, k: SplitKey): bool =
   ## Section names are case-insensitive; subsection names are not.  That
   ## asymmetry is git's, and it matters: `[remote "Origin"]` and
@@ -317,7 +300,7 @@ proc setConfigValue*(path, key, value: string) =
     # so the file does not gain a blank line every time it is written.
     if text.len > 0 and text[^1] == '\n': text.setLen(text.len - 1)
     lines = text.splitLines
-  let scanned = scanLines(lines)
+  let scanned = scanLines(lines, path)
 
   var lastMatch = -1
   var sectionEnd = -1
@@ -351,7 +334,7 @@ proc unsetConfigValue*(path, key: string, all: bool): int =
   var text = readWholeFile(path)
   if text.len > 0 and text[^1] == '\n': text.setLen(text.len - 1)
   var lines = text.splitLines
-  let scanned = scanLines(lines)
+  let scanned = scanLines(lines, path)
 
   var matches: seq[int]
   for i, sl in scanned:
@@ -369,7 +352,7 @@ proc unsetConfigValue*(path, key: string, all: bool): int =
   # untidy: the next `set` would then append into a section that reads as
   # though someone meant to put something there.  Only a block that is now
   # entirely empty goes -- a comment inside it is somebody's note, and stays.
-  let after = scanLines(lines)
+  let after = scanLines(lines, path)
   var drop: seq[int]
   for i, sl in after:
     if sl.kind != lkSection or not sameSection(sl, k): continue

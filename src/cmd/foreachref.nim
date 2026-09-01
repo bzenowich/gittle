@@ -48,54 +48,52 @@ const
   defaultAbbrev = 7
 
   deferredAtoms = ["committerdate", "authordate", "taggerdate", "creatordate",
-                   "subject", "contents", "body", "committername",
-                   "committeremail", "authorname", "authoremail", "creator",
-                   "align", "if", "then", "else", "end", "color", "push",
-                   "worktreepath", "ahead-behind", "describe", "raw",
-                   "objectsize:disk", "deltabase", "signature", "tree",
-                   "parent", "numparent", "upstream:track", "upstream:remotename"]
+                   "creator", "subject", "contents", "body", "align", "if",
+                   "push", "describe", "raw", "deltabase", "signature",
+                   "tree", "parent", "numparent", "worktreepath"]
     ## Real atoms of git's that v1 does not implement.  Naming them lets the
     ## error say "not implemented" rather than "unknown", which is the
     ## difference between a missing feature and a typo.
 
 type
-  Row = object
-    ## One ref, with everything the format or the sort might ask for.  Object
-    ## information is filled in lazily -- listing ten thousand tags should not
-    ## read ten thousand objects unless the format actually needs their type.
-    rf: Ref
-    isHead: bool
+  ObjInfo = object
+    ## What an object is, filled in on demand.  Listing ten thousand tags must
+    ## not read ten thousand objects unless the format asks for their type.
+    oid: Oid
     kind: ObjectType
     size: int
-    infoLoaded: bool
-    peeledOid: Oid
-    peeledKind: ObjectType
-    peeledSize: int
-    peelLoaded: bool
+    loaded: bool
+
+  Row = object
+    ## One ref, plus the object it names and -- for an annotated tag -- the
+    ## object that one points at, which is what the `*` atoms report.
+    rf: Ref
+    isHead: bool
+    self: ObjInfo
+    peeled: ObjInfo
 
 # ---------------------------------------------------------------------------
 # Field values
 # ---------------------------------------------------------------------------
 
-proc loadInfo(repo: Repository, r: var Row) =
-  if r.infoLoaded: return
-  r.infoLoaded = true
-  if r.rf.oid.isNull: return
-  let info = repo.objectInfo(r.rf.oid)
-  r.kind = info.kind
-  r.size = info.size
+proc load(repo: Repository, i: var ObjInfo) =
+  if i.loaded: return
+  i.loaded = true
+  if i.oid.isNull: return
+  let info = repo.objectInfo(i.oid)
+  i.kind = info.kind
+  i.size = info.size
 
 proc loadPeel(repo: Repository, r: var Row) =
   ## Follow an annotated tag to the object it names.
   ##
   ## `packed-refs` may already record this on a `^` line, which is exactly why
   ## that line exists: it saves reading the tag object at all.
-  if r.peelLoaded: return
-  r.peelLoaded = true
-  repo.loadInfo(r)
+  if r.peeled.loaded: return
+  repo.load(r.self)
   if r.rf.hasPeeled:
-    r.peeledOid = r.rf.peeled
-  elif r.kind == otTag:
+    r.peeled.oid = r.rf.peeled
+  elif r.self.kind == otTag:
     var current = r.rf.oid
     for _ in 0 .. 15:
       let obj = repo.readObject(current)
@@ -106,13 +104,10 @@ proc loadPeel(repo: Repository, r: var Row) =
         if line.startsWith("object "):
           target = line[7 .. ^1].strip()
           break
-      if target.len == 0: return
+      if target.len == 0: break
       current = parseOid(target)
-    r.peeledOid = current
-  if r.peeledOid.isNull: return
-  let info = repo.objectInfo(r.peeledOid)
-  r.peeledKind = info.kind
-  r.peeledSize = info.size
+    r.peeled.oid = current
+  repo.load(r.peeled)
 
 proc upstreamOf(repo: Repository, refname: string): string =
   ## `branch.<name>.merge` names the ref on the remote; combined with
@@ -127,13 +122,32 @@ proc upstreamOf(repo: Repository, refname: string): string =
   if not merge.startsWith("refs/heads/"): return ""
   "refs/remotes/" & remote & "/" & merge["refs/heads/".len .. ^1]
 
+proc refField(name, modifier, atom: string): string =
+  ## Every atom whose value is a *ref name* takes the same modifiers, so they
+  ## are implemented once here rather than beside each atom.
+  if name.len == 0 or modifier.len == 0: return name
+  if modifier == "short": return shortenRefname(name)
+  if modifier.startsWith("lstrip="):
+    return lstripRefname(name, parseInt(modifier["lstrip=".len .. ^1]))
+  if modifier.startsWith("rstrip="):
+    return rstripRefname(name, parseInt(modifier["rstrip=".len .. ^1]))
+  fail("unknown modifier in %(" & atom & ")")
+
+proc oidField(o: Oid, modifier, atom: string): string =
+  ## Likewise for every atom whose value is an object ID.
+  if modifier.len == 0: return $o
+  if modifier == "short": return abbrev(o, defaultAbbrev)
+  if modifier.startsWith("short="):
+    return abbrev(o, parseInt(modifier["short=".len .. ^1]))
+  fail("unknown modifier in %(" & atom & ")")
+
 proc fieldValue(repo: Repository, r: var Row, atom: string): string =
-  ## Expand one `%(…)` atom.  `atom` is what was between the parentheses.
+  ## Expand one `%(…)` atom.  `atom` is what was between the parentheses:
+  ## an optional `*` (meaning "of what this tag points at"), a name, and an
+  ## optional `:modifier`.
   var name = atom
-  var deref = false
-  if name.startsWith("*"):
-    deref = true
-    name = name[1 .. ^1]
+  let deref = name.startsWith("*")
+  if deref: name = name[1 .. ^1]
 
   var modifier = ""
   let colon = name.find(':')
@@ -142,85 +156,39 @@ proc fieldValue(repo: Repository, r: var Row, atom: string): string =
     name = name[0 ..< colon]
 
   for d in deferredAtoms:
-    if name == d or atom == d:
+    if name == d:
       fail("%(" & atom & ") is not implemented in this version\n" &
            "  date, message and conditional atoms need the revision walk " &
            "(phase 6)")
 
   if deref:
     repo.loadPeel(r)
-    if r.peeledOid.isNull: return ""
+    if r.peeled.oid.isNull: return ""
 
   case name
-  of "refname":
-    let full = r.rf.name
-    if modifier.len == 0: return full
-    if modifier == "short": return shortenRefname(full)
-    if modifier.startsWith("lstrip="):
-      return lstripRefname(full, parseInt(modifier["lstrip=".len .. ^1]))
-    if modifier.startsWith("rstrip="):
-      return rstripRefname(full, parseInt(modifier["rstrip=".len .. ^1]))
-    fail("unknown modifier in %(" & atom & ")")
-  of "objectname":
-    let o = if deref: r.peeledOid else: r.rf.oid
-    if modifier.len == 0: return $o
-    if modifier == "short": return abbrev(o, defaultAbbrev)
-    if modifier.startsWith("short="):
-      return abbrev(o, parseInt(modifier["short=".len .. ^1]))
-    fail("unknown modifier in %(" & atom & ")")
-  of "objecttype":
-    repo.loadInfo(r)
-    return $(if deref: r.peeledKind else: r.kind)
-  of "objectsize":
-    repo.loadInfo(r)
-    return $(if deref: r.peeledSize else: r.size)
+  of "refname":    refField(r.rf.name, modifier, atom)
+  of "symref":     refField(r.rf.symTarget, modifier, atom)
+  of "upstream":   refField(upstreamOf(repo, r.rf.name), modifier, atom)
+  of "objectname", "objecttype", "objectsize":
+    # The three object atoms differ only in which field they report, and the
+    # `*` prefix only in which object they report it for.
+    var info = if deref: r.peeled else: r.self
+    if name != "objectname": repo.load(info)
+    if deref: r.peeled = info else: r.self = info
+    case name
+    of "objectname": oidField(info.oid, modifier, atom)
+    of "objecttype": $info.kind
+    else: $info.size
   of "HEAD":
-    return if r.isHead: "*" else: " "
-  of "symref":
-    if r.rf.symTarget.len == 0: return ""
-    if modifier == "short": return shortenRefname(r.rf.symTarget)
-    return r.rf.symTarget
-  of "upstream":
-    let u = upstreamOf(repo, r.rf.name)
-    if u.len == 0: return ""
-    if modifier == "short": return shortenRefname(u)
-    return u
+    if r.isHead: "*" else: " "
   else:
     fail("unknown field name: %(" & atom & ")")
 
 proc expand(repo: Repository, r: var Row, format: string): string =
-  ## Interpolate a whole format string.
-  var i = 0
-  while i < format.len:
-    if format[i] != '%':
-      result.add format[i]
-      inc i
-      continue
-    failIf(i + 1 >= format.len, "unterminated % in format string")
-    if format[i+1] == '%':
-      result.add '%'
-      i += 2
-    elif format[i+1] == '(':
-      let close = format.find(')', i + 2)
-      failIf(close < 0, "unterminated %( in format string")
-      result.add repo.fieldValue(r, format[i+2 ..< close])
-      i = close + 1
-    else:
-      # `%0a` and friends: a byte written as two hex digits, which is how a
-      # format string carries a tab or a NUL through a shell.
-      failIf(i + 2 >= format.len, "unterminated % in format string")
-      let hex = format[i+1 .. i+2]
-      var v = 0
-      for c in hex:
-        let d = case c
-                of '0'..'9': ord(c) - ord('0')
-                of 'a'..'f': ord(c) - ord('a') + 10
-                of 'A'..'F': ord(c) - ord('A') + 10
-                else: -1
-        failIf(d < 0, "bad %-escape '%" & hex & "' in format string")
-        v = v * 16 + d
-      result.add char(v)
-      i += 3
+  var row = r
+  result = interpolate(format, proc (atom: string): string =
+    repo.fieldValue(row, atom))
+  r = row
 
 # ---------------------------------------------------------------------------
 # Filtering and sorting
@@ -316,7 +284,8 @@ proc cmdForEachRef*(c: Ctx, args: seq[string]): int =
   var rows: seq[Row]
   for rf in repo.refs.allRefs():
     if not matchesPattern(rf.name, patterns): continue
-    rows.add Row(rf: rf, isHead: rf.name == headBranch)
+    rows.add Row(rf: rf, isHead: rf.name == headBranch,
+                 self: ObjInfo(oid: rf.oid))
 
   if sortKeys.len == 0: sortKeys = @["refname"]
   sortRows(repo, rows, sortKeys)

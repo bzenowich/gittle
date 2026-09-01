@@ -5,12 +5,12 @@
 ## ask zlib how many input bytes it consumed.  Deflate is one-shot: gittle only
 ## ever compresses a whole loose object it already holds in memory.
 
+import util
+
 {.passL: "-lz".}
 {.pragma: zlibh, header: "<zlib.h>".}
 
 type
-  ZlibError* = object of CatchableError
-
   ZStream {.pure, final.} = object
     ## zlib's `z_stream`.  Layout is ABI-stable; `assertLayout` below checks it
     ## against the header at startup so a surprise is loud rather than subtle.
@@ -37,7 +37,6 @@ const
 
   ZBestSpeed* = 1.cint
     ## What git uses for loose objects (`core.loosecompression`, environment.c).
-  ZDefaultCompression* = -1.cint
 
   zlibVersion = "1.2.11"  ## only the major digit is checked by zlib
 
@@ -56,15 +55,12 @@ static const long gittle_zstream_size = (long)sizeof(z_stream);
 let cZStreamSize {.importc: "gittle_zstream_size", nodecl.}: clong
 
 proc assertLayout() =
-  if int(cZStreamSize) != sizeof(ZStream):
-    raise newException(ZlibError,
-      "z_stream layout mismatch: zlib.h says " & $int(cZStreamSize) &
-      " bytes, gittle assumes " & $sizeof(ZStream))
+  failIf(int(cZStreamSize) != sizeof(ZStream),
+    "z_stream layout mismatch: zlib.h says " & $int(cZStreamSize) &
+    " bytes, gittle assumes " & $sizeof(ZStream))
 
-proc fail(z: ZStream, code: cint, what: string) {.noreturn.} =
-  var detail = ""
-  if z.msg != nil: detail = ": " & $z.msg
-  raise newException(ZlibError, what & " failed (" & $code & ")" & detail)
+proc failZ(z: ZStream, code: cint, what: string) {.noreturn.} =
+  fail(what & " failed (" & $code & ")" & (if z.msg != nil: ": " & $z.msg else: ""))
 
 type
   Inflater* = object
@@ -82,7 +78,7 @@ proc openInflater*(): Inflater =
   assertLayout()
   result.strm = ZStream()
   let rc = inflateInit2u(result.strm, 15, zlibVersion, cint(sizeof(ZStream)))
-  if rc != ZOk: fail(result.strm, rc, "inflateInit2")
+  if rc != ZOk: failZ(result.strm, rc, "inflateInit2")
   result.live = true
 
 proc pump*(z: var Inflater, src: pointer, srcLen: int,
@@ -97,7 +93,7 @@ proc pump*(z: var Inflater, src: pointer, srcLen: int,
   if rc == ZStreamEnd:
     z.finished = true
   elif rc != ZOk and rc != ZBufError:
-    fail(z.strm, rc, "inflate")
+    failZ(z.strm, rc, "inflate")
   result.consumed = srcLen - int(z.strm.availIn)
   result.produced = dstLen - int(z.strm.availOut)
 
@@ -106,73 +102,59 @@ func offset(p: pointer, n: int): pointer {.inline.} =
 
 # -- one-shot helpers -------------------------------------------------------
 #
-# All three take a raw pointer because their callers are either a memory-mapped
-# packfile or a string, and neither wants a copy.
+# All of these take a raw pointer, because every caller is either a
+# memory-mapped packfile or a string and neither wants a copy.
 
-proc inflateExact*(src: pointer, srcLen, outLen: int):
+proc inflateInto(src: pointer, srcLen, limit: int, drain: bool):
     tuple[data: string, consumed: int] =
-  ## Inflate exactly `outLen` bytes.  Returns them together with the number of
-  ## compressed bytes they occupied -- which is how the pack reader steps from
-  ## one object to the next.
+  ## The one inflate loop.  Two knobs cover every way gittle reads a stream:
+  ##
+  ## * `limit` -- how many output bytes are wanted.  Negative means "however
+  ##   many there turn out to be", and the buffer doubles as it fills.
+  ## * `drain` -- after `limit` bytes, keep feeding zlib until it reports the
+  ##   end of the stream.  That is what makes `consumed` exact, which is the
+  ##   only way the pack reader can find where the next object starts.
   var z = openInflater()
   defer: z.close()
-  result.data = newString(outLen)
+  var cap = if limit >= 0: limit else: max(srcLen * 4, 4096)
+  result.data = newString(cap)
   var inPos = 0
   var outPos = 0
-  while outPos < outLen:
+  while not z.finished and (limit < 0 or outPos < limit):
+    if outPos == cap:
+      cap *= 2
+      result.data.setLen(cap)
     let p = z.pump(src.offset(inPos), srcLen - inPos,
-                   addr result.data[outPos], outLen - outPos)
-    inPos += p.consumed
-    outPos += p.produced
-    if p.produced == 0 and p.consumed == 0:
-      raise newException(ZlibError, "truncated zlib stream")
-  # Give zlib the chance to read the trailing adler32 so `consumed` is exact.
-  var scratch: byte
-  while not z.finished:
-    let p = z.pump(src.offset(inPos), srcLen - inPos, addr scratch, 1)
-    inPos += p.consumed
-    if p.produced != 0:
-      raise newException(ZlibError, "zlib stream longer than the declared size")
-    if p.consumed == 0 and not z.finished:
-      raise newException(ZlibError, "truncated zlib stream")
-  result.consumed = inPos
-
-proc inflatePrefix*(src: pointer, srcLen, maxOut: int): string =
-  ## Inflate at most `maxOut` bytes and stop; a short result means the stream
-  ## ended first.  Used to read a loose object's header without paying for its
-  ## body.
-  var z = openInflater()
-  defer: z.close()
-  result = newString(maxOut)
-  var inPos = 0
-  var outPos = 0
-  while outPos < maxOut and not z.finished:
-    let p = z.pump(src.offset(inPos), srcLen - inPos,
-                   addr result[outPos], maxOut - outPos)
+                   addr result.data[outPos], cap - outPos)
     inPos += p.consumed
     outPos += p.produced
     if p.consumed == 0 and p.produced == 0: break
-  result.setLen(outPos)
+  result.data.setLen(outPos)
+
+  if drain:
+    var scratch: byte
+    while not z.finished:
+      let p = z.pump(src.offset(inPos), srcLen - inPos, addr scratch, 1)
+      failIf(p.produced != 0, "zlib stream is longer than its declared size")
+      failIf(p.consumed == 0, "truncated zlib stream")
+      inPos += p.consumed
+  result.consumed = inPos
+
+proc inflateExact*(src: pointer, srcLen, outLen: int):
+    tuple[data: string, consumed: int] =
+  ## Inflate exactly `outLen` bytes, and report how many compressed bytes they
+  ## occupied -- which is how the pack reader steps from one object to the next.
+  result = inflateInto(src, srcLen, outLen, drain = true)
+  failIf(result.data.len != outLen, "truncated zlib stream")
+
+proc inflatePrefix*(src: pointer, srcLen, maxOut: int): string =
+  ## Inflate at most `maxOut` bytes and stop; a short result means the stream
+  ## ended first.  Reads a loose object's header without paying for its body.
+  inflateInto(src, srcLen, maxOut, drain = false).data
 
 proc inflateAll*(src: pointer, srcLen: int): string =
   ## Inflate a whole stream of unknown length.
-  var z = openInflater()
-  defer: z.close()
-  var cap = max(srcLen * 4, 4096)
-  result = newString(cap)
-  var inPos = 0
-  var outPos = 0
-  while not z.finished:
-    if outPos == cap:
-      cap *= 2
-      result.setLen(cap)
-    let p = z.pump(src.offset(inPos), srcLen - inPos,
-                   addr result[outPos], cap - outPos)
-    inPos += p.consumed
-    outPos += p.produced
-    if p.consumed == 0 and p.produced == 0:
-      raise newException(ZlibError, "truncated zlib stream")
-  result.setLen(outPos)
+  inflateInto(src, srcLen, -1, drain = false).data
 
 proc deflateAll*(src: pointer, srcLen: int, level: cint): string =
   ## Compress in one shot.  `compress2` uses zlib's defaults for everything but
@@ -181,6 +163,5 @@ proc deflateAll*(src: pointer, srcLen: int, level: cint): string =
   result = newString(int(bound))
   let rc = compress2(cast[ptr byte](addr result[0]), bound,
                      cast[ptr byte](src), culong(srcLen), level)
-  if rc != ZOk:
-    raise newException(ZlibError, "compress2 failed (" & $rc & ")")
+  failIf(rc != ZOk, "compress2 failed (" & $rc & ")")
   result.setLen(int(bound))
