@@ -79,9 +79,6 @@ proc nextRecord(r: var Reader): Arg =
   result = (true, r.data[r.pos ..< last])
   r.pos = if stop < 0: r.data.len else: stop + 1
 
-const cEscapes = "n\nt\tr\ra\ab\bf\fv\v\"\"\\\\"
-  ## The escapes git's `quote_c_style` emits, as letter/value pairs.
-
 proc unquoteC(s: string): string =
   ## Undo `quote_c_style`, which is how a value containing a space or a quote
   ## is spelled when the stream is not NUL-separated.  Only the escapes git
@@ -95,10 +92,13 @@ proc unquoteC(s: string): string =
       continue
     inc i
     failIf(i >= s.len, "badly quoted argument: " & s)
-    var k = 0
-    while k < cEscapes.len and cEscapes[k] != s[i]: k += 2
-    if k < cEscapes.len:
-      result.add cEscapes[k + 1]
+    var found = false
+    for (raw, letter) in cEscapes:
+      if s[i] == letter:
+        result.add raw
+        found = true
+        break
+    if found: discard
     elif s[i] in {'0' .. '7'}:
       var v = 0
       var n = 0

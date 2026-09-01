@@ -9,6 +9,7 @@ import std/[os, strutils]
 import cli, config, util
 import cmd/hashobject, cmd/catfile
 import cmd/updateref, cmd/symbolicref, cmd/foreachref
+import cmd/lstree, cmd/writetree, cmd/readtree, cmd/updateindex, cmd/lsfiles
 import cmd/config as cmdconfig
 
 const
@@ -30,8 +31,13 @@ Commands:
    config                read and write configuration
    for-each-ref          list refs through a format string
    hash-object           compute, and optionally store, an object ID
+   ls-files              list index and working-tree files
+   ls-tree               list a tree object's entries
+   read-tree             load a tree into the index
    symbolic-ref          read and write symbolic refs
+   update-index          modify the index
    update-ref            create, update and delete refs
+   write-tree            write the index out as a tree
    version               print the version"""
 
 proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
@@ -41,6 +47,11 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   of "update-ref": cmdUpdateRef(c, args)
   of "symbolic-ref": cmdSymbolicRef(c, args)
   of "for-each-ref": cmdForEachRef(c, args)
+  of "ls-tree": cmdLsTree(c, args)
+  of "write-tree": cmdWriteTree(c, args)
+  of "read-tree": cmdReadTree(c, args)
+  of "update-index": cmdUpdateIndex(c, args)
+  of "ls-files": cmdLsFiles(c, args)
   of "config": cmdconfig.cmdConfig(c, args)
   of "version": (echo version; 0)
   of "help": (echo usageText; 0)

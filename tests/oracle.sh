@@ -651,6 +651,196 @@ diff <(git config --file "$WORK/hand.config" --list) \
   || { bad "config parser"; diff <(git config --file "$WORK/hand.config" --list) \
        <("$GITTLE" config --file "$WORK/hand.config" list) | head -8; }
 
+# ===========================================================================
+# Phase 3 -- the index and trees
+# ===========================================================================
+
+# ------------------------------------------------------- ls-tree, against git
+# The reference repository's own HEAD tree: 561 top-level entries, 4,850
+# recursive, every mode git can store including a gitlink.
+lst_ok=1; nlst=0
+for o in "" "-r" "-r -t" "-t" "-d" "-d -r" "-l" "-r -l" "--name-only" \
+         "--abbrev" "--abbrev=8" "--abbrev=4" "-z"; do
+  for p in "" "Documentation" "t/" "t" "Makefile" "Doc*" "*.c" "Documenta" \
+           "Documentation/git-add.adoc" "Documentation/technical" "nope"; do
+    nlst=$((nlst+1))
+    if [ -z "$p" ]; then
+      git -C "$REFREPO" ls-tree $o HEAD > "$WORK/lt.git" 2>&1
+      "$GITTLE" -C "$REFREPO" ls-tree $o HEAD > "$WORK/lt.gittle" 2>&1
+    else
+      git -C "$REFREPO" ls-tree $o HEAD -- "$p" > "$WORK/lt.git" 2>&1
+      "$GITTLE" -C "$REFREPO" ls-tree $o HEAD -- "$p" > "$WORK/lt.gittle" 2>&1
+    fi
+    cmp -s "$WORK/lt.git" "$WORK/lt.gittle" \
+      || { lst_ok=0; echo "  ls-tree $o -- '$p'";
+           diff "$WORK/lt.git" "$WORK/lt.gittle" | head -3; }
+  done
+done
+[ $lst_ok = 1 ] && { ok; report "ls-tree" "$nlst option and path combinations"; } \
+                || bad "ls-tree"
+
+# -------------------------------------- the index git wrote, read by gittle
+# 4,850 entries of somebody else's index, without touching it.
+cp "$REFREPO/.git/index" "$WORK/big.index"
+check "write-tree over git's own index" \
+  "$(GIT_INDEX_FILE=$WORK/big.index git -C "$REFREPO" write-tree)" \
+  "$(GIT_INDEX_FILE=$WORK/big.index "$GITTLE" -C "$REFREPO" write-tree)"
+big_ok=1
+for o in "" "-s"; do
+  GIT_INDEX_FILE="$WORK/big.index" git -C "$REFREPO" ls-files $o > "$WORK/lf.git"
+  GIT_INDEX_FILE="$WORK/big.index" "$GITTLE" -C "$REFREPO" ls-files $o > "$WORK/lf.gittle"
+  cmp -s "$WORK/lf.git" "$WORK/lf.gittle" || { big_ok=0; echo "  ls-files $o"; }
+done
+for p in "*.c" "Documentation" "t/" "Makefile" "Documentation/*.adoc"; do
+  GIT_INDEX_FILE="$WORK/big.index" git -C "$REFREPO" ls-files -- "$p" > "$WORK/lf.git"
+  GIT_INDEX_FILE="$WORK/big.index" "$GITTLE" -C "$REFREPO" ls-files -- "$p" > "$WORK/lf.gittle"
+  cmp -s "$WORK/lf.git" "$WORK/lf.gittle" || { big_ok=0; echo "  ls-files -- $p"; }
+done
+[ $big_ok = 1 ] && { ok; report "ls-files" "4850 entries, 5 pathspecs"; } \
+                || bad "ls-files on git's index"
+
+# ---------------------------------------------- interleaving on one repository
+IDX="$WORK/idx"
+git init -q "$IDX"
+( cd "$IDX" && mkdir -p a/b && echo hello > f.txt && echo deep > a/b/deep.txt \
+  && printf '#!/bin/sh\n' > run.sh && chmod +x run.sh && ln -s f.txt link )
+
+# gittle stages; git must see exactly that, and agree on the tree.
+( cd "$IDX" && "$GITTLE" update-index --add f.txt a/b/deep.txt run.sh link )
+check "git sees what gittle staged" \
+  "A  a/b/deep.txt
+A  f.txt
+A  link
+A  run.sh" "$(git -C "$IDX" status --porcelain)"
+check "the same tree object" \
+  "$(git -C "$IDX" write-tree)" "$("$GITTLE" -C "$IDX" write-tree)"
+diff <(git -C "$IDX" ls-files -s) <("$GITTLE" -C "$IDX" ls-files -s) >/dev/null \
+  && ok || bad "ls-files -s after gittle staged"
+git -C "$IDX" commit -qm one
+git -C "$IDX" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after gittle wrote the index"
+report "gittle writes, git reads" "modes 100644, 100755 and 120000"
+
+# Every ls-files selector, against a working tree that is modified, deleted
+# and chmod'd at once -- git emits up to three lines per entry, so the
+# combinations are where the structure shows.
+( cd "$IDX" && echo changed > f.txt && rm a/b/deep.txt && chmod -x run.sh )
+sel_ok=1; nsel=0
+for o in "" "-c" "-s" "-m" "-d" "-u" "-c -m" "-d -m" "-c -d -m" "-m -s" "-z" \
+         "-c -s" "-u -s" "-c -u" "-c -d" "-d -s"; do
+  nsel=$((nsel+1))
+  git -C "$IDX" ls-files $o > "$WORK/s.git" 2>&1
+  "$GITTLE" -C "$IDX" ls-files $o > "$WORK/s.gittle" 2>&1
+  cmp -s "$WORK/s.git" "$WORK/s.gittle" \
+    || { sel_ok=0; echo "  ls-files $o"; diff "$WORK/s.git" "$WORK/s.gittle" | head -3; }
+done
+[ $sel_ok = 1 ] && { ok; report "ls-files selectors" "$nsel combinations"; } \
+                || bad "ls-files selectors"
+
+# --refresh must leave an index git calls clean.
+( cd "$IDX" && git checkout -q -- . && touch f.txt run.sh \
+  && "$GITTLE" update-index --refresh >/dev/null )
+check "git status after gittle --refresh" "" "$(git -C "$IDX" status --porcelain)"
+
+# --cacheinfo stages without a working-tree file at all.
+BLOB=$(echo staged-directly | git -C "$IDX" hash-object -w --stdin)
+"$GITTLE" -C "$IDX" update-index --add --cacheinfo "100644,$BLOB,virtual.txt"
+check "--cacheinfo, read by git" "100644 $BLOB 0	virtual.txt" \
+  "$(git -C "$IDX" ls-files -s virtual.txt)"
+git -C "$IDX" reset -q --hard
+
+# ---------------------------------------------------------- index formats
+FMT="$WORK/fmt"
+git init -q "$FMT"
+( cd "$FMT" && mkdir -p d && for i in 1 2 3; do echo "file $i" > "d/f$i.txt"; done \
+  && echo top > top.txt && git add -A && git commit -qm one )
+fmt_ok=1
+for v in 2 3 4; do
+  git -C "$FMT" update-index --index-version $v >/dev/null 2>&1
+  diff <(git -C "$FMT" ls-files -s) <("$GITTLE" -C "$FMT" ls-files -s) >/dev/null \
+    || { fmt_ok=0; echo "  index v$v reads differently"; }
+  [ "$(git -C "$FMT" write-tree)" = "$("$GITTLE" -C "$FMT" write-tree)" ] \
+    || { fmt_ok=0; echo "  index v$v gives a different tree"; }
+done
+[ $fmt_ok = 1 ] && { ok; report "index versions" "2, 3 and 4 all read"; } \
+                || bad "index versions"
+
+git -C "$FMT" update-index --index-version 2 >/dev/null
+git -C "$FMT" update-index --skip-worktree top.txt
+( cd "$FMT" && "$GITTLE" update-index --add d/f1.txt )
+check "extended flags survive a gittle rewrite" "S top.txt" \
+  "$(git -C "$FMT" ls-files -v top.txt)"
+git -C "$FMT" update-index --no-skip-worktree top.txt
+
+# index.skipHash writes an all-zero trailer, which is valid and must be read.
+git -C "$FMT" -c index.skipHash=true add -A
+check "a zeroed checksum is accepted" \
+  "$(git -C "$FMT" ls-files -s | head -1)" \
+  "$("$GITTLE" -C "$FMT" ls-files -s | head -1)"
+
+# A split index is a *required* extension gittle does not implement, so it must
+# be refused by name rather than half-read.
+git -C "$FMT" update-index --split-index >/dev/null 2>&1
+"$GITTLE" -C "$FMT" ls-files >/dev/null 2>"$WORK/split.err"
+grep -q "this index is split" "$WORK/split.err" && ok \
+  || { bad "split index should be refused by name"; head -2 "$WORK/split.err"; }
+git -C "$FMT" update-index --no-split-index >/dev/null 2>&1
+report "index formats" "v2/v3/v4, skipHash, split refused"
+
+# ------------------------------------- paths that need quoting, and exit codes
+# git C-quotes a path containing a quote, a backslash, a control character or
+# any byte above ASCII -- but not under -z, where the NUL already delimits.
+QP="$WORK/quote"
+git init -q "$QP"
+( cd "$QP" && printf x > "sp ace.txt" && printf y > 'quo"te.txt' \
+  && printf z > "$(printf 'uni\303\251.txt')" && git add -A && git commit -qm q ) >/dev/null 2>&1
+quote_ok=1
+for o in "" "-s" "-z"; do
+  diff <(git -C "$QP" ls-files $o) <("$GITTLE" -C "$QP" ls-files $o) >/dev/null \
+    || { quote_ok=0; echo "  ls-files $o"; diff <(git -C "$QP" ls-files $o) <("$GITTLE" -C "$QP" ls-files $o) | head -3; }
+done
+for o in "" "-r" "--name-only" "-z"; do
+  diff <(git -C "$QP" ls-tree $o HEAD) <("$GITTLE" -C "$QP" ls-tree $o HEAD) >/dev/null \
+    || { quote_ok=0; echo "  ls-tree $o"; }
+done
+[ $quote_ok = 1 ] && { ok; report "path quoting" "quote, space and UTF-8, and -z"; } \
+                  || bad "path quoting"
+
+# --error-unmatch is a status code, and only the cached pass satisfies it.
+git -C "$QP" ls-files --error-unmatch nope >/dev/null 2>&1; ea=$?
+"$GITTLE" -C "$QP" ls-files --error-unmatch nope >/dev/null 2>&1; eb=$?
+check "--error-unmatch on a missing path" "$ea" "$eb"
+git -C "$QP" ls-files --error-unmatch -m "sp ace.txt" >/dev/null 2>&1; ea=$?
+"$GITTLE" -C "$QP" ls-files --error-unmatch -m "sp ace.txt" >/dev/null 2>&1; eb=$?
+check "--error-unmatch counts only the cached pass" "$ea" "$eb"
+
+# ------------------------------------------------------------------ read-tree
+RT="$WORK/rt"
+git clone -q "$IDX" "$RT" 2>/dev/null
+( cd "$RT" && "$GITTLE" read-tree HEAD )
+check "read-tree then git write-tree" "$(git -C "$RT" rev-parse "HEAD^{tree}")" \
+  "$(git -C "$RT" write-tree)"
+( cd "$RT" && "$GITTLE" read-tree --empty )
+check "read-tree --empty" "" "$(git -C "$RT" ls-files)"
+( cd "$RT" && "$GITTLE" read-tree HEAD )
+diff <(git -C "$RT" ls-files -s) <("$GITTLE" -C "$RT" ls-files -s) >/dev/null \
+  && ok || bad "read-tree produced a different index"
+git -C "$RT" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after read-tree"
+report "read-tree" "a tree, and --empty"
+
+# An unmerged index has three stages for one path; neither tool may write a
+# tree from it.
+MG="$WORK/merge"
+git init -q "$MG"
+( cd "$MG" && echo base > f && git add f && git commit -qm base \
+  && git checkout -qb side && echo side > f && git commit -qam side \
+  && git checkout -q - && echo main > f && git commit -qam main \
+  && git merge side ) >/dev/null 2>&1
+diff <(git -C "$MG" ls-files -u) <("$GITTLE" -C "$MG" ls-files -u) >/dev/null \
+  && ok || bad "ls-files -u on a conflicted index"
+"$GITTLE" -C "$MG" write-tree >/dev/null 2>&1 \
+  && bad "write-tree should refuse an unmerged index" || ok
+report "unmerged entries" "three stages read, write-tree refuses"
+
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

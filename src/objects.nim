@@ -155,11 +155,21 @@ func modeType*(mode: uint32): ObjectType =
   of 0o160000'u32: otCommit
   else: otBlob
 
+func octalMode*(mode: uint32): string =
+  ## Octal with no leading zero -- how a mode is *stored* in a tree object.  A
+  ## directory is `40000`, not `040000`, and writing the padded form would
+  ## produce a different object ID for the same tree (R1).
+  if mode == 0: return "0"
+  var n = mode
+  while n > 0:
+    result = char(ord('0') + int(n and 7)) & result
+    n = n shr 3
+
 func formatMode*(mode: uint32): string =
-  ## Six octal digits, zero-padded -- how git displays a tree entry.
-  result = newString(6)
-  for i in countdown(5, 0):
-    result[i] = char(ord('0') + int((mode shr uint32((5 - i) * 3)) and 7))
+  ## Six octal digits, zero-padded -- how git *displays* a mode, in `ls-tree`
+  ## and `cat-file -p`.  Not what goes in the object.
+  result = octalMode(mode)
+  while result.len < 6: result = "0" & result
 
 iterator treeEntries*(data: string): TreeEntry =
   var i = 0

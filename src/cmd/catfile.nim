@@ -23,42 +23,6 @@ proc prettyPrint(obj: GitObject) =
   else:
     stdout.write obj.data
 
-# -- type dereferencing -----------------------------------------------------
-
-proc headerField(data: string, name: string): string =
-  ## The value of a leading `<name> <value>` line in a commit or tag.  Both put
-  ## their structural headers first, so this never scans the message.
-  var i = 0
-  while i < data.len:
-    let eol = data.find('\n', i)
-    let line = if eol < 0: data[i .. ^1] else: data[i ..< eol]
-    if line.len == 0: break          # blank line ends the header block
-    if line.startsWith(name & " "): return line[name.len + 1 .. ^1].strip()
-    if eol < 0: break
-    i = eol + 1
-  ""
-
-proc peelTo(r: Repository, start: Oid, want: ObjectType): GitObject =
-  ## `cat-file <type> <object>` asserts *or dereferences* to a type: a tag
-  ## yields what it points at, a commit yields its tree.
-  var o = start
-  for _ in 0 .. 15:
-    result = r.readObject(o)
-    if result.kind == want: return
-    case result.kind
-    of otTag:
-      let target = headerField(result.data, "object")
-      failIf(target.len == 0, "invalid tag object " & $o)
-      o = parseOid(target)
-    of otCommit:
-      if want != otTree: break
-      let tree = headerField(result.data, "tree")
-      failIf(tree.len == 0, "invalid commit object " & $o)
-      o = parseOid(tree)
-    else:
-      break
-  fail("gittle cat-file " & $start & ": bad file")
-
 # -- batch mode -------------------------------------------------------------
 
 proc emitFormat(fmt: string, o: Oid, kind: ObjectType, size: int) =
@@ -164,6 +128,6 @@ proc cmdCatFile*(c: Ctx, args: seq[string]): int =
   let want = parseObjectType(rest[0])
   failIf(want == otBad, "invalid object type '" & rest[0] & "'")
   let o = r.resolveOid(rest[1])
-  stdout.write peelTo(r, o, want).data
+  stdout.write r.peelTo(o, want).obj.data
   stdout.flushFile()
   0

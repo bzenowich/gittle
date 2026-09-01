@@ -49,6 +49,12 @@ proc compressBound(sourceLen: culong): culong {.importc, zlibh.}
 proc compress2(dest: ptr byte, destLen: var culong, source: ptr byte,
                sourceLen: culong, level: cint): cint {.importc, zlibh.}
 
+# The header is included explicitly rather than relied upon arriving from the
+# `importc` procs below: in a translation unit that happens not to call one of
+# them, it would not, and the size check would fail to compile.
+{.emit: """/*INCLUDESECTION*/
+#include <zlib.h>
+""".}
 {.emit: """/*TYPESECTION*/
 static const long gittle_zstream_size = (long)sizeof(z_stream);
 """.}

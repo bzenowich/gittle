@@ -33,6 +33,55 @@ proc fail*(msg: string) {.noreturn.} =
 proc failIf*(cond: bool, msg: string) {.inline.} =
   if cond: fail(msg)
 
+const cEscapes* = [('\a', 'a'), ('\b', 'b'), ('\f', 'f'), ('\n', 'n'),
+                   ('\r', 'r'), ('\t', 't'), ('\v', 'v'), ('"', '"'),
+                   ('\\', '\\')]
+  ## The escapes git's `quote_c_style` writes and reads, as (byte, letter).
+  ## Written as pairs rather than a packed string because a packed one is off
+  ## by a character if you miscount it, and nothing catches that until the
+  ## output is wrong.
+
+proc quotePath*(path: string): string =
+  ## Render a path the way git prints one (`quote.c:quote_c_style`).
+  ##
+  ## A path is just bytes, and most of them are unremarkable.  One containing a
+  ## quote, a backslash, a control character or any byte above ASCII is wrapped
+  ## in double quotes with C-style escapes -- so `ls-files` output stays one
+  ## path per line and can be pasted back into a shell.  `core.quotePath` turns
+  ## the high-byte half off; v1 does not implement it, which matches the
+  ## default and is what almost every repository sees.
+  ##
+  ## `-z` output is *not* quoted: a NUL terminator already makes every byte
+  ## unambiguous, which is the whole reason `-z` exists.
+  var needs = false
+  for c in path:
+    if c < ' ' or c >= '\x7F' or c == '"' or c == '\\':
+      needs = true
+      break
+  if not needs: return path
+
+  result = "\""
+  for c in path:
+    var escaped = false
+    for (raw, letter) in cEscapes:
+      if c == raw:
+        result.add '\\'
+        result.add letter
+        escaped = true
+        break
+    if escaped: discard
+    elif c < ' ' or c >= '\x7F':
+      # Three octal digits, always: `\3` followed by a digit would reparse as a
+      # different byte.
+      let v = int(uint8(c))
+      result.add '\\'
+      result.add char(ord('0') + ((v shr 6) and 7))
+      result.add char(ord('0') + ((v shr 3) and 7))
+      result.add char(ord('0') + (v and 7))
+    else:
+      result.add c
+  result.add '"'
+
 proc interpolate*(format: string, atom: proc (name: string): string): string =
   ## Expand a git-style format string.
   ##

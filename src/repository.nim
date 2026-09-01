@@ -5,7 +5,11 @@
 import std/[os, strutils, algorithm]
 import oid, objects, config, packfile, refs, ident, refname, util
 
-export refs, refname, config
+# Re-exported deliberately.  Every caller that holds a `Repository` also
+# handles the `Oid`s and `ObjectType`s it hands back, and a missing `oid`
+# import does not fail to compile -- it silently selects Nim's generic `$` and
+# prints an object ID as `(b: [179, 176, ...])`.
+export refs, refname, config, oid, objects
 
 type
   Repository* = ref object
@@ -240,7 +244,16 @@ proc objectInfo*(r: Repository, o: Oid): tuple[kind: ObjectType, size: int] =
   fail("object not found: " & $o)
 
 proc writeObject*(r: Repository, kind: ObjectType, data: string): Oid =
-  writeLoose(r.objDirs[0], kind, data)
+  ## Write an object, unless it is already here.
+  ##
+  ## The existence check covers packs as well as loose files, which matters:
+  ## `write-tree` rewrites every tree in the repository, and without this a
+  ## single run would litter the object store with thousands of loose copies of
+  ## objects that are already in a pack.  git makes the same check
+  ## (`freshen_packed_object`).
+  result = hashObject(kind, data)
+  if r.hasObject(result): return
+  discard writeLoose(r.objDirs[0], kind, data)
 
 # ---------------------------------------------------------------------------
 # The ref store
@@ -271,11 +284,86 @@ proc refs*(r: Repository): RefStore =
         try: r.objectInfo(o).kind except GittleError: otBad)
   r.refStoreCache
 
+proc headerField*(data, name: string): string =
+  ## The value of a leading `<name> <value>` line in a commit or a tag.  Both
+  ## put their structural headers first and end them with a blank line, so this
+  ## never scans the message.
+  var i = 0
+  while i < data.len:
+    let eol = data.find('\n', i)
+    let line = if eol < 0: data[i .. ^1] else: data[i ..< eol]
+    if line.len == 0: break
+    if line.startsWith(name & " "): return line[name.len + 1 .. ^1].strip()
+    if eol < 0: break
+    i = eol + 1
+  ""
+
+proc peelTo*(r: Repository, start: Oid, want: ObjectType):
+    tuple[oid: Oid, obj: GitObject] =
+  ## Follow a name to the type actually wanted: a tag yields what it points at,
+  ## a commit yields its tree.  This is what makes `<tree-ish>` an argument type
+  ## rather than a literal tree -- `ls-tree HEAD` and `cat-file tree v1.0` both
+  ## end up here.  Both the object and its name come back, because callers want
+  ## one or the other and re-hashing to recover the name would be absurd.
+  var o = start
+  for _ in 0 .. 15:
+    let obj = r.readObject(o)
+    if obj.kind == want: return (o, obj)
+    var next = ""
+    case obj.kind
+    of otTag: next = headerField(obj.data, "object")
+    of otCommit:
+      if want != otTree: break
+      next = headerField(obj.data, "tree")
+    else: break
+    failIf(next.len == 0, "invalid " & $obj.kind & " object " & $o)
+    o = parseOid(next)
+  fail($start & ": not a " & $want)
+
+proc workTreePath*(r: Repository, path: string): string =
+  ## Where an index entry's file lives.  In a bare repository there is no
+  ## working tree, and the path is used as given so that a caller which should
+  ## not be looking at files fails visibly rather than reading the wrong ones.
+  if r.workTree.len > 0: r.workTree / path else: path
+
+proc indexPath*(r: Repository): string =
+  ## The index is per-worktree -- that is most of the point of a worktree -- so
+  ## it lives in `gitDir`, never the common directory.  `GIT_INDEX_FILE`
+  ## overrides it, which is how `read-tree --index-output` and the merge
+  ## machinery work on a scratch index.
+  let env = getEnv("GIT_INDEX_FILE")
+  if env.len > 0: env else: r.gitDir / "index"
+
 proc headRefName*(r: Repository): string =
   ## The branch HEAD names, whether or not it exists yet.  In a repository with
   ## no commits this is the branch a first commit would create.
   let rf = r.refs.readRef(headRef)
   if rf.found and rf.isSymbolic: rf.symTarget else: headRef
+
+proc objectsMatching*(r: Repository, pre: OidPrefix): seq[Oid] =
+  ## Every object whose name begins with `pre`, loose and packed.
+  ##
+  ## Loose objects sit in fan-out directories named by their first byte, so a
+  ## one-nybble abbreviation has to look in sixteen of them and any longer one
+  ## in exactly one.  `walkDir` yields nothing for a directory that is absent,
+  ## which is the ordinary state of most of them.
+  let hex = ($pre.lowerBound)[0 ..< pre.nybbles]
+  var subdirs: seq[string]
+  if pre.nybbles == 1:
+    for n in "0123456789abcdef": subdirs.add hex & n
+  else:
+    subdirs.add hex[0 ..< 2]
+  for d in r.objDirs:
+    for sub in subdirs:
+      for _, path in walkDir(d / sub):
+        var o: Oid
+        if tryParseOid(sub & path.lastPathPart, o) and pre.matches(o) and
+           o notin result:
+          result.add o
+  r.loadPacks()
+  for p in r.packs:
+    for o in p.matching(pre):
+      if o notin result: result.add o
 
 proc resolveOid*(r: Repository, name: string): Oid =
   ## Turn a name into an object ID, in git's order of preference:
@@ -299,27 +387,7 @@ proc resolveOid*(r: Repository, name: string): Oid =
   failIf(not tryParsePrefix(name, pre) or pre.nybbles < 4,
          "not a valid object name: " & name)
 
-  var found: seq[Oid]
-  # Loose objects sit in fan-out directories named by their first byte, so a
-  # one-nybble abbreviation has to look in sixteen of them and any longer one
-  # in exactly one.  `walkDir` on a directory that is not there yields nothing.
-  let hex = ($pre.lowerBound)[0 ..< pre.nybbles]
-  var subdirs: seq[string]
-  if pre.nybbles == 1:
-    for n in "0123456789abcdef": subdirs.add hex & n
-  else:
-    subdirs.add hex[0 ..< 2]
-  for d in r.objDirs:
-    for sub in subdirs:
-      for _, path in walkDir(d / sub):
-        var o: Oid
-        if tryParseOid(sub & path.lastPathPart, o) and pre.matches(o) and
-           o notin found:
-          found.add o
-  r.loadPacks()
-  for p in r.packs:
-    for o in p.matching(pre):
-      if o notin found: found.add o
+  var found = r.objectsMatching(pre)
 
   if found.len == 0: fail("not a valid object name: " & name)
   if found.len > 1:
@@ -328,3 +396,57 @@ proc resolveOid*(r: Repository, name: string): Oid =
     for o in found: msg.add "\n  " & $o
     fail(msg)
   found[0]
+
+proc resolveTree*(r: Repository, name: string): Oid =
+  ## A `<tree-ish>` argument: resolve the name, then peel to the tree it names.
+  r.peelTo(r.resolveOid(name), otTree).oid
+
+# ---------------------------------------------------------------------------
+# Abbreviated object names
+# ---------------------------------------------------------------------------
+
+const
+  minAbbrev* = 4          ## git refuses anything shorter, and so does `resolveOid`
+  fallbackAbbrev* = 7     ## git's `FALLBACK_DEFAULT_ABBREV`, for a small repository
+
+proc approximateObjectCount(r: Repository): int =
+  ## Packed objects exactly, loose objects estimated the way git estimates them
+  ## (`odb.c`): count one fan-out directory and multiply by 256.  The answer
+  ## only picks a starting length, so an estimate is the right shape of answer.
+  r.loadPacks()
+  for p in r.packs: result += p.nObjects
+  for d in r.objDirs:
+    var n = 0
+    for _, _ in walkDir(d / "17"): inc n
+    result += n * 256
+
+proc autoAbbrev*(r: Repository): int =
+  ## How long an abbreviation has to be before collisions become likely.
+  ##
+  ## With about 2^n objects a collision is expected around 2^(n/2), and there
+  ## are four bits to a hex digit, so the length is ceil((msb + 1) / 2) -- with
+  ## a floor of seven (`odb.c`).  On the repository next door, 420,113 objects
+  ## give ten, which is what `git ls-tree --abbrev` prints.
+  var count = approximateObjectCount(r)
+  var msb = -1
+  while count > 0:
+    inc msb
+    count = count shr 1
+  result = max((msb + 1 + 1) div 2, fallbackAbbrev)
+
+proc uniqueAbbrev*(r: Repository, o: Oid, minLen: int): string =
+  ## The shortest prefix of `o` that is at least `minLen` digits and names no
+  ## other object.
+  ##
+  ## `--abbrev=<n>` is a *minimum*, not a length: git lengthens it until the
+  ## result is unambiguous (`odb.c:repo_find_unique_abbrev`), because an
+  ## abbreviation naming two objects is worse than a long one.  Truncating
+  ## instead produces output that looks right and cannot be pasted back.
+  let full = $o
+  var n = clamp(minLen, minAbbrev, OidHexLen)
+  while n < OidHexLen:
+    var pre: OidPrefix
+    discard tryParsePrefix(full[0 ..< n], pre)
+    if r.objectsMatching(pre).len <= 1: break
+    inc n
+  full[0 ..< n]
