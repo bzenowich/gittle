@@ -9,3 +9,6 @@ nimcache/
 
 # scratch
 *.tmp
+
+# build output
+/build/
