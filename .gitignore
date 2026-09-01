@@ -1,0 +1,11 @@
+# Nim build output
+nimcache/
+*.o
+/gittle
+/git-upload-pack
+/git-receive-pack
+/git-shell
+/git
+
+# scratch
+*.tmp
