@@ -218,10 +218,18 @@ func firstUnmatched*(ps: Pathspec, paths: openArray[string]): string =
     if not hit: return it.raw
   ""
 
-proc displayPath*(ps: Pathspec, path: string): string =
+proc relativeTo*(path, prefix: string): string =
   ## A root-relative path as the user should see it: relative to the directory
-  ## the command was run in.  git prints `../abspath.c` for a `:(top)` match
-  ## from a subdirectory, and paths with no leading `./` for the common case.
-  if ps.prefix.len == 0: return path
-  if path.startsWith(ps.prefix): return path[ps.prefix.len .. ^1]
-  relativePath(path, ps.prefix.strip(leading = false, chars = {'/'}))
+  ## the command was run in.  git prints `../abspath.c` for something above
+  ## that directory, and no leading `./` for the common case.
+  ##
+  ## Free of `Pathspec` because three commands need it without having one to
+  ## hand: `status` and `grep` print every path this way by default, and
+  ## `diff` prints none of them this way -- a patch is always root-relative,
+  ## because it has to apply from the root.
+  if prefix.len == 0: return path
+  if path.startsWith(prefix): return path[prefix.len .. ^1]
+  relativePath(path, prefix.strip(leading = false, chars = {'/'}))
+
+proc displayPath*(ps: Pathspec, path: string): string =
+  relativeTo(path, ps.prefix)

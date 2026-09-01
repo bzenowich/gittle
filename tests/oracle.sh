@@ -1244,11 +1244,17 @@ npath=$((npath+1))
 # Options that belong to a later phase must refuse by name rather than be
 # ignored -- a `log` that silently dropped `--grep` would answer a different
 # question and look like it had answered.
+# `-p`, `--stat`, `--grep` and `--author` were on this list until phase 5 and
+# are now implemented; what is left belongs to phase 6 or is cut outright.
 def_ok=1
-for o in -p --stat --grep=x --author=x --all --topo-order --since=2020-01-01 --graph; do
+ndef=0
+for o in --all --branches --tags --topo-order --date-order --since=2020-01-01 \
+         --until=2020-01-01 --merges --no-merges --graph --follow --full-diff \
+         --count --stdin -M -C --patience --histogram --word-diff --summary; do
+  ndef=$((ndef+1))
   "$GITTLE" -C "$REFREPO" log -1 "$o" >/dev/null 2>&1 && { def_ok=0; echo "  $o was accepted"; }
 done
-[ $def_ok = 1 ] && { ok; report "log deferrals" "7 later-phase options refuse by name"; } \
+[ $def_ok = 1 ] && { ok; report "log deferrals" "$ndef later-phase options refuse by name"; } \
                || bad "log deferrals"
 
 # --------------------------------------------------------------------- show
@@ -1256,7 +1262,7 @@ show_ok=1; nshow=0
 for f in "" "--oneline" "--pretty=raw" "--pretty=fuller" "--format=%H%n%s"; do
   nshow=$((nshow+1))
   a=$(git -C "$REFREPO" show -s $NOMAILMAP $f HEAD 2>&1)
-  b=$("$GITTLE" -C "$REFREPO" show $f HEAD 2>&1)
+  b=$("$GITTLE" -C "$REFREPO" show -s $f HEAD 2>&1)
   [ "$a" = "$b" ] || { show_ok=0; echo "  show $f differs"; }
 done
 # Every tag in the reference repository: annotated, signed, nested, and one
@@ -1266,7 +1272,7 @@ ntag=0; TAGS=$(git -C "$REFREPO" tag)
 for t in $TAGS; do
   ntag=$((ntag+1))
   a=$(git -C "$REFREPO" show -s $NOMAILMAP "$t" 2>&1)
-  b=$("$GITTLE" -C "$REFREPO" show "$t" 2>&1)
+  b=$("$GITTLE" -C "$REFREPO" show -s "$t" 2>&1)
   [ "$a" = "$b" ] || { show_ok=0; echo "  show $t differs"; }
 done
 # A tree lists names with a trailing slash on directories; a blob is raw bytes.
@@ -1278,6 +1284,383 @@ diff <(git -C "$REFREPO" show "$TREE") <("$GITTLE" -C "$REFREPO" show "$TREE") >
 diff <(git -C "$REFREPO" show "$BLOB") <("$GITTLE" -C "$REFREPO" show "$BLOB") >/dev/null \
   || { show_ok=0; echo "  show <blob> differs"; }
 [ $show_ok = 1 ] && { ok; report "show" "$nshow objects and $ntag tags"; } || bad "show"
+
+# ===========================================================================
+# Phase 5 -- diff, status and grep
+# ===========================================================================
+#
+# Three divergences are deliberate (phase-5.md) and each is tested by pointing
+# git at the option that selects the matching behavior, rather than left
+# untested:
+#
+#   --no-renames        gittle never detects a rename (plan.md §4)
+#   --minimal           gittle's Myers is always minimal; git's is not
+#   --diff-merges=off   combined merge diffs are cut (docs/03)
+#
+NOREN="--no-renames --minimal"
+NOCC="--diff-merges=off"
+# The reference repository's own .gitattributes sets `*.[ch] diff=cpp` (and
+# perl and python), and a userdiff driver replaces the rule that picks the
+# name on a `@@` line: the cpp pattern rejects jump targets, so git says
+# `static int f(...)` where gittle -- which has no gitattributes, decision 6
+# -- says `out:`.  Overriding each driver's xfuncname with git's own built-in
+# default is what makes the two comparable.
+NOATTR="-c diff.cpp.xfuncname=^[A-Za-z_$].*$ -c diff.perl.xfuncname=^[A-Za-z_$].*$ -c diff.python.xfuncname=^[A-Za-z_$].*$"
+
+# ------------------------------------------------- the diff engine, alone
+# Every file pair of real commits through both engines, with git's four header
+# lines stripped.  Comparing *pairs* rather than commits is what makes a
+# failure point at the file (phase-5.md, "The oracle procedure").
+if [ -x "$SELF" ]; then
+  PAIRN=120
+  [ $FULL = 1 ] && PAIRN=900
+  eng_ok=1; npair=0
+  for c in $(git -C "$REFREPO" rev-list --no-merges -n $PAIRN HEAD); do
+    for f in $(git -C "$REFREPO" diff-tree -r --no-renames --name-only "$c^" "$c"); do
+      git -C "$REFREPO" cat-file blob "$c^:$f" > "$WORK/p5.a" 2>/dev/null || continue
+      git -C "$REFREPO" cat-file blob "$c:$f"  > "$WORK/p5.b" 2>/dev/null || continue
+      npair=$((npair+1))
+      case $((npair % 7)) in
+        0) fl="";;  1) fl="-U0";; 2) fl="-U10";; 3) fl="-w";;
+        4) fl="-b";; 5) fl="--ignore-space-at-eol";; 6) fl="-U1";;
+      esac
+      git diff --no-index --minimal --no-color $fl -- "$WORK/p5.a" "$WORK/p5.b" \
+        | tail -n +5 > "$WORK/p5.pg"
+      "$SELF" diff $fl "$WORK/p5.a" "$WORK/p5.b" > "$WORK/p5.pt"
+      cmp -s "$WORK/p5.pg" "$WORK/p5.pt" || { eng_ok=0; echo "  $c $f [$fl] differs"; }
+    done
+  done
+  [ $eng_ok = 1 ] && { ok; report "diff engine" "$npair file pairs, hunk for hunk"; } \
+                  || bad "diff engine"
+else
+  report "diff engine" "skipped (no nim)"
+fi
+
+# ------------------------------------------------------------------- diff
+# A repository in a state that has one of everything: a modification, a
+# deletion, a creation, a staged file, a type change and a mode change.
+DR="$WORK/diffrepo"
+git init -q "$DR"
+( cd "$DR" && printf 'one\ntwo\nthree\n' > a.txt && printf 'x\n' > b.txt \
+  && mkdir sub && printf 'deep\n' > sub/c.txt && ln -s a.txt l \
+  && printf 'bin\000ary\n' > bin.dat \
+  && git add -A && git commit -qm one )
+( cd "$DR" && printf 'one\nTWO\nthree\nfour\n' > a.txt && rm b.txt \
+  && printf 'new\n' > d.txt && git add d.txt && rm l && printf 'nolink\n' > l \
+  && chmod +x sub/c.txt )
+
+diff_ok=1; ndiff=0
+for f in "" "--raw" "--stat" "--numstat" "--shortstat" "--name-only" \
+         "--name-status" "--cached" "--cached --raw" "--cached --stat" \
+         "HEAD" "HEAD --raw" "HEAD --stat" "HEAD --name-status" \
+         "-U0" "-U1" "-U10" "-R" "-R --raw" "--full-index" "--no-prefix" \
+         "--abbrev=12" "--abbrev=12 --raw" "-w" "-b" "--ignore-space-at-eol" \
+         "--ignore-cr-at-eol" "-a" "--diff-filter=D" "--diff-filter=A" \
+         "--diff-filter=M" "--diff-filter=T" "-S four" "-S nothing" \
+         "--stat -p" "--numstat --name-only" "--name-only --numstat" \
+         "--raw --name-only" "--raw --name-status" "--color" "-s" \
+         "-s -p" "-p -s" "-s --stat" "--stat -s" "-s --raw" "--raw -s" \
+         "-- a.txt" "-- sub" "HEAD -- a.txt" "--cached -- d.txt"; do
+  ndiff=$((ndiff+1))
+  ( cd "$DR" && git diff $NOREN $f ) > "$WORK/p5.dg" 2>&1
+  ( cd "$DR" && "$GITTLE" diff $f ) > "$WORK/p5.dt" 2>&1
+  cmp -s "$WORK/p5.dg" "$WORK/p5.dt" || { diff_ok=0; echo "  diff $f differs"; }
+done
+# -z is compared as bytes; the shell cannot hold a NUL in a variable.
+for f in "-z --raw" "-z --name-only" "-z --name-status" "-z --numstat"; do
+  ndiff=$((ndiff+1))
+  ( cd "$DR" && git diff $NOREN $f ) > "$WORK/p5.dg" 2>&1
+  ( cd "$DR" && "$GITTLE" diff $f ) > "$WORK/p5.dt" 2>&1
+  cmp -s "$WORK/p5.dg" "$WORK/p5.dt" || { diff_ok=0; echo "  diff $f differs"; }
+done
+# Two trees, and the exit status --exit-code reports.
+ndiff=$((ndiff+1))
+diff <(git -C "$REFREPO" $NOATTR diff $NOREN HEAD~1 HEAD --stat 2>&1) \
+     <("$GITTLE" -C "$REFREPO" diff "$(git -C "$REFREPO" rev-parse HEAD~1)" HEAD --stat 2>&1) \
+  >/dev/null || { diff_ok=0; echo "  diff <tree> <tree> --stat differs"; }
+( cd "$DR" && git diff --quiet ); a=$?
+( cd "$DR" && "$GITTLE" diff --quiet ); b=$?
+ndiff=$((ndiff+1))
+[ "$a" = "$b" ] && [ "$a" = 1 ] || { diff_ok=0; echo "  --quiet exit status $a vs $b"; }
+( cd "$DR" && git diff --quiet -- nosuchfile ); a=$?
+( cd "$DR" && "$GITTLE" diff --quiet -- nosuchfile ); b=$?
+ndiff=$((ndiff+1))
+[ "$a" = "$b" ] && [ "$a" = 0 ] || { diff_ok=0; echo "  --quiet clean exit status $a vs $b"; }
+# `-s` is an assignment in git, not a suppression, so it is order-sensitive
+# against every other format -- and it is a hard error with the name formats.
+( cd "$DR" && git diff -s --name-only ) >/dev/null 2>&1; a=$?
+( cd "$DR" && "$GITTLE" diff -s --name-only ) >/dev/null 2>&1; b=$?
+ndiff=$((ndiff+1))
+{ [ "$a" != 0 ] && [ "$b" != 0 ]; } \
+  || { diff_ok=0; echo "  -s --name-only should be refused ($a/$b)"; }
+# --no-index needs no repository at all.
+ndiff=$((ndiff+1))
+printf 'p\nq\n' > "$WORK/p5.n1"; printf 'p\nr\n' > "$WORK/p5.n2"
+diff <(git diff --no-index --minimal "$WORK/p5.n1" "$WORK/p5.n2" 2>&1) \
+     <("$GITTLE" diff --no-index "$WORK/p5.n1" "$WORK/p5.n2" 2>&1) >/dev/null \
+  || { diff_ok=0; echo "  diff --no-index differs"; }
+[ $diff_ok = 1 ] && { ok; report "diff" "$ndiff option and invocation forms"; } \
+                 || bad "diff"
+
+# --------------------------------------------- log and show, with the diff
+LOGD=60
+[ $FULL = 1 ] && LOGD=400
+ld_ok=1; nld=0
+for f in "-p" "--stat" "--numstat" "--shortstat" "--raw" "--name-only" \
+         "--name-status" "-p --stat" "-p --oneline" "--stat --oneline" \
+         "-p --format=%s" "-p --format=format:%s" "-p -U1" "-p -w" \
+         "-p --full-index" "--stat --format=full" "--numstat -z" \
+         "-p --abbrev=12"; do
+  nld=$((nld+1))
+  a=$(git -C "$REFREPO" $NOATTR log $NOMAILMAP $NOREN -n$LOGD $f 2>&1 | md5sum)
+  b=$("$GITTLE" -C "$REFREPO" log -n$LOGD $f 2>&1 | md5sum)
+  [ "$a" = "$b" ] || { ld_ok=0; echo "  log $f differs"; }
+done
+# show: a commit, a merge, a root commit, a tag and a tag of a tag.
+SHOWOBJ="HEAD $(git -C "$REFREPO" rev-parse HEAD~3) \
+         $(git -C "$REFREPO" rev-list --max-parents=0 HEAD | tail -1) \
+         v2.50.0 v1.0rc1"
+for f in "" "-s" "--stat" "--numstat" "-p --stat" "--oneline" "--name-status" \
+         "--raw" "-U1" "--shortstat" "--name-only" "--format=raw" \
+         "--format=full" "--format=fuller" "--format=%s"; do
+  for obj in $SHOWOBJ; do
+    nld=$((nld+1))
+    a=$(git -C "$REFREPO" $NOATTR show $NOMAILMAP $NOREN $NOCC $f $obj 2>&1 | md5sum)
+    b=$("$GITTLE" -C "$REFREPO" show $f $obj 2>&1 | md5sum)
+    [ "$a" = "$b" ] || { ld_ok=0; echo "  show $f $obj differs"; }
+  done
+done
+[ $ld_ok = 1 ] && { ok; report "log and show diffs" "$nld format combinations"; } \
+               || bad "log and show diffs"
+
+# --------------------------------------------- log's limiting patterns
+# --grep, --author and --committer, and how they combine.  Measured against
+# git rather than read off the manual: different kinds AND, repeats of one
+# kind OR, and --all-match turns the message group into an AND too.
+lim_ok=1; nlim=0
+LIMN=3000
+[ $FULL = 1 ] && LIMN=20000
+for f in "--grep=pack" "--grep=pack --grep=ref" "--grep=pack --grep=ref --all-match" \
+         "--grep=pack --invert-grep" "--author=Junio" "--committer=Junio" \
+         "--author=Junio --grep=pack" "--author=Junio --committer=Taylor" \
+         "--grep=PACK -i" "--grep=pack -F" "--grep=p.ck" "--author=gitster@pobox.com"; do
+  nlim=$((nlim+1))
+  a=$(git -C "$REFREPO" log $NOMAILMAP -n$LIMN --format=%H -E $f 2>&1 | md5sum)
+  b=$("$GITTLE" -C "$REFREPO" log -n$LIMN --format=%H $f 2>&1 | md5sum)
+  [ "$a" = "$b" ] || { lim_ok=0; echo "  log $f differs"; }
+done
+[ $lim_ok = 1 ] && { ok; report "log --grep/--author" "$nlim pattern combinations"; } \
+                || bad "log --grep/--author"
+
+# ----------------------------------------------------------------- status
+# Swept over repository *states*, not only over options: the four formats are
+# cheap to enumerate, and what is hard to get right is the state they describe.
+SR="$WORK/statusrepo"
+git init -q "$SR"
+st_ok=1; nst=0
+status_all() {  # status_all <label>
+  for f in "" "-s" "-s -b" "--porcelain" "--porcelain=v2" "--porcelain=v2 -b" \
+           "-uall" "-uno" "-s -uall" "-s -uno" "--long -uno" "-b" \
+           "-z" "--porcelain=v2 -z" "-s -- sub" "-- a.txt"; do
+    nst=$((nst+1))
+    ( cd "$SR" && git status $f ) > "$WORK/p5.sg" 2>&1
+    ( cd "$SR" && "$GITTLE" status $f ) > "$WORK/p5.st" 2>&1
+    cmp -s "$WORK/p5.sg" "$WORK/p5.st" || { st_ok=0; echo "  [$1] status $f differs"; }
+  done
+}
+status_all "empty repository"
+( cd "$SR" && printf 'a\n' > a.txt && mkdir -p sub/deep && printf 'c\n' > sub/deep/c.txt )
+status_all "untracked, no commit"
+( cd "$SR" && git add -A )
+status_all "staged, no commit"
+( cd "$SR" && git commit -qm one )
+status_all "clean"
+( cd "$SR" && printf 'A\n' > a.txt )
+status_all "unstaged"
+( cd "$SR" && git add a.txt )
+status_all "staged"
+( cd "$SR" && printf 'AA\n' > a.txt )
+status_all "staged and edited again"
+( cd "$SR" && rm sub/deep/c.txt && printf 'u\n' > u.txt && mkdir new && printf 'n\n' > new/n.txt )
+status_all "deleted and untracked"
+( cd "$SR" && ln -sf a.txt link && git add link && rm link && printf 'notalink\n' > link )
+status_all "type change"
+( cd "$SR" && chmod +x a.txt )
+status_all "mode change"
+( cd "$SR" && printf '*.log\n' > .gitignore && printf 'x\n' > q.log )
+status_all "ignore rules"
+[ $st_ok = 1 ] && { ok; report "status" "$nst combinations over 11 states"; } \
+               || bad "status"
+
+# ...and once over the reference repository itself, which the constructed
+# states cannot stand in for: it has two nested repositories, a real submodule
+# gitlink, and a configured upstream.  The three upstream forms are filtered
+# out on git's side -- they need a remote (phase 8) and a range count
+# (phase 6) -- and everything else must agree byte for byte.
+ref_ok=1
+# The upstream report is a *block*: the "Your branch ..." line and the blank
+# line under it.  Dropping only the line leaves a blank that gittle -- which
+# prints no upstream at all -- correctly does not have, so both go.
+diff <(git -C "$REFREPO" status \
+         | awk '/^Your branch /{skip=1; next} skip && $0==""{skip=0; next} {skip=0; print}') \
+     <("$GITTLE" -C "$REFREPO" status) >/dev/null \
+  || { ref_ok=0; echo "  status --long on the reference repository differs"; }
+diff <(git -C "$REFREPO" status -s) <("$GITTLE" -C "$REFREPO" status -s) >/dev/null \
+  || { ref_ok=0; echo "  status -s on the reference repository differs"; }
+diff <(git -C "$REFREPO" status -s -uall) <("$GITTLE" -C "$REFREPO" status -s -uall) >/dev/null \
+  || { ref_ok=0; echo "  status -s -uall on the reference repository differs"; }
+diff <(git -C "$REFREPO" status --porcelain=v2 -b | grep -v "^# branch.upstream\|^# branch.ab") \
+     <("$GITTLE" -C "$REFREPO" status --porcelain=v2 -b) >/dev/null \
+  || { ref_ok=0; echo "  status --porcelain=v2 on the reference repository differs"; }
+# A nested repository is one untracked directory, and a gitlink is not a
+# change -- both are easy to get wrong and neither appears in a fresh repo.
+diff <(git -C "$REFREPO" ls-files -o --exclude-standard) \
+     <("$GITTLE" -C "$REFREPO" ls-files -o --exclude-standard) >/dev/null \
+  || { ref_ok=0; echo "  ls-files -o on the reference repository differs"; }
+diff <(git -C "$REFREPO" diff --raw) <("$GITTLE" -C "$REFREPO" diff --raw) >/dev/null \
+  || { ref_ok=0; echo "  diff --raw on the reference repository differs"; }
+[ $ref_ok = 1 ] && { ok; report "status, real repository" "nested repos, a gitlink, an upstream"; } \
+                || bad "status, real repository"
+
+# ------------------------------------------- from inside a subdirectory
+# Every command that prints a path has to decide *which* path, and they do not
+# all decide the same way: a patch is always root-relative because it has to
+# apply from the root, `status` and `grep` are relative to where you stood,
+# and porcelain v1 alone is root-relative whatever the format around it does.
+# None of that is exercised from a repository root, which is where every other
+# sweep in this file runs.
+SUB="$WORK/subrepo"
+git init -q "$SUB"
+( cd "$SUB" && mkdir -p sub/deep && printf 'a\n' > top.txt \
+  && printf 'b\n' > sub/s.txt && printf 'c\n' > sub/deep/d.txt \
+  && git add -A && git commit -qm one \
+  && printf 'A\n' > top.txt && printf 'B\n' > sub/s.txt \
+  && printf 'D\n' > sub/deep/d.txt && printf 'new\n' > sub/untracked.txt )
+sub_ok=1; nsub=0
+for f in "" "-s" "-s -b" "--porcelain" "--porcelain=v2" "--porcelain=v2 -b" \
+         "-uall" "-uno" "-z" "-b"; do
+  nsub=$((nsub+1))
+  ( cd "$SUB/sub" && git status $f ) > "$WORK/p5.sg" 2>&1
+  ( cd "$SUB/sub" && "$GITTLE" status $f ) > "$WORK/p5.st" 2>&1
+  cmp -s "$WORK/p5.sg" "$WORK/p5.st" \
+    || { sub_ok=0; echo "  status $f from a subdirectory differs"; }
+done
+for f in "--stat" "--name-only" "--raw" "" "--stat -- deep"; do
+  nsub=$((nsub+1))
+  ( cd "$SUB/sub" && git diff $NOREN $f ) > "$WORK/p5.dg" 2>&1
+  ( cd "$SUB/sub" && "$GITTLE" diff $f ) > "$WORK/p5.dt" 2>&1
+  cmp -s "$WORK/p5.dg" "$WORK/p5.dt" \
+    || { sub_ok=0; echo "  diff $f from a subdirectory differs"; }
+done
+for f in "-n -E b" "-n -E b HEAD" "-l -E b" "-c -E b"; do
+  nsub=$((nsub+1))
+  ( cd "$SUB/sub" && git grep $f ) > "$WORK/p5.gg" 2>&1
+  ( cd "$SUB/sub" && "$GITTLE" grep $f ) > "$WORK/p5.gt" 2>&1
+  cmp -s "$WORK/p5.gg" "$WORK/p5.gt" \
+    || { sub_ok=0; echo "  grep $f from a subdirectory differs"; }
+done
+# status.relativePaths turns the whole thing off.
+nsub=$((nsub+1))
+( cd "$SUB/sub" && git -c status.relativePaths=false status -s ) > "$WORK/p5.sg" 2>&1
+( cd "$SUB/sub" && "$GITTLE" -c status.relativePaths=false status -s ) > "$WORK/p5.st" 2>&1
+cmp -s "$WORK/p5.sg" "$WORK/p5.st" \
+  || { sub_ok=0; echo "  status.relativePaths=false differs"; }
+[ $sub_ok = 1 ] && { ok; report "from a subdirectory" "$nsub status, diff and grep forms"; } \
+                || bad "from a subdirectory"
+
+# ------------------------------------------------- commit's summary output
+# The diffstat and the create/delete/mode-change lines, plus the whole of
+# `status` on "nothing to commit".  Compared by driving both tools through the
+# same script and diffing everything they said.
+commit_run() {  # commit_run <dir> <tool>
+  # Everything runs in a subshell that exits if the `cd` fails.  Without that,
+  # a failed `git init` leaves the body running in *this* repository, where it
+  # would `add -A` and `commit` the project itself -- which is exactly what
+  # happened once while this file was being written.
+  rm -rf "$1"; git init -q "$1" || return 1
+  (
+    cd "$1" || exit 1
+    printf 'a\n' > a.txt; mkdir sub; printf 'c\n' > sub/c.txt; ln -s a.txt l
+    $2 add -A > /dev/null; $2 commit -m one
+    printf 'A\nB\n' > a.txt; rm sub/c.txt; printf 'n\n' > n.txt; chmod +x a.txt
+    $2 add -A > /dev/null; $2 commit -m two
+    $2 commit -m three; echo "rc=$?"
+    printf 'z\n' > z.txt; $2 add z.txt > /dev/null; $2 commit -q -m four; echo "rc=$?"
+    printf 'zz\n' > z.txt; $2 add z.txt > /dev/null; $2 commit --amend -m four2
+  )
+}
+commit_run "$WORK/cg" "git"      > "$WORK/cg.out" 2>&1
+commit_run "$WORK/ct" "$GITTLE"  > "$WORK/ct.out" 2>&1
+if diff <(sed "s#$WORK/cg#REPO#g" "$WORK/cg.out") \
+        <(sed "s#$WORK/ct#REPO#g" "$WORK/ct.out") >/dev/null; then
+  ok; report "commit summary" "diffstat, create/delete/mode lines, and status"
+else
+  bad "commit summary"
+  diff <(sed "s#$WORK/cg#REPO#g" "$WORK/cg.out") \
+       <(sed "s#$WORK/ct#REPO#g" "$WORK/ct.out") | head -12
+fi
+
+# ------------------------------------------------------------------- grep
+# Over the whole reference repository, which is the only corpus large enough
+# to contain the awkward cases: binary files, empty files, gitlinks, symlinks.
+# `-E` throughout, because git's default is BRE and gittle's patterns are ERE
+# always -- a divergence docs/07 chose and phase-5.md records.
+grep_ok=1; ngrep=0
+GREPPAT="static xdl_ TODO the Signed-off-by"
+[ $FULL = 1 ] && GREPPAT="$GREPPAT ^int [a-z]+_oid struct"
+for pat in $GREPPAT; do
+  for f in "-n" "-l" "-c" "" "-i -n" "-w -n" "-C1 -n" "-L" "-A1 -n" "-B2 -n" \
+           "-v -l" "-v -c" "-h -n" "--cached -n"; do
+    ngrep=$((ngrep+1))
+    git -C "$REFREPO" grep -E $f -e "$pat" > "$WORK/p5.gg" 2>&1; ga=$?
+    "$GITTLE" -C "$REFREPO" grep -E $f -e "$pat" > "$WORK/p5.gt" 2>&1; gb=$?
+    { cmp -s "$WORK/p5.gg" "$WORK/p5.gt" && [ "$ga" = "$gb" ]; } \
+      || { grep_ok=0; echo "  grep $f -e '$pat' differs (rc $ga/$gb)"; }
+  done
+done
+# A tree search prefixes every path with the name it was asked by, and -z, -q
+# and --color have shapes of their own.
+for f in "-n alpha HEAD" "-n -z static" "-l -z static" "--color -n static" \
+         "-c -z static" "-n static HEAD" "-2 static"; do
+  ngrep=$((ngrep+1))
+  git -C "$REFREPO" grep -E $f > "$WORK/p5.gg" 2>&1; ga=$?
+  "$GITTLE" -C "$REFREPO" grep -E $f > "$WORK/p5.gt" 2>&1; gb=$?
+  { cmp -s "$WORK/p5.gg" "$WORK/p5.gt" && [ "$ga" = "$gb" ]; } \
+    || { grep_ok=0; echo "  grep $f differs (rc $ga/$gb)"; }
+done
+git -C "$REFREPO" grep -q static; ga=$?
+"$GITTLE" -C "$REFREPO" grep -q static; gb=$?
+ngrep=$((ngrep+1))
+[ "$ga" = "$gb" ] || { grep_ok=0; echo "  grep -q exit status $ga/$gb"; }
+git -C "$REFREPO" grep -q zzzznomatch; ga=$?
+"$GITTLE" -C "$REFREPO" grep -q zzzznomatch; gb=$?
+ngrep=$((ngrep+1))
+[ "$ga" = "$gb" ] || { grep_ok=0; echo "  grep -q no-match exit status $ga/$gb"; }
+[ $grep_ok = 1 ] && { ok; report "grep" "$ngrep combinations over the reference repository"; } \
+                 || bad "grep"
+
+# ------------------------------------------- the ERE engine's own agreement
+# The patterns plan.md §6.4 nominated as the places two regex flavors are
+# most likely to disagree, including the malformed ones -- whose error text
+# comes out identical because both tools call the same libc `regerror`.
+re_ok=1; nre=0
+RD="$WORK/reredir"; mkdir -p "$RD"
+printf 'a+b\naab\nab\nxx\n(x)\nx\nalpha123\naaa\naa\nfoo)bar\nfoo\nbar\n\nlast\n' \
+  > "$RD/subj.txt"
+( cd "$RD" && git init -q . && git add subj.txt )
+for pat in 'a+b' 'a?' '\(x\)' '[[:alpha:]]+' 'a{2,3}' ')' 'a|' '(|x)b' '^ab$' \
+           'b$' '^' '$' 'x*' '[a-' 'a**' '(a' 'foo|bar' '\.' '[^a]' 'A+B'; do
+  nre=$((nre+1))
+  ( cd "$RD" && git grep -n -E -e "$pat" -- subj.txt ) > "$WORK/p5.rg" 2>&1
+  ( cd "$RD" && "$GITTLE" grep -n -E -e "$pat" -- subj.txt ) > "$WORK/p5.rt" 2>&1
+  # git prefixes a compile error with "fatal: -e option, '<pat>': " and gittle
+  # with its own wording; the libc message after it must match exactly.
+  sed -i -e "s/^fatal: -e option, '.*': //" -e "s/^gittle: invalid regular expression '.*': //" \
+      "$WORK/p5.rg" "$WORK/p5.rt"
+  cmp -s "$WORK/p5.rg" "$WORK/p5.rt" || { re_ok=0; echo "  pattern '$pat' differs"; }
+done
+[ $re_ok = 1 ] && { ok; report "ERE engine" "$nre patterns, errors included"; } \
+               || bad "ERE engine"
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

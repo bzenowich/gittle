@@ -21,8 +21,10 @@
 ## git's `dir.c` is 4,192 lines, and nearly all of the difference is the
 ## untracked cache and the fsmonitor hook -- accelerators, discarded by R3.
 ## The other omission is deliberate scope: a subdirectory containing its own
-## `.git` is a submodule, which is cut, so gittle reports it and walks past
-## rather than recording the gitlink git would.
+## `.git` is a submodule, which is cut.  The walk reports it as one untracked
+## directory -- which is exactly what git's `status` and `ls-files -o` print --
+## and never descends into it.  `add` is where staging one is refused, because
+## gittle cannot write the gitlink git would.
 
 import std/[os, posix, algorithm]
 import ignore, index, objects, pathspec, repository
@@ -58,12 +60,15 @@ proc walkWorkTree*(repo: Repository, idx: Index, ig: Ignore, ps: Pathspec,
       let isDir = dirExists(full) and symlinkExists(full) == false
 
       if isDir:
-        # A nested repository is a submodule, and submodules are cut.  Saying
-        # so is better than silently staging its contents as ordinary files,
-        # which is the one outcome nobody wants.
+        # A directory containing its own `.git` is another repository.  git
+        # never descends into one and reports the directory itself -- `status`
+        # says `?? gittle/` and `ls-files -o` says `gittle/`, under every
+        # untracked mode.  gittle reports it the same way; refusing to *stage*
+        # it is `add`'s business, not the walk's, because submodules are cut
+        # (plan.md §4) and a gitlink is not something gittle can write.
         if fileExists(full / ".git") or dirExists(full / ".git"):
-          stderr.write "warning: '" & rel & "/' contains a repository; " &
-                       "gittle does not support submodules and is skipping it\n"
+          if not ig.isIgnored(rel, true) and ps.matches(rel):
+            result.add rel & "/"
           continue
         let ignored = ig.isIgnored(rel, true)
         # An ignored directory is never entered -- see the module header.  It

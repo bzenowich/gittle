@@ -57,6 +57,17 @@ func packTypeFromInt*(n: int): ObjectType =
 
 # -- framing and hashing ----------------------------------------------------
 
+const firstFewBytes = 8000
+  ## git looks for a NUL in the first 8000 bytes and calls the content binary
+  ## if it finds one (`xdiff-interface.c:buffer_is_binary`).  With no
+  ## gitattributes (decision 6) that is the *whole* of binary detection, in
+  ## git as well as here -- which is why `diff` and `grep` can share it.
+
+func isBinary*(s: string): bool =
+  for i in 0 ..< min(s.len, firstFewBytes):
+    if s[i] == '\0': return true
+  false
+
 func objectHeader*(kind: ObjectType, size: int): string =
   $kind & " " & $size & "\0"
 

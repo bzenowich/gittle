@@ -41,27 +41,18 @@ const cEscapes* = [('\a', 'a'), ('\b', 'b'), ('\f', 'f'), ('\n', 'n'),
   ## by a character if you miscount it, and nothing catches that until the
   ## output is wrong.
 
-proc quotePath*(path: string): string =
-  ## Render a path the way git prints one (`quote.c:quote_c_style`).
-  ##
-  ## A path is just bytes, and most of them are unremarkable.  One containing a
-  ## quote, a backslash, a control character or any byte above ASCII is wrapped
-  ## in double quotes with C-style escapes -- so `ls-files` output stays one
-  ## path per line and can be pasted back into a shell.  `core.quotePath` turns
-  ## the high-byte half off; v1 does not implement it, which matches the
-  ## default and is what almost every repository sees.
-  ##
-  ## `-z` output is *not* quoted: a NUL terminator already makes every byte
-  ## unambiguous, which is the whole reason `-z` exists.
-  var needs = false
-  for c in path:
-    if c < ' ' or c >= '\x7F' or c == '"' or c == '\\':
-      needs = true
-      break
-  if not needs: return path
+func needsQuote*(s: string): bool =
+  ## Would `quotePath` wrap this in quotes?  `diff` asks separately, because
+  ## it quotes a *pair* of strings together: `diff --git "a/odd path" "b/odd
+  ## path"` puts one set of quotes around the prefix and the path both
+  ## (`quote.c:quote_two_c_style`).
+  for c in s:
+    if c < ' ' or c >= '\x7F' or c == '"' or c == '\\': return true
+  false
 
-  result = "\""
-  for c in path:
+proc quoteBody*(s: string): string =
+  ## The escaped bytes, without the surrounding quotes.
+  for c in s:
     var escaped = false
     for (raw, letter) in cEscapes:
       if c == raw:
@@ -80,7 +71,21 @@ proc quotePath*(path: string): string =
       result.add char(ord('0') + (v and 7))
     else:
       result.add c
-  result.add '"'
+
+proc quotePath*(path: string): string =
+  ## Render a path the way git prints one (`quote.c:quote_c_style`).
+  ##
+  ## A path is just bytes, and most of them are unremarkable.  One containing a
+  ## quote, a backslash, a control character or any byte above ASCII is wrapped
+  ## in double quotes with C-style escapes -- so `ls-files` output stays one
+  ## path per line and can be pasted back into a shell.  `core.quotePath` turns
+  ## the high-byte half off; v1 does not implement it, which matches the
+  ## default and is what almost every repository sees.
+  ##
+  ## `-z` output is *not* quoted: a NUL terminator already makes every byte
+  ## unambiguous, which is the whole reason `-z` exists.
+  if not needsQuote(path): return path
+  "\"" & quoteBody(path) & "\""
 
 proc interpolate*(format: string, atom: proc (name: string): string): string =
   ## Expand a git-style format string.

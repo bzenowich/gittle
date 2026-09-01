@@ -368,7 +368,7 @@ All resolved (2026-09-01). Nothing in the scope is still open.
 |---|---|---|
 | 1 | Hooks | **Run `pre-commit` and `commit-msg`.** ~60 lines of fork/exec; `commit --no-verify` bypasses. No other hook fires. |
 | 2 | Serving repositories | **In scope for v1.** Ship `upload-pack` and `receive-pack`. |
-| 3 | Regex engine | **Vendor a ~500-line ERE engine.** No PCRE; `grep -P` and `log -P` stay cut. *Revisit at phase 5 — see §6.4.* |
+| 3 | Regex engine | ~~Vendor a ~500-line ERE engine.~~ **Superseded at phase 5: bind libc's POSIX `regcomp`/`regexec`, as git itself does.** 45 lines, no new dependency, identical error text, static linking intact. No PCRE; `grep -P` and `log -P` stay cut, and `-G`/BRE with them. See §6.4. |
 | 4 | zlib | **Link the system zlib.** The one external dependency. |
 | 5 | SHA-1 | **Plain SHA-1**, ~150 lines. Not sha1dc — see the risk note below. |
 | 6 | CRLF / gitattributes | **Linux only.** No `core.autocrlf`, no `text=auto`, no filters. |
@@ -572,6 +572,19 @@ Fall back to A if libc variation proves unacceptable. Revisit C only if gittle
 ever wants to be independent of libc regex *and* is willing to own a
 PCRE-to-ERE translation, which is a worse trade than owning the engine.
 
+**Resolved at phase 5 (2026-09-01): B, and it was not close.** The spike ran
+the table below through `git grep -E` and through a Nim binding, and they
+agreed on all twenty-two patterns — including the malformed ones, whose error
+text comes out *byte-identical* because both call the same libc `regerror`.
+`gcc -static` links it. Cost: **85 lines including the module comment**,
+against a 500-line budget. [`phase-5.md`](phase-5.md) has the table and the
+one trap (`^` anchors to the true buffer start under `REG_STARTEND`, so a
+line has to be passed as its own buffer).
+
+The divergence this leaves is the one §6.4 predicted: gittle's patterns are
+ERE always, where git's default is BRE, so `gittle grep 'a+b'` reads `+` as a
+quantifier where `git grep 'a+b'` reads it as a literal.
+
 **How to settle it (R8).** Do not compare the engines against their manuals.
 Take a table of patterns and subjects, run every one through `git grep` and
 through the candidate, and diff. The patterns that matter are the ones where
@@ -583,6 +596,8 @@ at a range boundary.
 
 Each phase should end somewhere useful, with real git available as the oracle:
 create state with one tool, verify with the other, in both directions.
+
+### What ends a phase
 
 **Every phase ends the same way**, and none is finished until all four are done:
 
@@ -596,6 +611,8 @@ create state with one tool, verify with the other, in both directions.
    with over-runs explained rather than smoothed over.
 4. **What was left undone is written down** in the phase document, with the
    phase it belongs to.
+
+### The phases
 
 1. **Object store.** `hash-object`, `cat-file`. Read loose and packed objects,
    apply deltas, write loose. *Oracle: hashes match git's byte for byte.*

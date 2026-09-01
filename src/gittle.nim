@@ -12,6 +12,9 @@ import cmd/updateref, cmd/symbolicref, cmd/foreachref
 import cmd/lstree, cmd/writetree, cmd/readtree, cmd/updateindex, cmd/lsfiles
 import cmd/config as cmdconfig
 import cmd/init, cmd/committree, cmd/add, cmd/log, cmd/commit, cmd/show
+import cmd/diff as cmddiff
+import cmd/status as cmdstatus
+import cmd/grep as cmdgrep
 
 const
   version = "gittle version 0.1.0"
@@ -33,7 +36,9 @@ Commands:
    commit                record the staged content as a new commit
    commit-tree           create a commit object
    config                read and write configuration
+   diff                  show changes between trees, index and working tree
    for-each-ref          list refs through a format string
+   grep                  search tracked content
    hash-object           compute, and optionally store, an object ID
    init                  create a repository
    log                   show commit history
@@ -41,6 +46,7 @@ Commands:
    ls-tree               list a tree object's entries
    read-tree             load a tree into the index
    show                  display objects
+   status                report working tree state
    symbolic-ref          read and write symbolic refs
    update-index          modify the index
    update-ref            create, update and delete refs
@@ -56,6 +62,9 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   of "log": cmdLog(c, args)
   of "commit": cmdCommit(c, args)
   of "show": cmdShow(c, args)
+  of "diff": cmddiff.cmdDiff(c, args)
+  of "status": cmdstatus.cmdStatus(c, args)
+  of "grep": cmdgrep.cmdGrep(c, args)
   of "commit-tree": cmdCommitTree(c, args)
   of "update-ref": cmdUpdateRef(c, args)
   of "symbolic-ref": cmdSymbolicRef(c, args)

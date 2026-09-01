@@ -29,7 +29,7 @@
 ## does the same, including checking before it writes anything: a partial
 ## `add` that then failed would be worse than either outcome.
 
-import std/[algorithm, os, posix]
+import std/[algorithm, os, posix, strutils]
 import ../cli, ../dir, ../ignore, ../index, ../pathspec, ../repository, ../util
 
 const usageText = """usage: gittle add [-n] [-v] [-f] [-u] [-A] [--] <pathspec>…"""
@@ -124,7 +124,16 @@ proc cmdAdd*(c: Ctx, argv: seq[string]): int =
   if not updateOnly:
     for path in walkWorkTree(repo, idx, ig, ps,
                              if force: {wwUntracked, wwIgnored} else: {wwUntracked}):
+      # The walk yields a nested repository as `name/`.  git would stage a
+      # 160000 gitlink; submodules are cut (plan.md §4), and writing one would
+      # produce a repository gittle could not then read -- so it is reported
+      # and skipped.  `touched` still counts it, so a pathspec that matched
+      # only this is not also reported as matching nothing.
       touched.add path
+      if path.endsWith("/"):
+        stderr.write "warning: '" & path & "' contains a repository; " &
+                     "gittle does not support submodules and is skipping it\n"
+        continue
       staged.add path
       if not dryRun: discard stageWorkingPath(repo, idx, path)
 

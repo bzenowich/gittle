@@ -1,0 +1,824 @@
+## What gets diffed against what, and how the result is printed.
+##
+## `diff.nim` compares two blobs.  This is everything on either side of it:
+## the option set that eight commands share (docs/03), the four ways of
+## producing a list of *file pairs*, and the seven output formats.
+##
+## ## A diff is a list of pairs, and there are only four sources
+##
+## `git diff` looks like several commands but is one, parameterised by which
+## two of three things it compares:
+##
+## | invocation | old side | new side |
+## |---|---|---|
+## | `diff` | the index | the working tree |
+## | `diff --cached [<commit>]` | a tree (HEAD by default) | the index |
+## | `diff <commit>` | a tree | the working tree |
+## | `diff <a> <b>` | a tree | a tree |
+## | `diff --no-index <p1> <p2>` | a file | a file |
+##
+## So each side is a sorted list of `(path, mode, oid)` and the pairing is one
+## merge join, written once (R7).  The one asymmetry is the working tree,
+## which has no object IDs of its own: an entry whose `stat` still matches the
+## index borrows the index's, and one that does not is hashed.
+##
+## **git records the null OID for a working-tree side** in `--raw`, even
+## though `-p` prints the real hash on the `index` line one moment later.  That
+## is not an inconsistency to tidy away: `--raw` reports what the *index* knows,
+## and a file that has been edited since it was staged genuinely has no
+## recorded name.  Both behaviors are reproduced.
+##
+## ## What is deliberately not here
+##
+## **Rename and copy detection** (`-M`, `-C`).  plan.md §4 cuts it: it is
+## ~2,000 lines of C for a similarity matrix, and git turns it *on by default*
+## for `diff` and `log -p`.  A rename therefore shows in gittle as a deletion
+## and a creation, and the oracle passes `--no-renames` for the same reason it
+## passes `--no-use-mailmap` -- the difference is tested rather than hidden.
+##
+## **Combined diffs for merge commits** (`-c`, `--cc`).  docs/03 cuts the whole
+## family; `log`/`show` print a merge commit with no diff at all, which is what
+## `--diff-merges=off` does and what git did by default before 1.5.
+
+import std/[os, posix, strutils, algorithm]
+import diff, index, objects, oid, pathspec, repository, trees, util
+
+type
+  DiffFormat* = enum
+    dfPatch, dfRaw, dfStat, dfShortstat, dfNumstat, dfNameOnly, dfNameStatus,
+    dfNone
+
+  DiffOpts* = object
+    formats*: set[DiffFormat]  ## several may be asked for at once
+    ctxLen*: int
+    ws*: WsMode
+    abbrev*: int
+    fullIndex*: bool
+    noPrefix*: bool
+    text*: bool                ## `-a`: never call a file binary
+    reverse*: bool             ## `-R`
+    nulTerminate*: bool        ## `-z`
+    filter*: string            ## `--diff-filter=`, upper-case letters kept
+    pickaxe*: string           ## `-S`
+    color*: bool
+    exitCode*: bool
+    quiet*: bool
+    statWidth*: int            ## `--stat=<width>`; 0 means the 80-column default
+
+  DiffPair* = object
+    ## One path, before and after.  A mode of zero means the path is absent on
+    ## that side, which is how creation and deletion are represented.
+    path*: string
+    oldPath*: string           ## only `--no-index` names the two sides apart
+    oldMode*, newMode*: uint32
+    oldOid*, newOid*: Oid
+    oldValid*, newValid*: bool ## is the recorded OID the real content hash?
+    oldFromWork*, newFromWork*: bool  ## read that side from a file, not an object
+
+func oldName(p: DiffPair): string =
+  if p.oldPath.len > 0: p.oldPath else: p.path
+
+func defaultDiffOpts*(): DiffOpts =
+  DiffOpts(ctxLen: 3, ws: wsExact, abbrev: 0)
+
+func status*(p: DiffPair): char =
+  ## The letter `--raw` and `--name-status` print.  `T` is a type change --
+  ## a regular file replaced by a symlink or a gitlink -- and it matters
+  ## because a patch renders it as a deletion *and* a creation rather than as
+  ## a modification.
+  ## The test is on `S_IFMT`, not on the object type: a symlink and a regular
+  ## file are both stored as blobs, and replacing one with the other is
+  ## exactly the case `T` exists for.
+  if p.oldMode == 0: 'A'
+  elif p.newMode == 0: 'D'
+  elif (p.oldMode and 0o170000'u32) != (p.newMode and 0o170000'u32): 'T'
+  else: 'M'
+
+# ---------------------------------------------------------------------------
+# Option parsing, shared by diff, log and show
+# ---------------------------------------------------------------------------
+
+const diffDeferred = [
+  "-M", "--find-renames", "-C", "--find-copies", "--find-copies-harder",
+  "-B", "--break-rewrites", "-D", "--irreversible-delete",
+  "--diff-algorithm", "--minimal", "--patience", "--histogram", "--anchored",
+  "--indent-heuristic", "--no-indent-heuristic",
+  "-c", "--cc", "--dd", "--diff-merges", "--remerge-diff", "--combined-all-paths",
+  "--word-diff", "--color-words", "--word-diff-regex", "--color-moved",
+  "--dirstat", "-X", "--cumulative", "--compact-summary", "--summary",
+  "--binary", "--check", "--ws-error-highlight", "--ignore-blank-lines",
+  "-I", "--ignore-matching-lines", "--function-context", "-W",
+  "--inter-hunk-context", "--src-prefix", "--dst-prefix", "--default-prefix",
+  "--relative", "--no-relative", "--textconv", "--no-textconv",
+  "--ext-diff", "--no-ext-diff", "--submodule", "--ignore-submodules",
+  "-G", "--pickaxe-regex", "--pickaxe-all", "--find-object",
+  "-O", "--skip-to", "--rotate-to", "--output", "--line-prefix",
+  "--ita-invisible-in-index", "--no-renames", "--rename-empty",
+  "-t", "--patch-with-raw", "--patch-with-stat", "--no-stat"]
+  ## Everything in docs/03 that gittle does not implement, so each refuses by
+  ## name instead of being silently ignored.  `--no-renames` is in the list
+  ## because gittle never detects renames: accepting the flag would imply the
+  ## other setting exists.
+
+proc checkDiffDeferred(a: string) =
+  let name = if a.contains('='): a[0 ..< a.find('=')] else: a
+  for n in diffDeferred:
+    if n == name:
+      fail(a & " is out of scope for gittle v1 (docs/03)")
+
+proc checkDiffOpts*(o: DiffOpts) =
+  ## The one combination git rejects rather than resolving, checked where git
+  ## checks it -- once, after parsing (`diff.c:diff_setup_done`) -- so that
+  ## `diff -s --name-only` fails on a clean tree too, where there would
+  ## otherwise be no output to notice it in.
+  failIf(dfNone in o.formats and
+         ({dfNameOnly, dfNameStatus} * o.formats).card > 0,
+         "options '--name-only', '--name-status' and '-s' cannot be used together")
+
+proc parseDiffOpt*(a: string, o: var DiffOpts,
+                   valueFor: proc (a: string): string): bool =
+  ## Consume one option from the shared `diff-options` family, or say it is
+  ## not one of ours.  `diff`, `log` and `show` all call this first and then
+  ## parse only what is genuinely theirs.
+  checkDiffDeferred(a)
+  case a
+  of "-p", "-u", "--patch":
+    # `-p` after `-s` turns the patch back on: git's `enable_patch_output`
+    # clears `DIFF_FORMAT_NO_OUTPUT` before setting the patch bit, so the two
+    # are order-sensitive and `-s -p` prints a patch where `-p -s` does not.
+    o.formats.excl dfNone
+    o.formats.incl dfPatch
+  of "-s", "--no-patch":
+    # An *assignment*, not a suppression: git's `-s` is
+    # `options->output_format = DIFF_FORMAT_NO_OUTPUT`, which wipes whatever
+    # came before it.  So `--stat -s` prints nothing and `-s --stat` prints a
+    # stat, and the order is the whole difference.
+    o.formats = {dfNone}
+  of "--raw": o.formats.incl dfRaw
+  of "--numstat": o.formats.incl dfNumstat
+  of "--shortstat": o.formats.incl dfShortstat
+  of "--name-only": o.formats.incl dfNameOnly
+  of "--name-status": o.formats.incl dfNameStatus
+  of "--full-index": o.fullIndex = true
+  of "--no-prefix": o.noPrefix = true
+  of "-a", "--text": o.text = true
+  of "-R": o.reverse = true
+  of "-z": o.nulTerminate = true
+  of "--exit-code": o.exitCode = true
+  of "--quiet":
+    o.quiet = true
+    o.exitCode = true
+    o.formats = {dfNone}
+  of "-w", "--ignore-all-space": o.ws = wsIgnoreAll
+  of "-b", "--ignore-space-change": o.ws = wsIgnoreChange
+  of "--ignore-space-at-eol": o.ws = wsIgnoreEol
+  of "--ignore-cr-at-eol": o.ws = wsIgnoreCr
+  of "--no-color": o.color = false
+  else:
+    if a.startsWith("--stat"):
+      o.formats.incl dfStat
+      # `--stat=<width>[,<name-width>[,<count>]]`; only the total width is in
+      # scope, and the rest is refused rather than accepted and ignored.
+      if a.len > 6 and a[6] == '=':
+        let parts = a[7 .. ^1].split(',')
+        failIf(parts.len > 1,
+               "--stat=<width>,<name-width> is out of scope for gittle v1")
+        o.statWidth = parseInt(parts[0])
+    elif a.startsWith("--unified"): o.ctxLen = parseInt(valueFor(a))
+    elif a.len > 2 and a[0] == '-' and a[1] == 'U': o.ctxLen = parseInt(a[2 .. ^1])
+    elif a.startsWith("--diff-filter"):
+      o.filter = valueFor(a).toUpperAscii
+      for c in o.filter:
+        failIf(c notin {'A', 'D', 'M', 'T', '*'},
+               "unsupported --diff-filter character '" & c &
+               "'\n  gittle detects no renames or copies, so only A, D, M " &
+               "and T can occur")
+    elif a.startsWith("-S"): o.pickaxe = (if a.len > 2: a[2 .. ^1] else: valueFor(a))
+    elif a.startsWith("--abbrev"): o.abbrev = parseInt(valueFor(a))
+    elif a.startsWith("--color"):
+      let w = if a.contains('='): a[a.find('=') + 1 .. ^1] else: "always"
+      o.color = case w
+        of "always": true
+        of "never": false
+        of "auto": isatty(stdout.getFileHandle()) != 0
+        else: fail("invalid --color argument: " & w)
+    else:
+      return false
+  true
+
+# ---------------------------------------------------------------------------
+# The four sources of pairs
+# ---------------------------------------------------------------------------
+
+func canonMode(mode: uint32): uint32 =
+  ## The mode a *diff* reports, which is not always the mode the tree records.
+  ##
+  ## git normalises every mode through `canon_mode` (`cache.h`) before it
+  ## reaches the diff machinery: a regular file becomes 100644 or 100755 by
+  ## whether any execute bit is set, and everything else collapses to its
+  ## type.  It matters on real history -- git's own root commit records
+  ## `100664`, and `git show` on it prints `new file mode 100644`.
+  ##
+  ## Only the *display* is canonical.  The tree keeps its own bytes, because
+  ## rewriting them would change the tree's object ID (R1).
+  case modeType(mode)
+  of otTree: modeTree
+  of otCommit: modeGitlink
+  else:
+    if (mode and 0o170000'u32) == 0o120000'u32: modeSymlink
+    elif (mode and 0o111'u32) != 0: modeExecutable
+    else: modeRegular
+
+type
+  FileEntry = object
+    path: string
+    mode: uint32
+    oid: Oid
+    valid: bool     ## the OID really is this content's hash
+    fromWork: bool
+
+proc listTree(repo: Repository, tree: Oid, ps: Pathspec): seq[FileEntry] =
+  ## Every blob in a tree, full paths, in index order.  A null object ID is
+  ## the *empty* tree, which is what a root commit's parent side is: it has
+  ## none, and every path in it is therefore a creation.
+  ##
+  ## `walkTree` yields tree order, which sorts a directory's entries as though
+  ## each had a trailing `/`.  The index -- and therefore the other side of
+  ## every join here -- sorts by raw bytes, and the two disagree exactly when
+  ## a file and a directory share a prefix (`foo.txt` against `foo/`), so the
+  ## result is re-sorted rather than assumed.
+  if tree.isNull: return
+  for e in repo.walkTree(tree):
+    if e.mode == modeTree: continue
+    if not ps.matches(e.name): continue
+    result.add FileEntry(path: e.name, mode: canonMode(e.mode), oid: e.oid, valid: true)
+  result.sort(proc (x, y: FileEntry): int = cmp(x.path, y.path))
+
+proc listIndex(idx: Index, ps: Pathspec): seq[FileEntry] =
+  for e in idx.entries:
+    if e.stage != 0: continue
+    if not ps.matches(e.path): continue
+    result.add FileEntry(path: e.path, mode: canonMode(e.mode), oid: e.oid, valid: true)
+
+proc listWorkTree(repo: Repository, idx: Index, ps: Pathspec): seq[FileEntry] =
+  ## The working tree, seen through the index: `diff` reports changes to
+  ## *tracked* files, so an untracked file is not a diff, it is `status`.
+  ##
+  ## An entry whose `stat` still matches keeps the index's object ID and is
+  ## marked valid.  One that does not is left invalid and hashed later, only
+  ## if something needs the number -- which is what makes `git diff` on a
+  ## freshly checked-out tree cost one `lstat` per file.
+  for e in idx.entries:
+    if e.stage != 0: continue
+    if not ps.matches(e.path): continue
+    # A gitlink names a commit in another repository, and the path on disk is
+    # that repository's directory.  Submodules are cut, so the entry is carried
+    # through unchanged: reporting a type change because a directory is not a
+    # regular file would be worse than saying nothing.
+    if modeType(e.mode) == otCommit:
+      result.add FileEntry(path: e.path, mode: e.mode, oid: e.oid, valid: true)
+      continue
+    let (ok, st) = statPath(repo.workTreePath(e.path))
+    if not ok: continue                        # deleted; absent on this side
+    var f = FileEntry(path: e.path, mode: modeForFile(st), fromWork: true)
+    if e.statMatches(st) and e.size != 0:
+      f.oid = e.oid
+      f.valid = true
+    result.add f
+
+proc join(old, new: seq[FileEntry]): seq[DiffPair] =
+  ## The merge join.  Both sides are sorted by path bytes, so one pass pairs
+  ## them and every unmatched entry on either side is a deletion or a creation.
+  var i = 0
+  var k = 0
+  while i < old.len or k < new.len:
+    let c = if i >= old.len: 1
+            elif k >= new.len: -1
+            else: cmp(old[i].path, new[k].path)
+    var p: DiffPair
+    if c < 0:
+      p = DiffPair(path: old[i].path, oldMode: old[i].mode, oldOid: old[i].oid,
+                   oldValid: old[i].valid)
+      inc i
+    elif c > 0:
+      p = DiffPair(path: new[k].path, newMode: new[k].mode, newOid: new[k].oid,
+                   newValid: new[k].valid, newFromWork: new[k].fromWork)
+      inc k
+    else:
+      p = DiffPair(path: old[i].path,
+                   oldMode: old[i].mode, oldOid: old[i].oid, oldValid: old[i].valid,
+                   newMode: new[k].mode, newOid: new[k].oid, newValid: new[k].valid,
+                   newFromWork: new[k].fromWork)
+      inc i
+      inc k
+    result.add p
+
+proc pairsTreeTree*(repo: Repository, a, b: Oid, ps: Pathspec): seq[DiffPair] =
+  join(listTree(repo, a, ps), listTree(repo, b, ps))
+
+proc pairsTreeIndex*(repo: Repository, tree: Oid, idx: Index,
+                     ps: Pathspec): seq[DiffPair] =
+  join(listTree(repo, tree, ps), listIndex(idx, ps))
+
+proc pairsIndexWork*(repo: Repository, idx: Index, ps: Pathspec): seq[DiffPair] =
+  join(listIndex(idx, ps), listWorkTree(repo, idx, ps))
+
+proc pairsTreeWork*(repo: Repository, tree: Oid, idx: Index,
+                    ps: Pathspec): seq[DiffPair] =
+  join(listTree(repo, tree, ps), listWorkTree(repo, idx, ps))
+
+# ---------------------------------------------------------------------------
+# Content, and what counts as binary
+# ---------------------------------------------------------------------------
+
+proc fileText(repo: Repository, path: string): string =
+  ## A working-tree file, or `--no-index`'s named one.  Absolute paths pass
+  ## through `workTreePath` unchanged, which is what `--no-index` relies on.
+  let full = if isAbsolute(path) or repo == nil: path
+             else: repo.workTreePath(path)
+  let (ok, st) = statPath(full)
+  if not ok: return ""
+  readWorkingFile(full, st)
+
+proc oldText(repo: Repository, p: DiffPair): string =
+  if p.oldMode == 0: ""
+  elif p.oldFromWork: repo.fileText(p.oldName)
+  else: repo.readObject(p.oldOid).data
+
+proc newText(repo: Repository, p: DiffPair): string =
+  if p.newMode == 0: ""
+  elif p.newFromWork: repo.fileText(p.path)
+  else: repo.readObject(p.newOid).data
+
+proc fillOid(repo: Repository, p: var DiffPair) =
+  ## A working-tree file has no recorded object ID until someone needs one.
+  ## `-p` does, for the `index` line; `--raw` deliberately does not.
+  if p.newMode != 0 and not p.newValid:
+    p.newOid = hashObject(otBlob, repo.newText(p))
+    p.newValid = true
+  if p.oldMode != 0 and not p.oldValid:
+    p.oldOid = hashObject(otBlob, repo.oldText(p))
+    p.oldValid = true
+
+proc changed*(repo: Repository, p: DiffPair): bool =
+  ## Is this pair a change at all?
+  ##
+  ## Equal object IDs settle it without reading anything, which is what makes
+  ## a tree-to-tree diff cheap.  A working-tree file whose `stat` moved but
+  ## whose content did not has no recorded ID, so it has to be hashed -- and
+  ## then it is *not* a change, which is why `git diff` prints nothing after a
+  ## bare `touch`.
+  if p.oldMode != p.newMode: return true
+  if p.oldValid and p.newValid: return p.oldOid != p.newOid
+  var q = p
+  repo.fillOid(q)
+  q.oldOid != q.newOid
+
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
+
+func countOccurrences(hay, needle: string): int =
+  if needle.len == 0: return 0
+  var i = 0
+  while true:
+    let at = hay.find(needle, i)
+    if at < 0: break
+    inc result
+    i = at + 1        # overlapping matches count, as git's `contains` counts
+
+proc applyFilters(repo: Repository, pairs: seq[DiffPair],
+                   o: DiffOpts): seq[DiffPair] =
+  ## `-R`, `--diff-filter` and `-S`, in that order.
+  for p0 in pairs:
+    var p = p0
+    if o.reverse:
+      p = DiffPair(path: p0.path,
+                   oldMode: p0.newMode, oldOid: p0.newOid, oldValid: p0.newValid,
+                   newMode: p0.oldMode, newOid: p0.oldOid, newValid: p0.oldValid)
+      # Reversing means the working tree becomes the *old* side, and there is
+      # nowhere to record that; hash it now so the swap is complete.
+      p.oldFromWork = p0.newFromWork
+      p.newFromWork = p0.oldFromWork
+      p.oldPath = p0.path
+      p.path = p0.oldName
+    if o.filter.len > 0 and o.filter != "*" and p.status notin o.filter:
+      continue
+    if o.pickaxe.len > 0 and
+       countOccurrences(repo.oldText(p), o.pickaxe) ==
+       countOccurrences(repo.newText(p), o.pickaxe):
+      continue
+    result.add p
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+const
+  colReset = "\e[m"
+  colMeta = "\e[1m"
+  colFrag = "\e[36m"
+  colOld = "\e[31m"
+  colNew = "\e[32m"
+    ## git's defaults (`color.diff.*` in `diff.c:parse_diff_color_slot`).
+    ## Configuring them is out of scope (docs/11), so the five are constants.
+
+proc quoteTwo(prefix, path0: string): string =
+  ## `a/` and the path quoted as one string when either needs it, which is why
+  ## an awkward path appears as `diff --git "a/odd name" "b/odd name"` rather
+  ## than as `a/"odd name"` (`quote.c:quote_two_c_style`).
+  ##
+  ## A leading `/` is dropped first, which only ever happens under
+  ## `--no-index` with an absolute path: git writes `a/tmp/x`, not `a//tmp/x`
+  ## (`diff.c:builtin_diff`, the `name_a + (*name_a == '/')`).
+  let path = if path0.len > 0 and path0[0] == '/': path0[1 .. ^1] else: path0
+  if needsQuote(prefix) or needsQuote(path):
+    "\"" & quoteBody(prefix) & quoteBody(path) & "\""
+  else:
+    prefix & path
+
+proc abbrevOf(repo: Repository, o: DiffOpts, id: Oid, valid: bool): string =
+  ## Outside a repository -- which is where `--no-index` runs -- there is
+  ## nothing to check an abbreviation against, so git truncates to seven
+  ## digits and hopes (`diff.c:diff_abbrev_oid`).
+  if repo == nil:
+    let n = if o.abbrev > 0: o.abbrev else: fallbackAbbrev
+    return (if valid and not id.isNull: ($id)[0 ..< n] else: repeat('0', n))
+  let n = if o.abbrev > 0: o.abbrev else: repo.autoAbbrev
+  if not valid or id.isNull: repeat('0', clamp(n, minAbbrev, OidHexLen))
+  else: repo.uniqueAbbrev(id, n)
+
+proc writePatch(repo: Repository, p0: DiffPair, o: DiffOpts, out0: var string) =
+  ## One file's patch.  The header is a small grammar and it is written here
+  ## in the order git writes it (`diff.c:builtin_diff` and `fill_metainfo`).
+  var p = p0
+  repo.fillOid(p)
+  # `-R` swaps the *prefixes* as well as the contents, so a reversed patch
+  # reads `diff --git b/x a/x`.  git does the same (`diff.c:builtin_diff`
+  # swaps `name_a`/`name_b` together with the two prefixes), and it is what
+  # keeps `a/` meaning "the side the patch would apply to".
+  let aPre = if o.noPrefix: "" elif o.reverse: "b/" else: "a/"
+  let bPre = if o.noPrefix: "" elif o.reverse: "a/" else: "b/"
+
+  template meta(s: string) =
+    if o.color: out0.add colMeta & s & colReset & "\n" else: out0.add s & "\n"
+
+  meta "diff --git " & quoteTwo(aPre, p.oldName) & " " & quoteTwo(bPre, p.path)
+
+  if p.oldMode != 0 and p.newMode != 0 and p.oldMode != p.newMode:
+    meta "old mode " & formatMode(p.oldMode)
+    meta "new mode " & formatMode(p.newMode)
+  elif p.oldMode == 0:
+    meta "new file mode " & formatMode(p.newMode)
+  elif p.newMode == 0:
+    meta "deleted file mode " & formatMode(p.oldMode)
+
+  let a = repo.oldText(p)
+  let b = repo.newText(p)
+  if a == b and p.oldMode != p.newMode and p.oldMode != 0 and p.newMode != 0:
+    return          # a pure mode change has no index line and no body
+
+  # `--full-index` prints forty digits on both sides, including the forty
+  # zeroes of an absent one -- an abbreviated null OID next to a full one
+  # would not line up and could not be pasted into `git apply`.
+  let hexA = if o.fullIndex: (if p.oldMode != 0: $p.oldOid else: repeat('0', OidHexLen))
+             else: repo.abbrevOf(o, p.oldOid, p.oldValid and p.oldMode != 0)
+  let hexB = if o.fullIndex: (if p.newMode != 0: $p.newOid else: repeat('0', OidHexLen))
+             else: repo.abbrevOf(o, p.newOid, p.newValid and p.newMode != 0)
+  var idx = "index " & hexA & ".." & hexB
+  if p.oldMode == p.newMode: idx.add " " & formatMode(p.oldMode)
+  meta idx
+
+  if not o.text and (isBinary(a) or isBinary(b)):
+    # git names the two sides the way it named them above, `/dev/null` and all.
+    let an = if p.oldMode == 0: "/dev/null" else: quoteTwo(aPre, p.oldName)
+    let bn = if p.newMode == 0: "/dev/null" else: quoteTwo(bPre, p.path)
+    out0.add "Binary files " & an & " and " & bn & " differ\n"
+    return
+
+  let d = diffText(a, b, o.ctxLen, o.ws)
+  if d.hunks.len == 0: return      # an empty creation: header only, no body
+
+  meta "--- " & (if p.oldMode == 0: "/dev/null" else: quoteTwo(aPre, p.oldName))
+  meta "+++ " & (if p.newMode == 0: "/dev/null" else: quoteTwo(bPre, p.path))
+
+  for h in d.hunks:
+    var hdr = "@@ -" & (if h.c1 == 0: $(h.s1 - 1) else: $h.s1) &
+              (if h.c1 == 1: "" else: "," & $h.c1) &
+              " +" & (if h.c2 == 0: $(h.s2 - 1) else: $h.s2) &
+              (if h.c2 == 1: "" else: "," & $h.c2) & " @@"
+    if o.color: out0.add colFrag & hdr & colReset
+    else: out0.add hdr
+    if h.funcName.len > 0: out0.add " " & h.funcName
+    out0.add "\n"
+    for l in h.lines:
+      let sign = case l.kind
+                 of dlContext: " "
+                 of dlDelete: "-"
+                 of dlAdd: "+"
+      if not o.color:
+        out0.add sign & l.text
+      else:
+        # Three shapes, and they are not symmetric (`diff.c:emit_line_0` and
+        # `emit_line_ws_markup`).  A context line has no colour at all but
+        # still ends in a reset; a deleted line is one red span over the sign
+        # and the text together; an added line is *two* green spans, because
+        # git splits the marker from the content so that a whitespace error
+        # in the content can be repainted without disturbing the `+`.
+        case l.kind
+        of dlContext:
+          out0.add " " & l.text & colReset
+        of dlDelete:
+          out0.add colOld & "-" & l.text & colReset
+        of dlAdd:
+          out0.add colNew & "+" & colReset
+          if l.text.len > 0: out0.add colNew & l.text & colReset
+      out0.add "\n"
+      if l.noNewline:
+        # git emits this through the *context* colour, which is empty by
+        # default -- so under `--color` it is the bare text plus a reset
+        # (`diff.c`, `DIFF_SYMBOL_CONTEXT_INCOMPLETE`).
+        out0.add "\\ No newline at end of file"
+        if o.color: out0.add colReset
+        out0.add "\n"
+
+proc splitTypeChange(pairs: seq[DiffPair]): seq[DiffPair] =
+  ## A `T` pair becomes a deletion followed by a creation.
+  ##
+  ## git does this for the *patch* format only: a symlink that became a
+  ## regular file has no meaningful line-by-line relationship to its target,
+  ## so the two halves are printed as separate files with the same name.
+  ## `--raw`, `--stat` and `--name-status` keep the single `T` record.
+  for p in pairs:
+    if p.status != 'T':
+      result.add p
+    else:
+      result.add DiffPair(path: p.path, oldPath: p.oldPath,
+                          oldMode: p.oldMode, oldOid: p.oldOid,
+                          oldValid: p.oldValid, oldFromWork: p.oldFromWork)
+      result.add DiffPair(path: p.path, oldPath: p.oldPath,
+                          newMode: p.newMode, newOid: p.newOid,
+                          newValid: p.newValid, newFromWork: p.newFromWork)
+
+func displayWidth(s: string): int =
+  ## How wide a path prints.  git uses `utf8_strwidth`, which consults a
+  ## wcwidth table so that an East Asian character counts two columns; gittle
+  ## counts *characters*, which agrees for every ASCII path and can leave a
+  ## diffstat bar a column out for one that is not.  The table is several
+  ## hundred lines and the stat bar is decoration.
+  for c in s:
+    if (byte(c) and 0xC0'u8) != 0x80'u8: inc result
+
+func decimalWidth(n: int): int =
+  result = 1
+  var v = n
+  while v >= 10:
+    v = v div 10
+    inc result
+
+func scaleLinear(it, width, maxChange: int): int =
+  ## git's `diff.c:scale_linear`.  The `1 +` and the `width - 1` together
+  ## guarantee that any change at all shows at least one character, which is
+  ## the point: a one-line change to a file in a commit that rewrote another
+  ## must not scale to nothing.
+  if it == 0: 0 else: 1 + (it * (width - 1) div maxChange)
+
+func summaryLine(files, insertions, deletions: int): string =
+  ## ` N files changed, X insertions(+), Y deletions(-)`, with git's three
+  ## rules: the singular forms, `0 files changed` on its own, and a zero count
+  ## shown only when the *other* one is also zero
+  ## (`diff.c:print_stat_summary_inserts_deletes`).
+  if files == 0: return " 0 files changed\n"
+  result = " " & $files & (if files == 1: " file changed" else: " files changed")
+  if insertions > 0 or deletions == 0:
+    result.add ", " & $insertions &
+               (if insertions == 1: " insertion(+)" else: " insertions(+)")
+  if deletions > 0 or insertions == 0:
+    result.add ", " & $deletions &
+               (if deletions == 1: " deletion(-)" else: " deletions(-)")
+  result.add "\n"
+
+proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
+               out0: var string) =
+  ## The histogram (`diff.c:show_stats`), which is mostly column arithmetic.
+  ##
+  ## The widths: the total is 80 unless `--stat=<n>` says otherwise (git asks
+  ## the terminal, but gittle never writes a diffstat to one without being
+  ## piped somewhere in the tests, and 80 is what git falls back to). The name
+  ## gets what it needs and the bar gets the rest, and when they do not both
+  ## fit the name is capped at 5/8 of the width and the bar at 3/8.
+  type Row = object
+    name: string
+    added, deleted: int
+    binary: bool
+  var rows: seq[Row]
+  var maxChange = 0
+  var maxLen = 0
+  var binWidth = 0
+  var numberWidth = 0
+
+  for p in pairs:
+    var r = Row(name: quotePath(p.path))
+    let a = repo.oldText(p)
+    let b = repo.newText(p)
+    if not o.text and (isBinary(a) or isBinary(b)):
+      r.binary = true
+      r.deleted = a.len
+      r.added = b.len
+      let w = 14 + decimalWidth(r.added) + decimalWidth(r.deleted)
+      binWidth = max(binWidth, w)
+      numberWidth = 3          # the counts line up under "Bin"
+    else:
+      let c = diffCounts(a, b, o.ws)
+      r.added = c.added
+      r.deleted = c.deleted
+      maxChange = max(maxChange, r.added + r.deleted)
+    maxLen = max(maxLen, displayWidth(r.name))
+    rows.add r
+  if rows.len == 0: return
+
+  var width = if o.statWidth > 0: o.statWidth else: 80
+  numberWidth = max(decimalWidth(maxChange), numberWidth)
+  if width < 16 + 6 + numberWidth: width = 16 + 6 + numberWidth
+  var graphWidth = if maxChange + 4 > binWidth: maxChange else: binWidth - 4
+  var nameWidth = maxLen
+  if nameWidth + numberWidth + 6 + graphWidth > width:
+    if graphWidth > width * 3 div 8 - numberWidth - 6:
+      graphWidth = max(width * 3 div 8 - numberWidth - 6, 6)
+    if nameWidth > width - numberWidth - 6 - graphWidth:
+      nameWidth = width - numberWidth - 6 - graphWidth
+    else:
+      graphWidth = width - numberWidth - 6 - nameWidth
+
+  var totalAdd = 0
+  var totalDel = 0
+  for r in rows:
+    # A name too long for its column is replaced by `...` plus its tail, cut
+    # back to a `/` when there is one so the result is still a path.
+    var name = r.name
+    var prefix = ""
+    if nameWidth < displayWidth(name):
+      prefix = "..."
+      var keep = max(nameWidth - 3, 0)
+      while displayWidth(name) > keep and name.len > 0:
+        var k = 1
+        while k < name.len and (byte(name[k]) and 0xC0'u8) == 0x80'u8: inc k
+        name = name[k .. ^1]
+      let slash = name.find('/')
+      if slash >= 0: name = name[slash .. ^1]
+    let padding = max(nameWidth - 3 * ord(prefix.len > 0) - displayWidth(name), 0)
+
+    if r.binary:
+      out0.add " " & prefix & name & repeat(' ', padding) & " | " &
+               align("Bin", numberWidth)
+      if r.added == 0 and r.deleted == 0:
+        out0.add "\n"
+        continue
+      out0.add " " & $r.deleted & " -> " & $r.added & " bytes\n"
+      continue
+
+    var add = r.added
+    var del = r.deleted
+    if graphWidth <= maxChange and maxChange > 0:
+      var total = scaleLinear(add + del, graphWidth, maxChange)
+      if total < 2 and add > 0 and del > 0: total = 2
+      if add < del:
+        add = scaleLinear(add, graphWidth, maxChange)
+        del = total - add
+      else:
+        del = scaleLinear(del, graphWidth, maxChange)
+        add = total - del
+    totalAdd += r.added
+    totalDel += r.deleted
+    out0.add " " & prefix & name & repeat(' ', padding) & " | " &
+             align($(r.added + r.deleted), numberWidth) &
+             (if r.added + r.deleted > 0: " " else: "")
+    if o.color:
+      if add > 0: out0.add colNew & repeat('+', add) & colReset
+      if del > 0: out0.add colOld & repeat('-', del) & colReset
+    else:
+      out0.add repeat('+', add) & repeat('-', del)
+    out0.add "\n"
+
+  out0.add summaryLine(rows.len, totalAdd, totalDel)
+
+func pathField(o: DiffOpts, path: string): string =
+  ## How a path is written in a record: quoted and newline-terminated, or
+  ## verbatim and NUL-terminated.  `-z` exists precisely so that no quoting is
+  ## needed, so the two always travel together.
+  if o.nulTerminate: path & "\0" else: quotePath(path) & "\n"
+
+proc writeRaw(repo: Repository, p: DiffPair, o: DiffOpts, out0: var string) =
+  ## `:<oldmode> <newmode> <oldsha> <newsha> <status><TAB><path>`
+  ## (`diff-format.adoc`).  The object ID of a working-tree side is all zeroes
+  ## -- see the module header.
+  out0.add ":" & formatMode(p.oldMode) & " " & formatMode(p.newMode) & " " &
+           repo.abbrevOf(o, p.oldOid, p.oldValid and p.oldMode != 0) & " " &
+           repo.abbrevOf(o, p.newOid, p.newValid and p.newMode != 0) & " " &
+           p.status
+  out0.add (if o.nulTerminate: "\0" else: "\t")
+  out0.add pathField(o, p.path)
+
+proc writeNumstat(repo: Repository, p: DiffPair, o: DiffOpts, out0: var string) =
+  let a = repo.oldText(p)
+  let b = repo.newText(p)
+  if not o.text and (isBinary(a) or isBinary(b)):
+    out0.add "-\t-\t"
+  else:
+    let c = diffCounts(a, b, o.ws)
+    out0.add $c.added & "\t" & $c.deleted & "\t"
+  out0.add pathField(o, p.path)
+
+proc writeNames(p: DiffPair, o: DiffOpts, withStatus: bool, out0: var string) =
+  if withStatus:
+    out0.add p.status
+    out0.add (if o.nulTerminate: "\0" else: "\t")
+  out0.add pathField(o, p.path)
+
+proc shortstat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts): string =
+  var add = 0
+  var del = 0
+  var files = 0
+  for p in pairs:
+    inc files
+    let a = repo.oldText(p)
+    let b = repo.newText(p)
+    if not o.text and (isBinary(a) or isBinary(b)): continue
+    let c = diffCounts(a, b, o.ws)
+    add += c.added
+    del += c.deleted
+  summaryLine(files, add, del)
+
+proc renderDiff*(repo: Repository, pairs0: seq[DiffPair], o: DiffOpts):
+    tuple[text: string, changed: bool] =
+  ## Render every requested format, and say whether there were any differences
+  ## -- which is what `--exit-code` reports and what `log` uses to decide
+  ## whether a commit gets a `---` separator before its diff.
+  ##
+  ## The pairs are filtered for *actual* change first: a tree-to-tree join
+  ## produces a pair for every path, and most of them are identical on both
+  ## sides.
+  var pairs: seq[DiffPair]
+  for p in pairs0:
+    if repo.changed(p): pairs.add p
+  pairs = repo.applyFilters(pairs, o)
+  result.changed = pairs.len > 0
+  if o.quiet or pairs.len == 0: return
+
+  var out0 = ""
+  # Asking for several formats at once is not additive.  `diff_setup_done`
+  # clears every other bit as soon as a *name* format is selected, so
+  # `--raw --name-only` prints names and nothing else, while
+  # `--stat --numstat` prints both.  git's own comment above `diff_flush`
+  # states the rule: "raw, stat, summary, patch -- or name/name-status
+  # (other bits clear)".
+  if dfNameStatus in o.formats:
+    for p in pairs: writeNames(p, o, true, out0)
+    result.text = out0
+    return
+  if dfNameOnly in o.formats:
+    for p in pairs: writeNames(p, o, false, out0)
+    result.text = out0
+    return
+
+  if dfRaw in o.formats:
+    for p in pairs: repo.writeRaw(p, o, out0)
+  if dfNumstat in o.formats:
+    for p in pairs: repo.writeNumstat(p, o, out0)
+  if dfStat in o.formats:
+    repo.writeStat(pairs, o, out0)
+  if dfShortstat in o.formats:
+    out0.add repo.shortstat(pairs, o)
+  if dfPatch in o.formats:
+    # A blank line goes between any statistics block and the patch under it
+    # (`diff.c:diff_flush`, `DIFF_SYMBOL_STAT_SEP`).  It is the only place
+    # where asking for two formats at once changes either of them.
+    if out0.len > 0 and
+       ({dfStat, dfShortstat, dfNumstat} * o.formats).card > 0:
+      out0.add "\n"
+    for p in splitTypeChange(pairs): repo.writePatch(p, o, out0)
+  result.text = out0
+
+proc commitSummary*(repo: Repository, pairs0: seq[DiffPair]): string =
+  ## What `commit` prints under its `[master abc1234] subject` line.
+  ##
+  ## Not the histogram: git asks for `DIFF_FORMAT_SHORTSTAT |
+  ## DIFF_FORMAT_SUMMARY` (`builtin/commit.c:print_summary`), which is the
+  ## one-line count followed by a line per structural change.  `--summary` is
+  ## cut as an *option* (docs/03) but these are the lines it would print, and
+  ## they are the ones that tell you a file was created rather than edited.
+  var o = defaultDiffOpts()
+  var pairs: seq[DiffPair]
+  for p in pairs0:
+    if repo.changed(p): pairs.add p
+  result = repo.shortstat(pairs, o)
+  for p in pairs:
+    if p.oldMode == 0:
+      result.add " create mode " & formatMode(p.newMode) & " " &
+                 quotePath(p.path) & "\n"
+    elif p.newMode == 0:
+      result.add " delete mode " & formatMode(p.oldMode) & " " &
+                 quotePath(p.path) & "\n"
+    elif p.oldMode != p.newMode:
+      result.add " mode change " & formatMode(p.oldMode) & " => " &
+                 formatMode(p.newMode) & " " & quotePath(p.path) & "\n"

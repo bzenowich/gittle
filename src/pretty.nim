@@ -301,6 +301,7 @@ type
     abbrevCommit*: bool    ## abbreviate the object name in the header line
     decorate*: bool
     showParents*: bool
+    nulTerminate*: bool     ## `-z`: records end with NUL, not newline
     now*: int64
 
 proc parsePretty*(spec: string, opts: var PrettyOpts) =
@@ -375,9 +376,6 @@ func indented(msg: string, tabWidth: int): string =
     if line.len == 0 and first: continue
     first = false
     result.add "    " & (if tabWidth > 0: expandTabs(line, tabWidth) else: line) & "\n"
-
-proc nameOf(repo: Repository, o: Oid, abbrev: int): string =
-  if abbrev <= 0: $o else: repo.uniqueAbbrev(o, abbrev)
 
 proc headerName(repo: Repository, o: Oid, opts: PrettyOpts): string =
   ## The object name in a `commit` or `oneline` line.
@@ -513,7 +511,8 @@ proc formatOne*(repo: Repository, o: Oid, c: Commit, opts: PrettyOpts,
     # whole visible difference is the final newline, which is why
     # `log --pretty=format:%h > f` leaves a file with no newline at the end
     # and `tformat:` does not.  `entrySeparator` is the other half.
-    if opts.kind == pkTFormat: result.add "\n"
+    if opts.kind == pkTFormat:
+      result.add (if opts.nulTerminate: '\0' else: '\n')
     return
   of pkOneline:
     result.add repo.headerName(o, opts)
@@ -566,12 +565,18 @@ proc formatOne*(repo: Repository, o: Oid, c: Commit, opts: PrettyOpts,
   result = result.strip(leading = false)
   result.add "\n"
 
-func entrySeparator*(kind: PrettyKind): string =
+func entrySeparator*(kind: PrettyKind, nulTerminate = false): string =
   ## What goes *between* two rendered commits.  The formats that terminate
   ## each entry with a newline need nothing; the ones that do not are
   ## separated by a blank line, which is why `log` has one between commits and
   ## `log --oneline` does not.
-  if kind in {pkOneline, pkTFormat}: "" else: "\n"
+  ##
+  ## `-z` replaces it with a NUL, because it sets git's `line_termination`
+  ## for the whole of `log`, not only for the diff records
+  ## (`log-tree.c:show_log`).
+  if kind in {pkOneline, pkTFormat}: ""
+  elif nulTerminate: "\0"
+  else: "\n"
 
 proc isTty*(): bool =
   ## `--decorate=auto` and `--color=auto` both ask this.  Decoration is for a

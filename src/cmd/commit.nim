@@ -34,8 +34,8 @@
 ## prints alongside it.
 
 import std/[os, strutils]
-import ../cli, ../commitobj, ../dir, ../hooks, ../ident, ../index,
-       ../pathspec, ../pretty, ../repository, ../trees, ../util
+import ../cli, ../commitobj, ../diffcore, ../dir, ../hooks, ../ident, ../index,
+       ../pathspec, ../pretty, ../repository, ../status, ../trees, ../util
 
 const usageText = """usage: gittle commit [-a] [-m <msg>] [-F <file>] [--amend]
                      [--author=<author>] [--date=<date>] [-s] [-q]
@@ -215,13 +215,17 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
     let parentTree = if parents.len == 1:
                        parseCommit(repo.readObject(parents[0]).data).tree
                      else: nullOid
-    if parents.len == 1 and parentTree == treeOid:
-      echo "On branch " & shortenRefname(repo.headRefName)
-      echo "nothing to commit, working tree clean"
-      return 1
-    if parents.len == 0 and repo.readObject(treeOid).data.len == 0:
-      echo "On branch " & shortenRefname(repo.headRefName)
-      echo "nothing to commit"
+    # git prints the whole of `status` here, not a one-line refusal: the
+    # question the user is about to ask is "then what *is* changed?", and the
+    # answer is already computed (`builtin/commit.c:prepare_to_commit`).
+    if (parents.len == 1 and parentTree == treeOid) or
+       (parents.len == 0 and repo.readObject(treeOid).data.len == 0):
+      let st = computeStatus(repo, idx, parsePathspec(@[], repo.prefix), umNormal)
+      stdout.write longStatus(st, umNormal,
+                              repo.cfg.getBool("advice.statusHints", true),
+                              (if repo.cfg.getBool("status.relativePaths", true):
+                                 repo.prefix else: ""))
+      stdout.flushFile()
       return 1
 
   # The hooks are shown the index that is being committed.  Under `-a` or a
@@ -297,4 +301,12 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
                formatDate(author.when0, author.tzOffset, DateMode(kind: dkDefault),
                           author.when0)
     echo line
+    # The counts and the creations, deletions and mode changes: what changed
+    # structurally, which the subject line does not say.
+    let parentTree = if parents.len >= 1:
+                       parseCommit(repo.readObject(parents[0]).data).tree
+                     else: nullOid
+    stdout.write commitSummary(repo,
+      pairsTreeTree(repo, parentTree, treeOid, parsePathspec(@[], "")))
+    stdout.flushFile()
   0

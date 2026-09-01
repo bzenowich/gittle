@@ -37,6 +37,7 @@ first, by anyone, in every phase:
 | Build | `nim c -d:release --out:build/gittle src/gittle.nim`; add `-d:static` for the single static binary. `nimble` cannot write `~/.nimble` here, so use `nim c` directly. |
 | Test | `tests/oracle.sh`, or `--full` to sweep every object in the reference repository and every commit and tag in it (~4 min). Needs bash, not just a POSIX shell. |
 | Comparing `log` | git applies `.mailmap` to `log` and `show` by **default** (`log.mailmap`, true since 2.34) and gittle does not — 18,512 of the reference repository's 82,130 commits display a different identity. Pass `--no-use-mailmap` to git or you are diffing that and nothing else. |
+| Comparing a diff | Four more of the same kind, all deliberate cuts (`docs/phase-5.md`): `--no-renames` (gittle detects none), `--minimal` (gittle's Myers always is), `--diff-merges=off` (combined diffs are cut — note `show` defaults to `--cc` where `log` does not), and, on the reference repository only, `-c diff.cpp.xfuncname=...` because its `.gitattributes` sets `diff=cpp` and a userdiff driver changes the name on a `@@` line. `tests/oracle.sh` has all four as `$NOREN`, `$NOCC` and `$NOATTR`. |
 
 ## Documentation
 
