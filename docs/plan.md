@@ -241,6 +241,55 @@ with no `bisect`, no `add -p`, and one `cherry-pick`. Treat it as a floor.
 
 ---
 
+### Ignore semantics — an engine the scope files understate
+
+`.gitignore` appears in the scope files only as scattered flags (`clean -x/-X/-e`,
+`add -f`, `ls-files -i/--exclude-standard`, the `check-ignore` command). That
+undersells it: the matcher is a shared engine that `add`, `status`, `clean`,
+`ls-files`, and `check-ignore` all depend on, and `status` is unusable without it
+— an ordinary working tree would drown in build artifacts. What v1 must
+implement, from `Documentation/gitignore.adoc`:
+
+**Sources, highest precedence first.** Within one level, the *last* matching
+pattern decides.
+
+1. Patterns given on the command line (`clean -e`).
+2. `.gitignore` files, matched relative to the directory each one sits in, with
+   deeper files overriding shallower ones up to the working-tree root.
+3. `$GIT_COMMON_DIR/info/exclude` — note *common* dir, so linked worktrees share it.
+4. The file named by `core.excludesFile` (default `~/.config/git/ignore`).
+
+**Pattern syntax.**
+
+| Form | Meaning |
+|---|---|
+| blank line | matches nothing; used as a separator |
+| `#…` | comment; a literal `#` must be escaped `\#` |
+| trailing spaces | ignored unless escaped `\ ` |
+| `!pat` | negation — re-include a previously excluded path |
+| `pat/` | matches directories only |
+| `/pat` or `a/b` | anchored to the `.gitignore`'s own directory |
+| `pat` (no slash) | matches at any depth below that directory |
+| `*` / `?` | any run of / single character, **never** matching `/` |
+| `[a-z]` | character class |
+| `**/x`, `x/**`, `a/**/b` | leading: any directory; trailing: everything inside; middle: zero or more directories |
+
+**Two traps worth writing into the tests.**
+
+* *You cannot re-include a file whose parent directory is excluded.* Git never
+  descends into an excluded directory, so `!sub/keep.txt` after `sub/` does
+  nothing. Implementing negation without this rule produces a matcher that looks
+  correct on small cases and diverges on real repositories.
+* Ignore rules apply only to **untracked** files. A tracked file stays tracked no
+  matter what any `.gitignore` says.
+
+**Cost.** git's glob engine (`wildmatch.c`) is only 290 lines including `**`
+support; the 4,192 lines of `dir.c` are mostly the untracked-directory walk and
+its caches, which R3 discards. Budgeted at 500 lines of Nim with pathspec, which
+shares the same matcher.
+
+**Config keys this requires** beyond the flat-INI minimum: `core.excludesFile`.
+
 ## 5. Budget
 
 A sketch, not an estimate. Each figure is Nim, simplified per §3.
@@ -253,7 +302,7 @@ config: flat INI subset                                       150
 object parse/format: commit, tree, tag                        300
 revision walk                                                 250
 diff: Myers + unified emit                                    500
-pathspec + ignore matching                                    400
+pathspec + ignore matching (shared glob engine)                500
 working tree: checkout, status                                600
 merge: file 3-way + structural tree merge                     600
 wire protocol v2 over ssh: ls-refs, fetch, push               700
@@ -267,7 +316,7 @@ git-shell + argv[0] dispatch                                   80
 index v4 read                                                  30
 repository extension gate + worktree config                    60
                                                           -------
-                                                            9,030
+                                                            9,130
 ```
 
 The line that will blow the budget is the second-to-last. Every algorithm above
@@ -437,8 +486,10 @@ create state with one tool, verify with the other, in both directions.
    Loose refs plus `packed-refs`.
 3. **Index and trees.** `update-index`, `ls-files`, `write-tree`, `read-tree`,
    `ls-tree`. *Oracle: `git fsck` and `git status` are clean after gittle writes.*
-4. **First commit.** `init`, `add`, `commit`, `log`, `show`. The vertical slice
-   that proves the format work.
+4. **First commit.** `init`, `add`, `commit`, `log`, `show`, **plus the ignore
+   and pathspec matcher** — `add` must refuse ignored files without `-f`, and
+   `status` in phase 5 is unusable without it. Only the `check-ignore` *command*
+   waits for phase 10. The vertical slice that proves the format work.
 5. **Diff.** Myers plus unified output; `diff`, `status` in all forms, `grep`.
 6. **History.** `rev-list`, `rev-parse`, `merge-base`, `branch`, `tag`,
    `checkout`/`switch`/`restore`, `reset`, `reflog`.

@@ -297,6 +297,8 @@ Subcommands: `push` (default), `save` (deprecated), `list`, `show`, `pop`,
 - [ ] `-v` / `--verbose` — Also show the staged diff (twice: the unstaged diff too).
 - [x] `-u[<mode>]` / `--untracked-files[=<mode>]` — *(core)* Control untracked reporting: `no`, `normal`, `all`.  `[log]`
 - [ ] `--ignored[=<mode>]` — Also report ignored files (`traditional`, `matching`, `no`).
+  Cutting this removes only the ability to *display* ignored files; `status` still
+  applies ignore rules to suppress them from untracked output.
 - [ ] `--ignore-submodules[=<when>]` — Ignore some or all submodule changes.
 - [x] `-z` — NUL-terminate entries and imply porcelain v1.
 - [ ] `--column[=<options>]` / `--no-column` — Print untracked files in columns.
