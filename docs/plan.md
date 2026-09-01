@@ -368,7 +368,7 @@ All resolved (2026-09-01). Nothing in the scope is still open.
 |---|---|---|
 | 1 | Hooks | **Run `pre-commit` and `commit-msg`.** ~60 lines of fork/exec; `commit --no-verify` bypasses. No other hook fires. |
 | 2 | Serving repositories | **In scope for v1.** Ship `upload-pack` and `receive-pack`. |
-| 3 | Regex engine | **Vendor a ~500-line ERE engine.** No PCRE; `grep -P` and `log -P` stay cut. |
+| 3 | Regex engine | **Vendor a ~500-line ERE engine.** No PCRE; `grep -P` and `log -P` stay cut. *Revisit at phase 5 — see §6.4.* |
 | 4 | zlib | **Link the system zlib.** The one external dependency. |
 | 5 | SHA-1 | **Plain SHA-1**, ~150 lines. Not sha1dc — see the risk note below. |
 | 6 | CRLF / gitattributes | **Linux only.** No `core.autocrlf`, no `text=auto`, no filters. |
@@ -509,6 +509,75 @@ never shadows a real git that may also be installed.
 Dispatch costs roughly 30 lines and removes the need for any separate
 executables, which is what makes the single-static-binary goal survive contact
 with the transport protocol.
+
+### 6.4 The regex engine — reopen at phase 5
+
+Decision 3 says vendor an ERE engine. Nothing has been built yet: the only
+matching code so far is `glob.nim`, which is shell wildcards and not regex.
+`grep` in phase 5 is where 500 lines get spent, so the question of whether a
+library can spend them for us was investigated first (2026-09-01).
+
+**What `grep` actually has to accept.** git's default is **BRE**
+(`grep.c:497-500`); `-E` selects ERE and `-P` selects PCRE. docs/07 keeps `-E`
+and cuts `-G` and `-P`, so gittle's `grep` is ERE-only by choice — a divergence
+worth remembering, because `gittle grep 'a+b'` reads `+` as a quantifier where
+`git grep 'a+b'` reads it as a literal.
+
+**Three candidates.**
+
+**A — vendor an ERE engine, as decided.** ~500 lines. Complete control of the
+semantics, identical on every libc, and no dependency. It is the baseline the
+other two have to beat.
+
+**B — POSIX `regcomp`/`regexec` from libc.** About 40 lines of binding, and
+**this is what git itself does**: `compat/regex/` is only compiled when
+`NO_REGEX` is defined for a libc that lacks `REG_STARTEND`. Verified here:
+
+* ERE and capture groups work (`^(ab+|c)d$` on `cd` gives group 1 `[0,1)`);
+* `REG_STARTEND` is present in glibc — it confines matching to a byte range,
+  and it matched `bb` inside `"aa\0bb"`, so embedded NULs are handled;
+* `gcc -static` links it, so the single-binary goal survives;
+* **no new dependency at all** — libc is already linked.
+
+One BRE flag away from also giving us `-G` for free if it is ever wanted.
+
+Two things to check before committing: `^` and `$` under `REG_STARTEND` anchor
+to the *true* buffer boundaries and not to the range (verified: `^ab+d$` over
+`[2,6)` of `"xxabbdyy"` does not match), so line-oriented matching needs
+`REG_NOTBOL`/`REG_NOTEOL` handling; and behavior is locale-sensitive and varies
+between libcs. A busybox-class target means musl, which there is no toolchain
+here to test — that is the open risk, and it is exactly why git ships a
+fallback.
+
+**C — Nim's `std/nre2`.** Pure Nim, a linear-time NFA, no C library, replacing
+the deprecated `nre`. Attractive, and the weakest fit of the three:
+
+* It is **PCRE syntax**, not POSIX. Neither BRE nor ERE, so every pattern would
+  be translated before matching — and a translation layer is precisely the
+  "wrote it from a reading of the spec" failure mode R8 exists to catch.
+* It is in Nim **devel** only; the toolchain here is 2.2.10, which has no
+  `nre2` at all. `std/re` and `std/nre` in 2.2.10 both wrap **PCRE1**, which is
+  not even installed on this machine (only `libpcre2-*`), so neither would link
+  today, and either would break the one-external-dependency rule regardless.
+* Its engine is not in Nim's `lib/` — `nre2.nim` does `import regex,
+  regex/nfatype`, and there is no `regex` module or directory under `lib/`. So
+  it is a fetched package rather than a plain stdlib module. Not confirmed
+  either way, and it matters: a package manager in the build contradicts
+  "one static binary, only external dependency is the system zlib".
+
+**Decision: unchanged for now; decision 3 stands.** At phase 5, spike **B**
+first — it is what the reference implementation does, it costs about a
+twentieth of A, and it hands back BRE if the `-G` cut is ever reconsidered.
+Fall back to A if libc variation proves unacceptable. Revisit C only if gittle
+ever wants to be independent of libc regex *and* is willing to own a
+PCRE-to-ERE translation, which is a worse trade than owning the engine.
+
+**How to settle it (R8).** Do not compare the engines against their manuals.
+Take a table of patterns and subjects, run every one through `git grep` and
+through the candidate, and diff. The patterns that matter are the ones where
+the flavors disagree: `a+b`, `a?`, `\(x\)`, `[[:alpha:]]`, `{2,3}`, an unmatched
+`)`, an empty alternation branch, a pattern with an embedded NUL, and anchors
+at a range boundary.
 
 ## 7. Build order
 
