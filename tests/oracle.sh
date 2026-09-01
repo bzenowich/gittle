@@ -16,6 +16,26 @@ REFREPO=${REFREPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 FULL=0
 [ "${1:-}" = "--full" ] && FULL=1
 
+# Prefer a git built from the reference tree over whatever is on PATH: the
+# system one may be years older than the checkout it is being asked to explain.
+# GIT_EXEC_PATH makes that binary find its own subcommands rather than the
+# installed ones, and GIT_TEMPLATE_DIR keeps `git init` from warning about a
+# templates directory that only exists after `make install`.
+if [ -x "$REFREPO/git" ]; then
+  GIT="$REFREPO/git"
+  GIT_EXEC_PATH="$REFREPO"; export GIT_EXEC_PATH
+  [ -d "$REFREPO/templates/blt" ] && { GIT_TEMPLATE_DIR="$REFREPO/templates/blt"; export GIT_TEMPLATE_DIR; }
+else
+  GIT=git
+fi
+git() { "$GIT" "$@"; }
+
+# Tests that write refs need an identity for the reflog, and must not depend on
+# whichever one the developer happens to have configured.
+GIT_AUTHOR_NAME="Oracle Test"; GIT_AUTHOR_EMAIL="oracle@example.com"
+GIT_COMMITTER_NAME="Oracle Test"; GIT_COMMITTER_EMAIL="oracle@example.com"
+export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -34,7 +54,7 @@ command -v git >/dev/null || { echo "no git on PATH"; exit 1; }
 [ -d "$REFREPO/.git" ] || { echo "no reference repository at $REFREPO"; exit 1; }
 
 echo "gittle:  $GITTLE"
-echo "oracle:  $(git --version)"
+echo "oracle:  $(git --version) ($GIT)"
 echo "repo:    $REFREPO ($(git -C "$REFREPO" describe --always))"
 echo
 
@@ -64,6 +84,12 @@ if command -v nim >/dev/null && \
   done
   [ $sha_ok = 1 ] && { ok; report "sha1" "$nsha inputs match sha1sum"; } \
                   || bad "sha1"
+
+  if "$SELF" glob > "$WORK/glob.out" 2>&1; then
+    ok; report "glob engine" "$(sed 's/^ok //' "$WORK/glob.out") checked"
+  else
+    bad "glob engine"; head -8 "$WORK/glob.out"
+  fi
 
   z_ok=1; nz=0
   for n in 0 1 100 4096 65536 1000000; do
@@ -336,6 +362,249 @@ fi
 "$GITTLE" -C / cat-file -t "$t" >/dev/null 2>&1 \
   && bad "should refuse to run outside a repository" || ok
 report "repository discovery" "subdir, bare, worktree, none"
+
+# ===========================================================================
+# Phase 2 -- refs and config
+# ===========================================================================
+
+# A repository with a branch, a lightweight tag, an annotated tag and a commit
+# on a second branch, so every ref shape below is represented.
+REFS="$WORK/refs"
+git init -q "$REFS"
+echo one > "$REFS/f"; git -C "$REFS" add f; git -C "$REFS" commit -qm one
+git -C "$REFS" tag lightweight
+git -C "$REFS" tag -a -m annotated annotated
+git -C "$REFS" branch side
+echo two > "$REFS/f"; git -C "$REFS" add f; git -C "$REFS" commit -qm two
+H=$(git -C "$REFS" rev-parse HEAD)
+H1=$(git -C "$REFS" rev-parse HEAD~1)
+
+# ---------------------------------------------------------------- ref names
+# `check-ref-format` is the oracle.  `--allow-onelevel` is the right comparison
+# because `update-ref` accepts a top-level pseudoref: `git update-ref FOO <oid>`
+# works, and `git check-ref-format FOO` on its own does not.
+# In its own copy: some of these names are HEAD and `main`, and creating then
+# deleting those moves and removes the branch HEAD points at.
+NAMES="$WORK/names"; cp -r "$REFS" "$NAMES"
+name_ok=1; nnames=0
+for n in \
+  refs/heads/main refs/tags/v1.0 refs/heads/feature/x HEAD refs/heads/a-b_c \
+  refs/heads/.hidden refs/heads/a..b refs/heads/a.lock refs/heads/a@{0} \
+  'refs/heads/a b' refs/heads/a~1 refs/heads/a^ refs/heads/a: refs/heads/a? \
+  'refs/heads/a[' 'refs/heads/a\\b' refs/heads/a. refs/heads//b refs/heads/ \
+  @ main refs/heads/a*
+do
+  nnames=$((nnames+1))
+  if git -C "$NAMES" check-ref-format --allow-onelevel "$n" 2>/dev/null; then
+    want=0
+  else want=1; fi
+  # gittle has no check-ref-format command; update-ref is the same validator.
+  if "$GITTLE" -C "$NAMES" update-ref "$n" "$H" 2>"$WORK/rn.err"; then got=0
+  elif grep -q "invalid ref name" "$WORK/rn.err"; then got=1
+  else got=0; fi   # rejected for some other reason: the name itself was fine
+  [ "$want" = "$got" ] || { name_ok=0; echo "  '$n': git says $want, gittle says $got"; }
+  git -C "$NAMES" update-ref -d "$n" 2>/dev/null
+done
+[ $name_ok = 1 ] && { ok; report "ref name validation" "$nnames names agree with git"; } \
+                 || bad "ref name validation"
+
+# ------------------------------------------------------------- for-each-ref
+fer_ok=1
+for a in "" "--sort=-refname" "--sort=objecttype --sort=refname" "--count=2" \
+         "refs/heads" "refs/tags" "refs/heads/*" "refs/*/side"; do
+  diff <(git -C "$REFS" for-each-ref $a) <("$GITTLE" -C "$REFS" for-each-ref $a) \
+    >/dev/null || { fer_ok=0; echo "  for-each-ref $a differs"; }
+done
+for f in '%(refname)' '%(refname:short)' '%(refname:lstrip=2)' \
+         '%(refname:rstrip=1)' '%(objectname)' '%(objectname:short)' \
+         '%(objectname:short=12)' '%(objecttype)' '%(objectsize)' \
+         '%(HEAD)%(refname)' '%(symref)' '%(upstream)' \
+         '%(*objectname)' '%(*objecttype)' '%(*objectsize)' \
+         'x%%y%09z' '%(refname)|%(objecttype)|%(objectsize)'; do
+  diff <(git -C "$REFS" for-each-ref --format="$f") \
+       <("$GITTLE" -C "$REFS" for-each-ref --format="$f") >/dev/null \
+    || { fer_ok=0; echo "  --format=$f differs"; }
+done
+[ $fer_ok = 1 ] && { ok; report "for-each-ref" "8 option sets, 17 formats"; } \
+                || bad "for-each-ref"
+
+# Refs packed by git must read back exactly the same as loose ones.
+cp -r "$REFS" "$WORK/packed"
+before=$("$GITTLE" -C "$WORK/packed" for-each-ref)
+git -C "$WORK/packed" pack-refs --all
+[ ! -f "$WORK/packed/.git/refs/heads/side" ] || bad "pack-refs left loose refs"
+after=$("$GITTLE" -C "$WORK/packed" for-each-ref)
+check "packed-refs reads the same" "$before" "$after"
+
+# A loose ref must shadow a packed one of the same name.
+git -C "$WORK/packed" update-ref refs/heads/side "$H1"
+check "loose ref shadows packed" \
+  "$(git -C "$WORK/packed" rev-parse refs/heads/side)" \
+  "$("$GITTLE" -C "$WORK/packed" for-each-ref --format='%(objectname)' refs/heads/side)"
+
+# ---------------------------------------------------------------- symbolic-ref
+check "symbolic-ref HEAD" \
+  "$(git -C "$REFS" symbolic-ref HEAD)" "$("$GITTLE" -C "$REFS" symbolic-ref HEAD)"
+check "symbolic-ref --short" \
+  "$(git -C "$REFS" symbolic-ref --short HEAD)" \
+  "$("$GITTLE" -C "$REFS" symbolic-ref --short HEAD)"
+"$GITTLE" -C "$REFS" symbolic-ref refs/heads/alias refs/heads/side
+check "gittle's symref, read by git" \
+  "refs/heads/side" "$(git -C "$REFS" symbolic-ref refs/heads/alias)"
+check "symref resolves to its target" \
+  "$(git -C "$REFS" rev-parse refs/heads/side)" \
+  "$(git -C "$REFS" rev-parse refs/heads/alias)"
+"$GITTLE" -C "$REFS" symbolic-ref -d refs/heads/alias
+git -C "$REFS" symbolic-ref refs/heads/alias >/dev/null 2>&1 \
+  && bad "symbolic-ref -d left the ref behind" || ok
+# -q on a ref that is not symbolic exits 1 without complaining
+"$GITTLE" -C "$REFS" symbolic-ref -q refs/heads/side >/dev/null 2>&1
+[ $? = 1 ] && ok || bad "symbolic-ref -q on a direct ref should exit 1"
+report "symbolic-ref" "read, write, --short, -d, -q"
+
+# ------------------------------------------------------------------ update-ref
+"$GITTLE" -C "$REFS" update-ref refs/heads/written "$H" -m "by gittle"
+check "gittle writes, git reads" "$H" "$(git -C "$REFS" rev-parse refs/heads/written)"
+check "reflog entry gittle wrote" \
+  "0000000000000000000000000000000000000000 $H" \
+  "$(cut -d' ' -f1,2 < "$REFS/.git/logs/refs/heads/written")"
+check "reflog message" "by gittle" \
+  "$(sed 's/.*\t//' < "$REFS/.git/logs/refs/heads/written")"
+
+# The reflog line gittle writes and the one git writes must have the same shape.
+git -C "$REFS" update-ref refs/heads/gitwrote "$H" -m "by git"
+check "reflog shape matches git's" \
+  "$(awk '{print NF}' < "$REFS/.git/logs/refs/heads/gitwrote")" \
+  "$(awk '{print NF}' < "$REFS/.git/logs/refs/heads/written")"
+
+# Compare-and-swap: a wrong old value must fail and change nothing.
+"$GITTLE" -C "$REFS" update-ref refs/heads/written "$H1" \
+  0000000000000000000000000000000000000001 >/dev/null 2>&1 \
+  && bad "CAS with a wrong old value should fail" || ok
+check "CAS failure changed nothing" "$H" \
+  "$(git -C "$REFS" rev-parse refs/heads/written)"
+
+# A ref may not name an object that is not there, and a branch must be a commit.
+"$GITTLE" -C "$REFS" update-ref refs/heads/bogus \
+  deadbeefdeadbeefdeadbeefdeadbeefdeadbeef >/dev/null 2>&1 \
+  && bad "should refuse a nonexistent object" || ok
+TREE=$(git -C "$REFS" rev-parse "HEAD^{tree}")
+"$GITTLE" -C "$REFS" update-ref refs/heads/bogus "$TREE" >/dev/null 2>&1 \
+  && bad "should refuse a tree as a branch" || ok
+git -C "$REFS" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after gittle's writes"
+
+# Deleting: loose, packed, and the reflog that went with it.
+"$GITTLE" -C "$REFS" update-ref -d refs/heads/gitwrote
+git -C "$REFS" rev-parse refs/heads/gitwrote >/dev/null 2>&1 \
+  && bad "delete left the ref" || ok
+[ -f "$REFS/.git/logs/refs/heads/gitwrote" ] \
+  && bad "delete left the reflog" || ok
+git -C "$WORK/packed" pack-refs --all
+"$GITTLE" -C "$WORK/packed" update-ref -d refs/heads/side
+git -C "$WORK/packed" rev-parse refs/heads/side >/dev/null 2>&1 \
+  && bad "delete left a packed ref" || ok
+git -C "$WORK/packed" fsck --strict >/dev/null 2>&1 && ok \
+  || bad "fsck after deleting a packed ref"
+
+# HEAD is followed, not overwritten, and both logs record the move.
+: > "$REFS/.git/logs/HEAD"
+: > "$REFS/.git/logs/$(git -C "$REFS" symbolic-ref HEAD)"
+"$GITTLE" -C "$REFS" update-ref HEAD "$H1" -m "deref"
+check "update-ref HEAD keeps it symbolic" "ref: $(git -C "$REFS" symbolic-ref HEAD)" \
+  "$(cat "$REFS/.git/HEAD")"
+check "the branch moved, not HEAD" "$H1" "$(git -C "$REFS" rev-parse HEAD)"
+check "both reflogs recorded it" "1 1" \
+  "$(wc -l < "$REFS/.git/logs/HEAD" | tr -d ' ') $(wc -l < "$REFS/.git/logs/$(git -C "$REFS" symbolic-ref HEAD)" | tr -d ' ')"
+git -C "$REFS" update-ref HEAD "$H"
+report "update-ref" "write, CAS, delete, deref, validation"
+
+# --stdin is a transaction: all of it happens, or none of it does.
+printf 'create refs/heads/t1 %s\nupdate refs/heads/t2 %s\n' "$H" "$H" \
+  | "$GITTLE" -C "$REFS" update-ref --stdin
+check "--stdin applied the batch" "$H $H" \
+  "$(git -C "$REFS" rev-parse refs/heads/t1 refs/heads/t2 | tr '\n' ' ' | sed 's/ $//')"
+printf 'create refs/heads/t3 %s\ncreate refs/heads/t1 %s\n' "$H" "$H" \
+  | "$GITTLE" -C "$REFS" update-ref --stdin >/dev/null 2>&1 \
+  && bad "--stdin should fail on a duplicate create" || ok
+git -C "$REFS" rev-parse refs/heads/t3 >/dev/null 2>&1 \
+  && bad "--stdin left a ref behind after failing" || ok
+printf 'verify refs/heads/t1 %s\ndelete refs/heads/t2\n' "$H" \
+  | "$GITTLE" -C "$REFS" update-ref --stdin
+git -C "$REFS" rev-parse refs/heads/t2 >/dev/null 2>&1 \
+  && bad "--stdin delete did nothing" || ok
+printf 'verify refs/heads/t1 %s\n' "$H1" \
+  | "$GITTLE" -C "$REFS" update-ref --stdin >/dev/null 2>&1 \
+  && bad "--stdin verify should fail on the wrong value" || ok
+# -z: the same batch, NUL-separated
+printf 'update refs/heads/t4\0%s\0\0' "$H" \
+  | "$GITTLE" -C "$REFS" update-ref -z --stdin
+check "--stdin -z" "$H" "$(git -C "$REFS" rev-parse refs/heads/t4)"
+printf 'symref-update refs/heads/sym\0refs/heads/t1\0' \
+  | "$GITTLE" -C "$REFS" update-ref -z --stdin
+check "--stdin symref-update" "refs/heads/t1" \
+  "$(git -C "$REFS" symbolic-ref refs/heads/sym)"
+report "update-ref --stdin" "transaction, verify, -z, symref"
+
+# A held lock must stop a second writer rather than corrupt the ref.
+touch "$REFS/.git/refs/heads/t1.lock"
+"$GITTLE" -C "$REFS" update-ref refs/heads/t1 "$H1" >/dev/null 2>&1 \
+  && bad "should refuse a locked ref" || ok
+rm -f "$REFS/.git/refs/heads/t1.lock"
+report "ref locking" "a held .lock is respected"
+
+# ---------------------------------------------------------------------- config
+CG="$WORK/cfg-git"; CT="$WORK/cfg-gittle"
+git init -q "$CG"; git init -q "$CT"
+cfg_both() { git -C "$CG" config "$@" >/dev/null 2>&1
+             "$GITTLE" -C "$CT" config "$@" >/dev/null 2>&1; }
+cfg_both set core.foo bar
+cfg_both set section.key value
+cfg_both set remote.origin.url 'git@example.com:p.git'
+cfg_both set core.foo baz
+cfg_both set 'a.sub.with.dots.key' 'has  spaces  '
+cfg_both set quoting.v 'x#y;z"q\w'
+cfg_both set branch.main.merge refs/heads/main
+cfg_both unset section.key
+cfg_both unset remote.origin.url
+cmp -s "$CG/.git/config" "$CT/.git/config" \
+  && { ok; report "config set/unset" "file is byte-identical to git's"; } \
+  || { bad "config set/unset"; diff "$CG/.git/config" "$CT/.git/config" | head -8; }
+
+diff <(git -C "$CT" config list --local) <("$GITTLE" -C "$CT" config list --local) \
+  >/dev/null && ok || bad "config list --local"
+check "config get" "baz" "$("$GITTLE" -C "$CT" config get core.foo)"
+"$GITTLE" -C "$CT" config get no.such.key >/dev/null 2>&1
+[ $? = 1 ] && ok || bad "config get on a missing key should exit 1"
+printf '[multi]\n\tk = 1\n\tk = 2\n' >> "$CT/.git/config"
+check "config get takes the last value" "2" "$("$GITTLE" -C "$CT" config get multi.k)"
+check "config get --all" "1 2" \
+  "$("$GITTLE" -C "$CT" config get --all multi.k | tr '\n' ' ' | sed 's/ $//')"
+"$GITTLE" -C "$CT" config unset multi.k >/dev/null 2>&1
+[ $? = 5 ] && ok || bad "config unset on a multi-valued key should exit 5"
+"$GITTLE" -C "$CT" config unset --all multi.k
+"$GITTLE" -C "$CT" config get multi.k >/dev/null 2>&1 \
+  && bad "config unset --all left a value" || ok
+report "config get/list" "scopes, --all, exit status"
+
+# The parser has to survive the shapes a human writes by hand.
+cat > "$WORK/hand.config" <<'CFG'
+# a comment
+[core] ; trailing comment
+	bare = false
+[remote "with space"]
+	url = "  padded  "
+	fetch = +refs/heads/*:refs/remotes/o/*
+[bool]
+	implicit
+[cont]
+	v = one\
+two
+CFG
+diff <(git config --file "$WORK/hand.config" --list) \
+     <("$GITTLE" config --file "$WORK/hand.config" list) >/dev/null \
+  && { ok; report "config parser" "comments, subsections, continuations"; } \
+  || { bad "config parser"; diff <(git config --file "$WORK/hand.config" --list) \
+       <("$GITTLE" config --file "$WORK/hand.config" list) | head -8; }
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

@@ -1,8 +1,22 @@
-## Object IDs.  20 raw bytes; hex only at the edges.
+## Object IDs: 20 raw bytes, with hex only at the edges.
+##
+## An object ID is the SHA-1 of the object's framed bytes, and it is the only
+## name an object has.  Everything below exists to keep it in its binary form
+## in memory -- a pack index holds 420,000 of them, and comparing them as
+## 40-character strings would be both slower and easier to get subtly wrong
+## about case.
+##
+## Two shapes are needed:
+##
+## * `Oid`, a complete 20-byte name.
+## * `OidPrefix`, an *abbreviation* -- the `1630431` a human types instead of
+##   the full forty digits.  It carries a count of significant hex digits
+##   because an odd-length abbreviation constrains only half of a byte, which
+##   is what makes `matches` and the pack index's prefix search fiddly.
 ##
 ## R4: one hash.  SHA-1 is the only object format v1 understands, and the
-## extension gate in repository.nim refuses a sha256 repository outright, so
-## nothing below needs to be parameterised by hash size.
+## extension gate in `repository.nim` refuses a sha256 repository outright, so
+## nothing here is parameterised by hash size.
 
 
 import sha1, util
@@ -86,6 +100,10 @@ func tryParsePrefix*(s: string, p: var OidPrefix): bool =
 
 func matches*(p: OidPrefix, o: Oid): bool =
   ## Does `o` begin with the abbreviation?
+  ##
+  ## Whole bytes compare directly; an odd trailing nybble compares only the
+  ## high half of the next byte, which is why the count is kept in nybbles
+  ## rather than bytes.
   let whole = p.nybbles div 2
   for i in 0 ..< whole:
     if p.b[i] != o.b[i]: return false

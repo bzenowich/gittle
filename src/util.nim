@@ -1,4 +1,14 @@
-## Errors, and the small filesystem helpers every writer needs.
+## Errors, exit status, and the small filesystem helpers every writer needs.
+##
+## Everything gittle can explain to a user is a `GittleError`.  `main` catches
+## it, prints `gittle: <message>` and exits 128, which is git's status for a
+## fatal error; anything else escaping to `main` is a bug and gets Nim's own
+## traceback, which is the right outcome for a bug.
+##
+## The messages are meant to be actionable rather than terse.  A tool this
+## small cannot afford advice machinery, so what would have been a hint goes
+## in the error text itself -- see the repository extension gate for the shape
+## that takes.
 
 import std/[os, posix, strutils]
 
@@ -33,9 +43,17 @@ proc readWholeFile*(path: string): string =
 var tmpSeq = 0
 
 proc writeFileAtomic*(path, data: string, mode: int = 0o444) =
-  ## Write via a temporary file in the same directory plus `rename`, so a reader
-  ## never sees a partial file and a crash never leaves a corrupt one.  Loose
-  ## objects are read-only once written, which is why `mode` defaults to 0444.
+  ## Write via a temporary file in the same directory plus `rename`.
+  ##
+  ## `rename` within a directory is atomic on POSIX, so a concurrent reader
+  ## sees either the old file or the complete new one, never a partial write,
+  ## and a crash leaves at worst a stray temporary rather than a corrupt
+  ## object.  The temporary has to be in the *same* directory because `rename`
+  ## across filesystems is not atomic and may not even be possible.
+  ##
+  ## `mode` defaults to 0444: a loose object is named by the hash of its own
+  ## contents, so there is never a reason to modify one in place, and making it
+  ## read-only says so.
   let dir = parentDir(path)
   inc tmpSeq
   let tmp = dir / ("tmp_gittle_" & $getpid() & "_" & $tmpSeq)

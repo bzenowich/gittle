@@ -8,6 +8,8 @@
 import std/[os, strutils]
 import cli, config, util
 import cmd/hashobject, cmd/catfile
+import cmd/updateref, cmd/symbolicref, cmd/foreachref
+import cmd/config as cmdconfig
 
 const
   version = "gittle version 0.1.0"
@@ -25,13 +27,21 @@ Options before the command:
 
 Commands:
    cat-file              inspect objects
+   config                read and write configuration
+   for-each-ref          list refs through a format string
    hash-object           compute, and optionally store, an object ID
+   symbolic-ref          read and write symbolic refs
+   update-ref            create, update and delete refs
    version               print the version"""
 
 proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   case verb
   of "hash-object": cmdHashObject(c, args)
   of "cat-file": cmdCatFile(c, args)
+  of "update-ref": cmdUpdateRef(c, args)
+  of "symbolic-ref": cmdSymbolicRef(c, args)
+  of "for-each-ref": cmdForEachRef(c, args)
+  of "config": cmdconfig.cmdConfig(c, args)
   of "version": (echo version; 0)
   of "help": (echo usageText; 0)
   else:

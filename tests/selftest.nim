@@ -3,11 +3,12 @@
 ##
 ##   selftest sha1   < input   -- hash stdin, feeding it in awkward chunk sizes
 ##   selftest zlib   < input   -- round-trip stdin through every inflate path
+##   selftest glob             -- the glob engine against a table of cases
 ##
 ## Built by tests/oracle.sh; not part of the gittle binary.
 
 import std/[os, strutils]
-import sha1, zlib
+import sha1, zlib, glob, refname
 
 proc hex(d: Sha1Digest): string =
   result = newStringOfCap(40)
@@ -51,11 +52,73 @@ proc testZlib(data: string) =
 
   echo "ok ", data.len, " -> ", comp.len
 
+const globCases = [
+  # (pattern, subject, pathname-mode expected, plain expected)
+  ("*", "abc", true, true),
+  ("*", "a/b", false, true),          # `*` stops at `/` in pathname mode
+  ("**", "a/b", true, true),          # `**` is the opt-out
+  ("a/*", "a/b", true, true),
+  ("a/*", "a/b/c", false, true),
+  ("a/**", "a/b/c", true, true),
+  ("refs/heads/*", "refs/heads/main", true, true),
+  ("refs/heads/*", "refs/heads/f/x", false, true),
+  ("refs/*/side", "refs/heads/side", true, true),
+  ("?", "a", true, true),
+  ("?", "/", false, true),
+  ("a?c", "abc", true, true),
+  ("a?c", "ac", false, false),
+  ("[abc]d", "bd", true, true),
+  ("[!abc]d", "bd", false, false),
+  ("[^abc]d", "zd", true, true),
+  ("[a-c]d", "bd", true, true),
+  ("[a-c]d", "dd", false, false),
+  ("[]]x", "]x", true, true),         # `]` first in a class is a literal
+  ("a\\*b", "a*b", true, true),         # an escaped star is a literal star
+  ("a\\*b", "axb", false, false),
+  ("", "", true, true),
+  ("", "a", false, false),
+  ("a*b*c", "abxbyc", true, true),    # backtracking
+  ("*.c", "foo.c", true, true),
+  ("*.c", "d/foo.c", false, true),
+  ("[", "[", false, false),           # an unterminated class matches nothing
+]
+
+proc testGlob() =
+  var failures = 0
+  for (pat, sub, wantPath, wantPlain) in globCases:
+    let gotPath = globMatch(pat, sub, {gfPathname})
+    let gotPlain = globMatch(pat, sub, {})
+    if gotPath != wantPath:
+      inc failures
+      echo "  pathname: '", pat, "' vs '", sub, "' -> ", gotPath, ", want ", wantPath
+    if gotPlain != wantPlain:
+      inc failures
+      echo "  plain:    '", pat, "' vs '", sub, "' -> ", gotPlain, ", want ", wantPlain
+
+  # Case folding, and the shortening helpers that sit beside the matcher.
+  doAssert globMatch("ABC", "abc", {gfIgnoreCase})
+  doAssert not globMatch("ABC", "abc", {})
+  doAssert shortenRefname("refs/heads/main") == "main"
+  doAssert shortenRefname("refs/tags/v1") == "v1"
+  doAssert shortenRefname("refs/remotes/o/main") == "o/main"
+  doAssert shortenRefname("HEAD") == "HEAD"
+  doAssert lstripRefname("refs/heads/main", 2) == "main"
+  doAssert lstripRefname("refs/heads/f/x", -1) == "x"
+  doAssert rstripRefname("refs/heads/main", 1) == "refs/heads"
+  doAssert isValidRefname("refs/heads/main")
+  doAssert not isValidRefname("refs/heads/a..b")
+  doAssert not isValidRefname("main")
+  doAssert isValidRefname("HEAD", {rfAllowOneLevel})
+
+  doAssert failures == 0, $failures & " glob cases failed"
+  echo "ok ", globCases.len, " glob cases"
+
 when isMainModule:
-  let data = readAll(stdin)
-  case (if paramCount() >= 1: paramStr(1) else: "")
-  of "sha1": testSha1(data)
-  of "zlib": testZlib(data)
+  let mode = if paramCount() >= 1: paramStr(1) else: ""
+  case mode
+  of "glob": testGlob()
+  of "sha1": testSha1(readAll(stdin))
+  of "zlib": testZlib(readAll(stdin))
   else:
-    stderr.write "usage: selftest (sha1 | zlib) < input\n"
+    stderr.write "usage: selftest (sha1 | zlib | glob) [< input]\n"
     quit(2)

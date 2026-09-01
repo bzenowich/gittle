@@ -3,7 +3,9 @@
 ## packs, and alternates.
 
 import std/[os, strutils, algorithm]
-import oid, objects, config, packfile, util
+import oid, objects, config, packfile, refs, ident, refname, util
+
+export refs, refname, config
 
 type
   Repository* = ref object
@@ -16,6 +18,7 @@ type
     objDirs*: seq[string]  ## the main object directory first, then alternates
     packsLoaded: bool
     packs: seq[Pack]
+    refStoreCache: RefStore
 
 # -- discovery --------------------------------------------------------------
 
@@ -162,11 +165,15 @@ proc openRepository*(gitDirOpt, workTreeOpt, startDir: string,
     let t = readWholeFile(commonFile).strip()
     result.commonDir = (if isAbsolute(t): t else: result.gitDir / t).normalizedPath
 
-  result.cfg = loadConfig(result.commonDir / "config")
-  # extensions.worktreeConfig: per-worktree overrides, read after the shared file.
+  # Configuration is a merge, later files winning: the user's own file, then
+  # the repository's, then this worktree's, then `-c` on the command line.
+  # `--system` is out of scope (docs/11): a single static binary with no
+  # install prefix has no system-wide file to read.
+  result.cfg = loadConfig(globalConfigPath())
+  result.cfg.add loadConfig(result.commonDir / "config")
   if result.cfg.getBool("extensions.worktreeConfig", false):
     result.cfg.add loadConfig(result.gitDir / "config.worktree")
-  result.cfg.add overrides   # -c on the command line wins over the files
+  result.cfg.add overrides
 
   checkExtensions(result)
 
@@ -229,12 +236,59 @@ proc objectInfo*(r: Repository, o: Oid): tuple[kind: ObjectType, size: int] =
 proc writeObject*(r: Repository, kind: ObjectType, data: string): Oid =
   writeLoose(r.objDirs[0], kind, data)
 
+# ---------------------------------------------------------------------------
+# The ref store
+# ---------------------------------------------------------------------------
+
+proc logRefsPolicy(cfg: Config, bare: bool): LogRefsPolicy =
+  ## `core.logAllRefUpdates` is a tri-state, not a boolean: unset means "the
+  ## normal set of refs, unless this repository is bare", and the string
+  ## `always` means every ref including tags (`refs.c`).
+  if not cfg.has("core.logAllRefUpdates"):
+    return if bare: lrNone else: lrNormal
+  let v = cfg.get("core.logAllRefUpdates").toLowerAscii
+  case v
+  of "always": lrAlways
+  of "false", "no", "off", "0": lrNone
+  else: lrNormal
+
+proc refs*(r: Repository): RefStore =
+  ## The ref store for this repository, created on first use.
+  if r.refStoreCache == nil:
+    let cfg = r.cfg
+    r.refStoreCache = newRefStore(
+      r.gitDir, r.commonDir, logRefsPolicy(cfg, r.bare),
+      proc (): Ident = getIdent(cfg, irCommitter),
+      proc (o: Oid): ObjectType =
+        # `otBad` means "not in this database", which is how the ref layer
+        # refuses to point a ref at an object that is not there.
+        try: r.objectInfo(o).kind except GittleError: otBad)
+  r.refStoreCache
+
+proc headRefName*(r: Repository): string =
+  ## The branch HEAD names, whether or not it exists yet.  In a repository with
+  ## no commits this is the branch a first commit would create.
+  let (found, rf) = r.refs.readRef(headRef)
+  if found and rf.isSymbolic: rf.symTarget else: headRef
+
 proc resolveOid*(r: Repository, name: string): Oid =
-  ## Phase 1 resolves object names only: a full 40-hex name, or an unambiguous
-  ## abbreviation of at least four digits.  Refs, HEAD and the `^`/`~` operators
-  ## arrive with the revision walk in phase 6.
+  ## Turn a name into an object ID, in git's order of preference:
+  ##
+  ## 1. a full 40-digit object name, which always wins -- it is unambiguous by
+  ##    construction, and something that long is never meant as a ref;
+  ## 2. a reference, through the DWIM rules in `refs.nim` (`HEAD`, `main`,
+  ##    `v1.0`, `origin/main`, or any full ref name);
+  ## 3. an unambiguous abbreviated object name of at least four digits.
+  ##
+  ## The `^`, `~`, `@{…}` and `<tree-ish>:<path>` operators need the revision
+  ## walk and arrive in phase 6.
   if tryParseOid(name, result):
     return
+
+  let d = r.refs.dwimRef(name)
+  if d.found:
+    return d.oid
+
   var pre: OidPrefix
   failIf(not tryParsePrefix(name, pre) or pre.nybbles < 4,
          "not a valid object name: " & name)

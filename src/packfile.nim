@@ -1,11 +1,61 @@
 ## Packfiles: `.idx` v2 lookup, `.pack` object reading, and delta application.
 ##
-## Both files are memory-mapped.  Nothing here copies more than the object being
-## returned, which matters: the pack next door is 322 MiB.
+## A packfile is how git stores almost every object almost all of the time.
+## The repository beside this one holds 420,113 objects; 420,111 of them are in
+## a single 322 MiB pack, and none is a separate file.  Reading one is
+## therefore not an optimisation -- it is the ordinary case.
 ##
-## Only index version 2 is read.  Git has written v2 by default since 1.6, and
-## a v1 index can be regenerated with `git index-pack`, so refusing it costs a
-## user nothing and saves a format.
+## ## The two files
+##
+## A pack comes in two parts, named after the same 40-hex digest:
+##
+## * `pack-<hash>.pack` -- a 12-byte header (`PACK`, a version, an object
+##   count), then every object back to back, then a 20-byte checksum of
+##   everything before it.  Objects are stored *in an arbitrary order* and
+##   there is no table of contents.
+## * `pack-<hash>.idx` -- the table of contents, which is why it can be
+##   regenerated from the pack alone (`git index-pack`).
+##
+## ## The index, version 2
+##
+##     8 bytes     \377tOc, then the version, 2
+##     1024 bytes  a 256-entry fan-out table: entry `i` is the number of
+##                 objects whose first byte is <= `i`
+##     N * 20      every object's ID, sorted
+##     N * 4       a CRC32 of each object's packed bytes
+##     N * 4       each object's offset in the pack; if the top bit is set,
+##                 the rest indexes the table below instead
+##     M * 8       offsets that do not fit in 31 bits, for packs over 2 GiB
+##     20 + 20     the pack's checksum, then the index's own
+##
+## The fan-out table is the trick that makes lookup fast without loading
+## anything: the first byte of the wanted ID indexes straight into it, and the
+## binary search that follows starts already narrowed to about 1/256th of the
+## file.
+##
+## ## Two different variable-length integers
+##
+## The pack format uses two varint encodings that look alike and are not
+## interchangeable, which is a rewarding source of bugs:
+##
+## * The **size** varint, in an object's header.  Seven bits per byte,
+##   little-endian, top bit set means "another byte follows" -- except that the
+##   first byte gives up three bits to the object type, so it carries only
+##   four.  See `readEntry`.
+## * The **offset** varint, used by `OBJ_OFS_DELTA` for the distance back to
+##   its base, and again by index version 4 for path prefixes.  Also seven bits
+##   per byte, but each continuation *adds one* before shifting, so that no
+##   value has two encodings.  See the loop in `readEntry`.
+##
+## Both are also big-endian in a sense the other is not; do not merge them.
+##
+## ## What is read and what is not
+##
+## Both files are memory-mapped, so nothing here copies more than the object
+## being returned.  Only index version 2 is read: git has written v2 by default
+## since 1.6, and a v1 index can be regenerated in seconds, so refusing it costs
+## a user nothing and saves a format.  The `.rev` reverse index and any bitmap
+## file beside the pack are ignored entirely (R3).
 
 import std/[memfiles, os, tables, deques]
 import oid, objects, zlib, util
@@ -174,6 +224,8 @@ proc readEntry*(p: Pack, offset: int): PackEntry =
   result.kind = packTypeFromInt(int((c shr 4) and 7))
   failIf(result.kind == otBad, "bad object type in " & p.packPath &
                                " at " & $offset)
+  # The size varint: four bits in the first byte (the other four are the type
+  # and the continuation flag), then seven per byte, little-endian.
   var size = int(c and 15)
   var shift = 4
   while (c and 0x80) != 0:
@@ -214,7 +266,10 @@ proc inflateEntry(p: Pack, e: PackEntry): string =
 # -- deltas -----------------------------------------------------------------
 
 func deltaVarint(d: string, at: var int): int =
-  ## The delta header's plain 7-bit little-endian varint (patch-delta.c).
+  ## The delta header's varint: plain seven bits per byte, little-endian, top
+  ## bit as the continuation flag (`patch-delta.c`).  Note this is a *third*
+  ## encoding, distinct from both pack varints -- it has no type field stolen
+  ## from the first byte and no +1 on continuation.
   var shift = 0
   while true:
     failIf(at >= d.len, "truncated delta header")
@@ -225,8 +280,21 @@ func deltaVarint(d: string, at: var int): int =
     shift += 7
 
 proc applyDelta*(base, delta: string): string =
-  ## patch-delta.c, ~94 lines of C, in about 35 of Nim.  The result size is
-  ## known from the header, so the whole thing is one allocation.
+  ## Reconstruct an object from a base and a delta (`patch-delta.c`).
+  ##
+  ## A delta is a tiny program with two instructions, run against the base:
+  ##
+  ## * **copy** -- top bit set.  The low four bits say which of four offset
+  ##   bytes follow, the next three say which of three size bytes follow, and
+  ##   absent bytes are zero.  So copying 4 bytes from offset 0 costs two bytes
+  ##   of delta, and a size of zero means 65536 (a special case that exists
+  ##   only because the encoding cannot otherwise express it).
+  ## * **insert** -- top bit clear, and the byte itself is a length of 1..127,
+  ##   followed by that many literal bytes.  Zero is reserved.
+  ##
+  ## The header gives the base size (checked, because a mismatch means we found
+  ## the wrong base) and the result size, so the whole result is one
+  ## allocation and every write is bounds-checked against it.
   var at = 0
   let baseSize = deltaVarint(delta, at)
   let resultSize = deltaVarint(delta, at)

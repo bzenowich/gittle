@@ -1,9 +1,21 @@
 ## SHA-1 (RFC 3174).
 ##
-## Decision 5 in plan.md: a plain implementation, not git's sha1dc.  Object IDs
-## match git's for identical content; what is lost is the hardening that makes
-## git refuse the known collision-attack patterns.  gittle will happily store a
-## collision pair that git rejects.
+## Every object in a git repository is named by the SHA-1 of its own bytes, so
+## this file is the reason gittle and git agree about anything at all.
+##
+## The algorithm: the message is padded to a multiple of 64 bytes (a `0x80`
+## byte, then zeros, then the original length in bits as a big-endian 64-bit
+## number), and each 64-byte block is mixed into a five-word state through 80
+## rounds.  `update` may be called with any split of the input -- the state is
+## the same however the bytes arrive, which is what lets `hashObject` hash a
+## header and a payload without joining them into a third copy.
+##
+## **Decision 5 in plan.md: this is plain SHA-1, not git's sha1dc.** Object IDs
+## match git's for identical content, which is all that compatibility requires.
+## What is lost is the hardening that detects the known collision-attack
+## patterns and refuses: gittle will happily store a collision pair that git
+## rejects.  That is acceptable for a local tool and worth remembering if
+## gittle ever accepts pushes from strangers.
 
 type
   Sha1Digest* = array[20, byte]
@@ -95,6 +107,11 @@ func update*(c: var Sha1Ctx, s: string) {.inline.} =
 
 func finish*(c: var Sha1Ctx): Sha1Digest =
   ## Pad and emit the digest.  `c` must not be used again without `init`.
+  ##
+  ## The padding is a `0x80` byte, then enough zeros to leave exactly eight
+  ## bytes free at the end of a block, then the message length in *bits*.  When
+  ## fewer than eight bytes are free the padding runs into a second block,
+  ## which is why `pad` is 72 bytes rather than 64.
   let bits = c.total * 8
   var pad: array[72, byte]        # 0x80, up to 63 zeros, 8 length bytes
   pad[0] = 0x80
