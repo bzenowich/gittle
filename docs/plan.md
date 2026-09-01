@@ -143,6 +143,32 @@ The ratio is worst when the absolute cost is trivial. Ordinary pushes are
 unaffected in any way a user would notice; the case to watch is a first push of
 imported history, where a 20x multiplier on hundreds of megabytes is real.
 
+**Reproducing these figures.** Run from a checkout of git with a single
+packfile; `$G` is the repository under measurement.
+
+```sh
+G="git -C /home/bz/code/git"
+$G rev-list --objects --all | awk '{print $1}' > objlist.txt   # 420,113 oids
+
+# raw uncompressed total (NB: verify-pack's size column reports DELTA sizes
+# for deltified objects, so it cannot be summed for this -- use cat-file)
+awk '{print $1}' objlist.txt \
+  | $G cat-file --batch-check='%(objectsize)' \
+  | awk '{s+=$1} END{printf "%.1f MiB\n", s/1048576}'
+
+$G pack-objects --stdout --window=0 --no-reuse-delta < objlist.txt | wc -c  # no deltas
+$G pack-objects --stdout --window=0                  < objlist.txt | wc -c  # reuse only
+ls -l .git/objects/pack/*.pack                                              # git's own
+
+# push sizes: thin (what git sends) vs undeltified (what gittle sends)
+printf 'HEAD\n^HEAD~100\n' | $G pack-objects --stdout --thin --revs | wc -c
+printf 'HEAD\n^HEAD~100\n' | $G pack-objects --stdout --revs --window=0 --no-reuse-delta | wc -c
+```
+
+`--window=0` disables delta *search* while leaving reuse on; adding
+`--no-reuse-delta` disables reuse as well. That pair is what separates the two
+middle rows of the table above, and it is the whole of R2 in one flag.
+
 **Unaffected entirely:** `clone` and `fetch` as a client. The server builds
 those packs, gittle only applies the deltas — 94 lines.
 
