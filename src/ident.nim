@@ -88,10 +88,43 @@ proc parseDate*(s: string): tuple[when0: int64, tzOffset: int] =
       discard
   fail("cannot parse date: " & s)
 
+proc parseIdentLine*(line: string): Ident =
+  ## The inverse of `$`, over bytes some other tool wrote.
+  ##
+  ## Deliberately tolerant (R1: read liberally).  Real repositories contain
+  ## ident lines with no email, with a stray `>` in the name, and -- from
+  ## importers -- with no timestamp at all.  Anything unreadable degrades to a
+  ## zero timestamp rather than failing a `log` over history nobody can change
+  ## now; `split_ident_line` in git is tolerant for the same reason.
+  let lt = line.find('<')
+  let gt = if lt >= 0: line.find('>', lt + 1) else: -1
+  if lt >= 0 and gt > lt:
+    result.name = line[0 ..< lt].strip()
+    result.email = line[lt + 1 ..< gt]
+    let rest = line[gt + 1 .. ^1].splitWhitespace()
+    if rest.len >= 1 and rest[0].len > 0 and rest[0].allCharsInSet(Digits):
+      result.when0 = parseBiggestInt(rest[0]).int64
+    if rest.len >= 2 and rest[1].len == 5 and rest[1][0] in {'+', '-'}:
+      try: result.tzOffset = parseTzOffset(rest[1]) except GittleError: discard
+  else:
+    result.name = line.strip()
+
+var cachedNow: tuple[when0: int64, tzOffset: int]
+
 proc nowStamp(): tuple[when0: int64, tzOffset: int] =
-  let n = now()
-  # Nim reports the offset in seconds *west* of UTC; git writes east.
-  (n.toTime().toUnix(), -(n.utcOffset div 60))
+  ## The clock is read **once per process**, and every identity written
+  ## afterwards gets that instant.
+  ##
+  ## This is not a cache for speed.  A commit records an author and a
+  ## committer, and reading the clock separately for each lets one commit
+  ## straddle a second boundary -- so the same command run twice produces
+  ## objects that differ only in a timestamp nobody chose.  git does the same
+  ## thing (`ident.c:ident_default_date`).
+  if cachedNow.when0 == 0:
+    let n = now()
+    # Nim reports the offset in seconds *west* of UTC; git writes east.
+    cachedNow = (n.toTime().toUnix(), -(n.utcOffset div 60))
+  cachedNow
 
 proc getIdent*(cfg: Config, role: IdentRole): Ident =
   ## Resolve the identity to record, or explain what the user has to set.

@@ -17,6 +17,10 @@ type
     commonDir*: string   ## where objects/ and most refs live; == gitDir unless
                          ## this is a linked worktree
     workTree*: string    ## "" when bare
+    prefix*: string      ## the directory the command was run in, relative to
+                         ## `workTree` and ending in `/`; "" at the root.
+                         ## Pathspecs are resolved against it, and paths are
+                         ## printed relative to it, the way git does both.
     bare*: bool
     cfg*: Config
     objDirs*: seq[string]  ## the main object directory first, then alternates
@@ -189,6 +193,11 @@ proc openRepository*(gitDirOpt, workTreeOpt, startDir: string,
 
   result.bare = bareOpt or result.cfg.getBool("core.bare", result.workTree.len == 0)
   if result.bare: result.workTree = ""
+  if result.workTree.len > 0:
+    let here = absolutePath(startDir).normalizedPath
+    if here == result.workTree: result.prefix = ""
+    elif here.startsWith(result.workTree & "/"):
+      result.prefix = here[result.workTree.len + 1 .. ^1] & "/"
   result.loadObjDirs()
 
 # -- object lookup ----------------------------------------------------------

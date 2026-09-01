@@ -9,7 +9,7 @@
 ## plumbing, so it refuses to guess which of the two a caller meant.
 
 import std/[posix, strutils]
-import ../cli, ../index, ../objects, ../repository, ../util
+import ../cli, ../dir, ../index, ../objects, ../repository, ../util
 
 const usageText = """usage: gittle update-index [--add] [--remove] [--refresh]
                           [--cacheinfo <mode>,<object>,<path>]
@@ -18,25 +18,21 @@ const usageText = """usage: gittle update-index [--add] [--remove] [--refresh]
 proc stageFile(repo: Repository, idx: Index, path: string,
                allowAdd, allowRemove: bool) =
   ## Stage the working-tree file at `path`, or remove its entry if it is gone.
-  let full = repo.workTreePath(path)
-  let (ok, st) = statPath(full)
-  if not ok or S_ISDIR(st.st_mode):
-    failIf(not allowRemove,
-           "cannot stage '" & path & "': it does not exist\n" &
-           "  use --remove to drop it from the index")
-    failIf(not idx.removePath(path),
-           "'" & path & "' is not in the index and does not exist")
-    return
-
+  ##
+  ## The staging itself is `dir.stageWorkingPath`, which `add` and `commit`
+  ## also use; what is local here is the refusal.  `update-index` is plumbing,
+  ## so it will not guess whether a vanished file means "record the removal" or
+  ## "you mistyped the path" -- `--add` and `--remove` say which.
   let existing = idx.find(path)
   failIf(existing < 0 and not allowAdd,
          "cannot add '" & path & "' to the index\n" &
          "  use --add to add a path that is not already tracked")
-
-  var e = IndexEntry(path: path)
-  e.fillStat(st)
-  e.oid = repo.writeObject(otBlob, readWorkingFile(full, st))
-  idx.addEntry(e)
+  if stageWorkingPath(repo, idx, path): return
+  failIf(not allowRemove,
+         "cannot stage '" & path & "': it does not exist\n" &
+         "  use --remove to drop it from the index")
+  failIf(not idx.removePath(path),
+         "'" & path & "' is not in the index and does not exist")
 
 proc parseCacheinfo(repo: Repository, idx: Index, arg: string) =
   ## `--cacheinfo <mode>,<object>,<path>` inserts an entry with no working-tree

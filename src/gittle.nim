@@ -11,6 +11,7 @@ import cmd/hashobject, cmd/catfile
 import cmd/updateref, cmd/symbolicref, cmd/foreachref
 import cmd/lstree, cmd/writetree, cmd/readtree, cmd/updateindex, cmd/lsfiles
 import cmd/config as cmdconfig
+import cmd/init, cmd/committree, cmd/add, cmd/log, cmd/commit, cmd/show
 
 const
   version = "gittle version 0.1.0"
@@ -27,13 +28,19 @@ Options before the command:
    -h, --help            print this message
 
 Commands:
+   add                   stage content into the index
    cat-file              inspect objects
+   commit                record the staged content as a new commit
+   commit-tree           create a commit object
    config                read and write configuration
    for-each-ref          list refs through a format string
    hash-object           compute, and optionally store, an object ID
+   init                  create a repository
+   log                   show commit history
    ls-files              list index and working-tree files
    ls-tree               list a tree object's entries
    read-tree             load a tree into the index
+   show                  display objects
    symbolic-ref          read and write symbolic refs
    update-index          modify the index
    update-ref            create, update and delete refs
@@ -44,6 +51,12 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   case verb
   of "hash-object": cmdHashObject(c, args)
   of "cat-file": cmdCatFile(c, args)
+  of "init": cmdInit(c, args)
+  of "add": cmdAdd(c, args)
+  of "log": cmdLog(c, args)
+  of "commit": cmdCommit(c, args)
+  of "show": cmdShow(c, args)
+  of "commit-tree": cmdCommitTree(c, args)
   of "update-ref": cmdUpdateRef(c, args)
   of "symbolic-ref": cmdSymbolicRef(c, args)
   of "for-each-ref": cmdForEachRef(c, args)

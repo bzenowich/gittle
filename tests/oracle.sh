@@ -1,5 +1,8 @@
-#!/bin/sh
+#!/bin/bash
 # Differential tests: every claim gittle makes is checked against real git.
+#
+# bash, not sh: the suite compares two command's output with `diff <(a) <(b)`
+# throughout, and process substitution is not POSIX.
 #
 #   tests/oracle.sh [--full]
 #
@@ -31,10 +34,20 @@ fi
 git() { "$GIT" "$@"; }
 
 # Tests that write refs need an identity for the reflog, and must not depend on
-# whichever one the developer happens to have configured.
+# whichever one the developer happens to have configured.  The dates are pinned
+# too: a commit is named by the hash of its own bytes, so two tools committing
+# the same tree agree only if they are told the same instant.
 GIT_AUTHOR_NAME="Oracle Test"; GIT_AUTHOR_EMAIL="oracle@example.com"
 GIT_COMMITTER_NAME="Oracle Test"; GIT_COMMITTER_EMAIL="oracle@example.com"
+GIT_AUTHOR_DATE="1700000000 +0000"; GIT_COMMITTER_DATE="1700000060 +0100"
 export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+export GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+
+# git applies `.mailmap` to `log` and `show` by default (log.mailmap, true
+# since 2.34).  gittle does not implement it (docs/07 cuts --mailmap), so every
+# comparison against the reference repository -- which has a 700-line .mailmap
+# -- has to turn it off or it is comparing that, and nothing else.
+NOMAILMAP=--no-use-mailmap
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -840,6 +853,431 @@ diff <(git -C "$MG" ls-files -u) <("$GITTLE" -C "$MG" ls-files -u) >/dev/null \
 "$GITTLE" -C "$MG" write-tree >/dev/null 2>&1 \
   && bad "write-tree should refuse an unmerged index" || ok
 report "unmerged entries" "three stages read, write-tree refuses"
+
+# ===========================================================================
+# Phase 4: init, add, commit, log, show, and the ignore/pathspec engine
+# ===========================================================================
+
+# `git init` copies a template directory; `--template` is cut from gittle, so
+# the two are compared with an empty one.  Otherwise this would be measuring
+# whether gittle ships `hooks/pre-commit.sample`, which it deliberately does not.
+EMPTYTPL="$WORK/empty-template"
+mkdir -p "$EMPTYTPL"
+
+# ---------------------------------------------------------------------- init
+IN="$WORK/init"; mkdir -p "$IN"
+( cd "$IN" && GIT_TEMPLATE_DIR="$EMPTYTPL" git init -q a >/dev/null 2>&1 \
+           && "$GITTLE" init -q b >/dev/null )
+diff <(cd "$IN/a" && find . | sort) <(cd "$IN/b" && find . | sort) >/dev/null \
+  && ok || { bad "init created a different tree"; diff <(cd "$IN/a" && find . | sort) <(cd "$IN/b" && find . | sort); }
+cmp -s "$IN/a/.git/config" "$IN/b/.git/config" && ok || bad "init config differs"
+cmp -s "$IN/a/.git/HEAD" "$IN/b/.git/HEAD" && ok || bad "init HEAD differs"
+( cd "$IN" && GIT_TEMPLATE_DIR="$EMPTYTPL" git init -q --bare ba >/dev/null 2>&1 \
+           && "$GITTLE" init -q --bare bb >/dev/null )
+cmp -s "$IN/ba/config" "$IN/bb/config" && ok || bad "init --bare config differs"
+diff <(cd "$IN/ba" && find . | sort) <(cd "$IN/bb" && find . | sort) >/dev/null \
+  && ok || bad "init --bare created a different tree"
+# -b names the initial branch, and a second init must not disturb anything.
+( cd "$IN" && "$GITTLE" init -q -b trunk c >/dev/null )
+check "init -b" "ref: refs/heads/trunk" "$(cat "$IN/c/.git/HEAD")"
+( cd "$IN/c" && echo x > f && "$GITTLE" add f && "$GITTLE" commit -qm one )
+before=$(git -C "$IN/c" rev-parse HEAD)
+out=$( cd "$IN/c" && "$GITTLE" init )
+case "$out" in Reinitialized*) ok;; *) bad "re-init message: $out";; esac
+check "re-init keeps HEAD" "$before" "$(git -C "$IN/c" rev-parse HEAD)"
+git -C "$IN/c" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after gittle init+commit"
+report "init" "layout, config bytes, --bare, -b, re-init"
+
+# --------------------------------------------------- commit-tree, byte-exact
+# The command with no index, no hooks and no message cleanup in front of it:
+# whatever the two tools disagree about here is the commit format itself.
+CT="$WORK/ct"
+git init -q "$CT"
+( cd "$CT" && echo one > a && mkdir -p d && echo two > d/b && git add . )
+T1=$(git -C "$CT" write-tree)
+( cd "$CT" && echo three >> a && git add . )
+T2=$(git -C "$CT" write-tree)
+ct_ok=1; nct=0
+P1=$(git -C "$CT" commit-tree "$T1" -m base)
+for spec in "$T1||one" "$T2||one" "$T1|$P1|child" "$T2|$P1|child" \
+            "$T1|$P1 $P1|dup" "$T1||multi
+line
+message" "$T1||trailing   spaces   " "$T1||#looks like a comment" \
+            "$T1||" "$T2|$P1|a
+"; do
+  tree=${spec%%|*}; rest=${spec#*|}; par=${rest%%|*}; msg=${rest#*|}
+  args=""
+  for p in $par; do args="$args -p $p"; done
+  nct=$((nct+1))
+  a=$(printf '%s' "$msg" | git -C "$CT" commit-tree $args "$tree" 2>/dev/null)
+  b=$(printf '%s' "$msg" | "$GITTLE" -C "$CT" commit-tree $args "$tree" 2>/dev/null)
+  [ "$a" = "$b" ] || { ct_ok=0; echo "  commit-tree differs: tree=$tree parents='$par'"; }
+done
+# -m is repeatable and paragraphs join with a blank line; -F reads a file.
+printf 'from a file\n' > "$WORK/msg.txt"
+for args in "-m one" "-m one -m two" "-m one -m two -m three" \
+            "-F $WORK/msg.txt" "-m one -F $WORK/msg.txt"; do
+  nct=$((nct+1))
+  a=$(git -C "$CT" commit-tree $args "$T1")
+  b=$("$GITTLE" -C "$CT" commit-tree $args "$T1")
+  [ "$a" = "$b" ] || { ct_ok=0; echo "  commit-tree $args: git=$a gittle=$b"; }
+done
+[ $ct_ok = 1 ] && { ok; report "commit-tree" "$nct object IDs match git's"; } \
+               || bad "commit-tree"
+git -C "$CT" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after commit-tree"
+
+# ------------------------------------------------ commit message cleanup (R1)
+# The pipeline that decides the bytes hashed into the commit.  Compared by
+# object ID, never by text: a message differing by one trailing newline prints
+# identically under `log` and is a different commit.
+mk_msg_repo() { rm -rf "$1"; git init -q "$1"; ( cd "$1" && echo x > f && git add f ); }
+msg_ok=1; nmsg=0
+while IFS= read -r m; do
+  [ -z "$m" ] && continue
+  msg=$(printf '%b' "$m")
+  mk_msg_repo "$WORK/m1"; mk_msg_repo "$WORK/m2"
+  ( cd "$WORK/m1" && git commit -q -m "$msg" >/dev/null 2>&1 )
+  ( cd "$WORK/m2" && "$GITTLE" commit -q -m "$msg" >/dev/null 2>&1 )
+  a=$(git -C "$WORK/m1" rev-parse HEAD 2>/dev/null)
+  b=$(git -C "$WORK/m2" rev-parse HEAD 2>/dev/null)
+  nmsg=$((nmsg+1))
+  [ "$a" = "$b" ] || { msg_ok=0; printf '  message %s: git=%s gittle=%s\n' "$m" "$a" "$b"; }
+done <<'MSGS'
+plain
+  leading spaces kept
+trailing spaces stripped\t
+\n\n\nleading blank lines
+trailing blank lines\n\n\n
+a\n\n\n\nb collapsed to one blank
+# a comment survives -m
+line one\nline two
+a\tb tab inside
+unicode \xc3\xa9\xc3\xa8
+MSGS
+[ $msg_ok = 1 ] && { ok; report "commit message cleanup" "$nmsg messages, identical object IDs"; } \
+                || bad "commit message cleanup"
+
+# -F, and the message a hook rewrote, go through the same pipeline.
+mk_msg_repo "$WORK/m1"; mk_msg_repo "$WORK/m2"
+printf '  subject  \n\n\n\nbody\n\n\n' > "$WORK/msg2.txt"
+( cd "$WORK/m1" && git commit -q -F "$WORK/msg2.txt" )
+( cd "$WORK/m2" && "$GITTLE" commit -q -F "$WORK/msg2.txt" )
+check "commit -F" "$(git -C "$WORK/m1" rev-parse HEAD)" "$(git -C "$WORK/m2" rev-parse HEAD)"
+# An empty message aborts rather than committing nothing.
+mk_msg_repo "$WORK/m3"
+( cd "$WORK/m3" && "$GITTLE" commit -q -m "   " >/dev/null 2>&1 ) \
+  && bad "an empty message should abort" || ok
+
+# ------------------------------------------------------- the ignore engine
+# A generated matrix, checked through `ls-files`, which is the shared engine's
+# only observable surface until `check-ignore` arrives in phase 10.
+IG="$WORK/ignore"
+git init -q "$IG"
+( cd "$IG"
+  mkdir -p a/b/c doc build sub/build tmp "sp ace" deep/x/y out nested
+  for f in a/x.c a/b/y.c a/b/c/z.c doc/d.txt doc/d.log build/o.o sub/build/p.o \
+           sub/q.txt tmp/t1 "sp ace/s.txt" top.txt top.log Makefile keep.log \
+           deep/x/y/f.c deep/x/g.c out/x nested/note.md 'hash#file'; do
+    echo content > "$f"
+  done
+  cat > .gitignore <<'PATTERNS'
+# a comment line
+*.log
+!keep.log
+build/
+/tmp
+a/b/*.c
+out
+**/y/*.c
+deep/**/g.c
+\#hash*
+PATTERNS
+  printf '!*.log\n*.txt\n' > doc/.gitignore
+  printf 'q.txt\n' > sub/.gitignore )
+ig_ok=1; nig=0
+for opts in "-o --exclude-standard" "-o -i --exclude-standard" "-o" \
+            "-o --exclude-standard -- a" "-o --exclude-standard -- '*.c'" \
+            "-o --exclude-standard -- ':(glob)*.c'" \
+            "-o --exclude-standard -- doc sub"; do
+  nig=$((nig+1))
+  diff <(eval git -C "$IG" ls-files $opts) <(eval "$GITTLE" -C "$IG" ls-files $opts) \
+    >/dev/null || { ig_ok=0; echo "  ls-files $opts differs"; }
+done
+# From a subdirectory: the pathspec prefix and the relative output both apply.
+for d in a doc sub deep/x; do
+  for opts in "-o --exclude-standard" "-o --exclude-standard ." "-o --exclude-standard ':(top).'"; do
+    nig=$((nig+1))
+    diff <(cd "$IG/$d" && eval git ls-files $opts) \
+         <(cd "$IG/$d" && eval "$GITTLE" ls-files $opts) >/dev/null \
+      || { ig_ok=0; echo "  ls-files $opts in $d differs"; }
+  done
+done
+# The trap: a file under an excluded directory cannot be re-included.
+( cd "$IG" && printf 'nested/\n!nested/note.md\n' >> .gitignore )
+nig=$((nig+1))
+diff <(git -C "$IG" ls-files -o --exclude-standard) \
+     <("$GITTLE" -C "$IG" ls-files -o --exclude-standard) >/dev/null \
+  || { ig_ok=0; echo "  re-include under an excluded directory differs"; }
+[ $ig_ok = 1 ] && { ok; report "ignore and pathspec" "$nig listings match git"; } \
+               || bad "ignore engine"
+
+# check-ignore is phase 10, so the per-path answer is cross-checked through
+# `add`, which refuses an ignored path named outright.
+ci_ok=1; nci=0
+for p in top.log keep.log build/o.o tmp/t1 a/b/y.c a/b/c/z.c out/x doc/d.txt \
+         doc/d.log sub/q.txt 'hash#file' deep/x/y/f.c deep/x/g.c Makefile \
+         nested/note.md; do
+  nci=$((nci+1))
+  git -C "$IG" check-ignore -q "$p" && want=ignored || want=not
+  "$GITTLE" -C "$IG" add -n "$p" >/dev/null 2>&1 && got=not || got=ignored
+  [ "$want" = "$got" ] || { ci_ok=0; echo "  $p: git says $want, gittle says $got"; }
+done
+[ $ci_ok = 1 ] && { ok; report "ignored-path decisions" "$nci paths agree with check-ignore"; } \
+               || bad "ignored-path decisions"
+
+# ------------------------------------------------------------------------ add
+mk_add() {  # mk_add <dir> <tool>
+  rm -rf "$1"; git init -q "$1"
+  ( cd "$1"
+    mkdir -p src doc build
+    for f in src/a.c src/b.c doc/d.txt build/o.o top.txt ignored.txt; do
+      echo original > "$f"
+    done
+    printf 'build/\nignored.txt\n' > .gitignore )
+}
+add_ok=1; nadd=0
+for args in "." "-A" "-n ." "-v ." "src" "src doc" "'*.c'" "':(glob)*.c'" \
+            "-f ignored.txt" "-f ." "--" "-- ." "top.txt src/a.c"; do
+  nadd=$((nadd+1))
+  mk_add "$WORK/a1"; mk_add "$WORK/a2"
+  ao=$(cd "$WORK/a1" && eval git add $args 2>&1); arc=$?
+  bo=$(cd "$WORK/a2" && eval "$GITTLE" add $args 2>&1); brc=$?
+  # The hint lines differ (git advertises `git config` keys gittle has not
+  # got), so the comparison is on the index, the status and the exit code.
+  [ "$arc" = "$brc" ] || { add_ok=0; echo "  add $args: exit $arc vs $brc"; }
+  diff <(git -C "$WORK/a1" ls-files -s) <(git -C "$WORK/a2" ls-files -s) >/dev/null \
+    || { add_ok=0; echo "  add $args: index differs"; }
+done
+# -u stages modifications and removals of tracked paths and nothing else.
+for pre in "modify" "delete" "both"; do
+  for args in "-u" "-u src" "-A" "." "src"; do
+    nadd=$((nadd+1))
+    mk_add "$WORK/a1"; mk_add "$WORK/a2"
+    for d in "$WORK/a1" "$WORK/a2"; do
+      ( cd "$d" && git add . >/dev/null 2>&1
+        case "$pre" in
+          modify) echo changed > src/a.c;;
+          delete) rm src/b.c;;
+          both)   echo changed > src/a.c; rm src/b.c; echo new > src/c.c;;
+        esac )
+    done
+    ( cd "$WORK/a1" && eval git add $args >/dev/null 2>&1 )
+    ( cd "$WORK/a2" && eval "$GITTLE" add $args >/dev/null 2>&1 )
+    diff <(git -C "$WORK/a1" ls-files -s) <(git -C "$WORK/a2" ls-files -s) >/dev/null \
+      || { add_ok=0; echo "  add $args after $pre: index differs"; }
+  done
+done
+# --dry-run prints what would happen and changes nothing.
+mk_add "$WORK/a1"; mk_add "$WORK/a2"
+diff <(cd "$WORK/a1" && git add -n .) <(cd "$WORK/a2" && "$GITTLE" add -n .) >/dev/null \
+  && ok || { add_ok=0; bad "add -n output differs"; }
+[ -f "$WORK/a2/.git/index" ] && { add_ok=0; bad "add -n wrote the index"; } || ok
+# From a subdirectory, and with a path that climbs out of one.
+mk_add "$WORK/a1"; mk_add "$WORK/a2"
+diff <(cd "$WORK/a1/src" && git add -n . ../doc) \
+     <(cd "$WORK/a2/src" && "$GITTLE" add -n . ../doc) >/dev/null \
+  && ok || { add_ok=0; bad "add from a subdirectory differs"; }
+[ $add_ok = 1 ] && { ok; report "add" "$nadd option and pathspec combinations"; } \
+                || bad "add"
+
+# ------------------------------------------------------------------- commit
+# One scripted history, built twice, compared as objects.  Every step that
+# differs shows up as a different commit ID and every later step inherits it,
+# so this is the strongest single check in the suite.
+build_history() {  # build_history <dir> <tool>
+  rm -rf "$1"; git init -q "$1"
+  cd "$1"
+  echo a > f; echo b > g; mkdir -p d; echo c > d/h; printf 'build/\n' > .gitignore
+  mkdir -p build; echo junk > build/o.o
+  $2 add .                       >/dev/null
+  $2 commit -q -m "first commit" >/dev/null
+  echo a2 >> f
+  $2 add f                                    >/dev/null
+  $2 commit -q -m subject -m "and a body"     >/dev/null
+  echo b2 >> g
+  $2 commit -qam "staged with -a"             >/dev/null
+  rm g
+  $2 commit -qam "a removal"                  >/dev/null
+  echo x > only.txt; $2 add only.txt >/dev/null; echo y >> f
+  $2 commit -q -m "a partial commit" f        >/dev/null
+  $2 commit -q --amend -m "amended"           >/dev/null
+  $2 commit -q --allow-empty -m "empty"       >/dev/null
+  $2 commit -q --allow-empty -s -m "signed"   >/dev/null
+  $2 commit -q --allow-empty -m "other" --author="Other Person <o@p.example>" >/dev/null
+  $2 commit -q --allow-empty -m "dated" --date="1600000000 +0200"            >/dev/null
+  cd - >/dev/null
+}
+build_history "$WORK/h1" "$GIT"
+build_history "$WORK/h2" "$GITTLE"
+diff <(git -C "$WORK/h1" log --pretty=raw) <(git -C "$WORK/h2" log --pretty=raw) \
+  >/dev/null && ok || { bad "commit histories differ"; \
+  diff <(git -C "$WORK/h1" log --pretty=raw) <(git -C "$WORK/h2" log --pretty=raw) | head -12; }
+diff <(git -C "$WORK/h1" ls-files -s) <(git -C "$WORK/h2" ls-files -s) >/dev/null \
+  && ok || bad "commit left a different index"
+diff <(git -C "$WORK/h1" status --porcelain) <(git -C "$WORK/h2" status --porcelain) \
+  >/dev/null && ok || bad "git status disagrees after gittle committed"
+diff <(cat "$WORK/h1/.git/logs/HEAD") <(cat "$WORK/h2/.git/logs/HEAD") >/dev/null \
+  && ok || { bad "reflogs differ"; diff <(cat "$WORK/h1/.git/logs/HEAD") <(cat "$WORK/h2/.git/logs/HEAD") | head -6; }
+diff <(cat "$WORK/h1/.git/logs/refs/heads/"*) <(cat "$WORK/h2/.git/logs/refs/heads/"*) \
+  >/dev/null && ok || bad "branch reflogs differ"
+git -C "$WORK/h2" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after gittle commit"
+# git can carry on in gittle's repository and vice versa.
+( cd "$WORK/h2" && echo z >> f && git commit -qam "git continues" )
+( cd "$WORK/h2" && echo w >> f && "$GITTLE" commit -qam "gittle continues" )
+git -C "$WORK/h2" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after interleaving"
+check "interleaved history length" "11" "$(git -C "$WORK/h2" rev-list --count HEAD)"
+report "commit" "9 commits either way, identical objects, reflogs and index"
+
+# Refusals, with the exit status git uses.
+NT="$WORK/nothing"
+rm -rf "$NT"; git init -q "$NT"
+( cd "$NT" && echo a > f && "$GITTLE" add f && "$GITTLE" commit -qm one )
+( cd "$NT" && "$GITTLE" commit -m two >/dev/null 2>&1 ) && bad "commit with nothing staged should fail" || ok
+( cd "$NT" && "$GITTLE" commit -am two -a f >/dev/null 2>&1 ) && bad "-a with paths should fail" || ok
+BR="$WORK/bare"; rm -rf "$BR"; git init -q --bare "$BR"
+( cd "$BR" && "$GITTLE" commit -m x >/dev/null 2>&1 ) && bad "commit in a bare repo should fail" || ok
+report "commit refusals" "nothing staged, -a with paths, bare"
+
+# ------------------------------------------------------------------- hooks
+HK="$WORK/hooks"
+rm -rf "$HK"; git init -q "$HK"; mkdir -p "$HK/.git/hooks"
+( cd "$HK" && echo a > f && "$GITTLE" add f )
+printf '#!/bin/sh\nexit 1\n' > "$HK/.git/hooks/pre-commit"; chmod +x "$HK/.git/hooks/pre-commit"
+( cd "$HK" && "$GITTLE" commit -qm x >/dev/null 2>&1 ) && bad "pre-commit did not stop the commit" || ok
+( cd "$HK" && "$GITTLE" commit -q --no-verify -m x >/dev/null 2>&1 ) && ok || bad "--no-verify did not bypass pre-commit"
+rm "$HK/.git/hooks/pre-commit"
+printf '#!/bin/sh\nsed -i "s/^/hooked /" "$1"\n' > "$HK/.git/hooks/commit-msg"
+chmod +x "$HK/.git/hooks/commit-msg"
+( cd "$HK" && echo b >> f && "$GITTLE" commit -qam rewritten )
+check "commit-msg rewrote the message" "hooked rewritten" \
+  "$(git -C "$HK" log -1 --format=%s)"
+# The editor is a shell command line, and its result goes through the same
+# cleanup -- so the comment line the template adds does not reach the commit.
+rm "$HK/.git/hooks/commit-msg"
+( cd "$HK" && echo c >> f && GIT_EDITOR='sh -c "printf \"from the editor\n# a comment\n\" > $1" --' "$GITTLE" commit -qa )
+check "editor message, comments stripped" "from the editor" \
+  "$(git -C "$HK" log -1 --format=%B | head -1)"
+check "editor comment line dropped" "1" "$(git -C "$HK" log -1 --format=%B | grep -c .)"
+# A pre-commit hook exists to inspect what is about to be committed, so under
+# `-a` it must see the staged state and not the index still on disk.  Both
+# tools point it at a temporary index through GIT_INDEX_FILE.
+HK2="$WORK/hooks2"
+for d in "$HK2/a" "$HK2/b"; do
+  rm -rf "$d"; git init -q "$d"; mkdir -p "$d/.git/hooks"
+  printf '#!/bin/sh\n%s diff --cached --name-only\n' "$GIT" > "$d/.git/hooks/pre-commit"
+  chmod +x "$d/.git/hooks/pre-commit"
+  ( cd "$d" && echo a > f && echo b > g && git add . \
+    && git commit -qm base --no-verify && echo a2 >> f )
+done
+diff <(cd "$HK2/a" && git commit -qam second 2>&1) \
+     <(cd "$HK2/b" && "$GITTLE" commit -qam second 2>&1) >/dev/null \
+  && ok || bad "pre-commit sees a different index under -a"
+[ -z "$(ls "$HK2/b/.git" | grep next-index)" ] && ok \
+  || bad "commit left a temporary index behind"
+report "hooks and editor" "pre-commit, --no-verify, commit-msg, \$GIT_EDITOR, GIT_INDEX_FILE"
+
+# --------------------------------------------------------------------- log
+# The formatting vocabulary, enumerated against the reference repository.
+LOGN=400
+[ $FULL = 1 ] && LOGN=20000
+log_ok=1; nlog=0
+for f in "" "--oneline" "--pretty=oneline" "--pretty=raw" "--pretty=full" \
+         "--pretty=fuller" "--date=iso8601" "--date=iso8601-strict" \
+         "--date=rfc2822" "--date=short" "--date=raw" "--date=unix" \
+         "--date=human" "--date=relative" "--date=local" "--date=iso-local" \
+         "--relative-date" "--parents" "--abbrev-commit" "--abbrev=12" \
+         "--abbrev=12 --abbrev-commit" "--reverse" "--skip=7" \
+         "--first-parent" "--no-walk" "--format=%B" "--format=%b" \
+         "--format=%s" "--format=%f" "--format=%H" \
+         "--pretty=format:%h|%p|%T|%t|%ci|%cr|%f|%an|%ae|%ad" \
+         "--pretty=format:%ai|%aI|%as|%at|%ar|%cd|%cD|%ct" \
+         "--pretty=tformat:%h%x09%s"; do
+  nlog=$((nlog+1))
+  a=$(git -C "$REFREPO" log -$LOGN $NOMAILMAP $f 2>&1 | md5sum)
+  b=$("$GITTLE" -C "$REFREPO" log -$LOGN $f 2>&1 | md5sum)
+  [ "$a" = "$b" ] || { log_ok=0; echo "  log $f differs"; }
+done
+# Formats containing a space have to be passed as one argument, so they are
+# checked outside the loop rather than fought with through word splitting.
+for f in "--date=format:%Y/%m/%d %H:%M:%S %a %b" "--format=%h %t %p" \
+         "--format=%ai %aI %as %at %ar" "--format=%an <%ae> %ad%n%s"; do
+  nlog=$((nlog+1))
+  a=$(git -C "$REFREPO" log -$LOGN $NOMAILMAP "$f" | md5sum)
+  b=$("$GITTLE" -C "$REFREPO" log -$LOGN "$f" | md5sum)
+  [ "$a" = "$b" ] || { log_ok=0; echo "  log '$f' differs"; }
+done
+[ $log_ok = 1 ] && { ok; report "log formats" "$nlog vocabularies over $LOGN commits"; } \
+                || bad "log formats"
+
+# Path limiting is history simplification, not a filter: a commit whose tree is
+# unchanged under the pathspec is skipped and only that parent is followed.
+path_ok=1; npath=0
+for p in Makefile diff.c Documentation t/t0000-basic.sh compat builtin/log.c \
+         contrib po "*.h" "Documentation/git-log.adoc"; do
+  npath=$((npath+1))
+  a=$(git -C "$REFREPO" log --oneline -60 $NOMAILMAP -- "$p")
+  b=$("$GITTLE" -C "$REFREPO" log --oneline -60 -- "$p")
+  [ "$a" = "$b" ] || { path_ok=0; echo "  log -- $p differs"; }
+done
+# Without `--`, and from a subdirectory.
+npath=$((npath+1))
+[ "$(git -C "$REFREPO" log --oneline -30 $NOMAILMAP Makefile)" \
+= "$("$GITTLE" -C "$REFREPO" log --oneline -30 Makefile)" ] \
+  || { path_ok=0; echo "  bare path argument differs"; }
+npath=$((npath+1))
+[ "$(cd "$REFREPO/Documentation" && git log --oneline -30 $NOMAILMAP -- git-log.adoc)" \
+= "$(cd "$REFREPO/Documentation" && "$GITTLE" log --oneline -30 -- git-log.adoc)" ] \
+  || { path_ok=0; echo "  path limiting from a subdirectory differs"; }
+[ $path_ok = 1 ] && { ok; report "log path limiting" "$npath pathspecs, simplification included"; } \
+                 || bad "log path limiting"
+
+# Options that belong to a later phase must refuse by name rather than be
+# ignored -- a `log` that silently dropped `--grep` would answer a different
+# question and look like it had answered.
+def_ok=1
+for o in -p --stat --grep=x --author=x --all --topo-order --since=2020-01-01 --graph; do
+  "$GITTLE" -C "$REFREPO" log -1 "$o" >/dev/null 2>&1 && { def_ok=0; echo "  $o was accepted"; }
+done
+[ $def_ok = 1 ] && { ok; report "log deferrals" "7 later-phase options refuse by name"; } \
+               || bad "log deferrals"
+
+# --------------------------------------------------------------------- show
+show_ok=1; nshow=0
+for f in "" "--oneline" "--pretty=raw" "--pretty=fuller" "--format=%H%n%s"; do
+  nshow=$((nshow+1))
+  a=$(git -C "$REFREPO" show -s $NOMAILMAP $f HEAD 2>&1)
+  b=$("$GITTLE" -C "$REFREPO" show $f HEAD 2>&1)
+  [ "$a" = "$b" ] || { show_ok=0; echo "  show $f differs"; }
+done
+# Every tag in the reference repository: annotated, signed, nested, and one
+# that points at a blob.
+ntag=0; TAGS=$(git -C "$REFREPO" tag)
+[ $FULL = 1 ] || TAGS=$(printf '%s\n' "$TAGS" | head -40)
+for t in $TAGS; do
+  ntag=$((ntag+1))
+  a=$(git -C "$REFREPO" show -s $NOMAILMAP "$t" 2>&1)
+  b=$("$GITTLE" -C "$REFREPO" show "$t" 2>&1)
+  [ "$a" = "$b" ] || { show_ok=0; echo "  show $t differs"; }
+done
+# A tree lists names with a trailing slash on directories; a blob is raw bytes.
+TREE=$(git -C "$REFREPO" rev-parse "HEAD^{tree}")
+BLOB=$(git -C "$REFREPO" rev-parse "HEAD:README.md")
+nshow=$((nshow+2))
+diff <(git -C "$REFREPO" show "$TREE") <("$GITTLE" -C "$REFREPO" show "$TREE") >/dev/null \
+  || { show_ok=0; echo "  show <tree> differs"; }
+diff <(git -C "$REFREPO" show "$BLOB") <("$GITTLE" -C "$REFREPO" show "$BLOB") >/dev/null \
+  || { show_ok=0; echo "  show <blob> differs"; }
+[ $show_ok = 1 ] && { ok; report "show" "$nshow objects and $ntag tags"; } || bad "show"
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

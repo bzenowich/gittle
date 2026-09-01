@@ -35,7 +35,8 @@ first, by anyone, in every phase:
 | Reference source | `../` — the git checkout this repository sits inside. Cite files and functions from it in comments; that is what makes a decision checkable later. |
 | libgit2, for reference | `../libgit2` |
 | Build | `nim c -d:release --out:build/gittle src/gittle.nim`; add `-d:static` for the single static binary. `nimble` cannot write `~/.nimble` here, so use `nim c` directly. |
-| Test | `tests/oracle.sh`, or `--full` to sweep every object in the reference repository (~70s). |
+| Test | `tests/oracle.sh`, or `--full` to sweep every object in the reference repository and every commit and tag in it (~4 min). Needs bash, not just a POSIX shell. |
+| Comparing `log` | git applies `.mailmap` to `log` and `show` by **default** (`log.mailmap`, true since 2.34) and gittle does not — 18,512 of the reference repository's 82,130 commits display a different identity. Pass `--no-use-mailmap` to git or you are diffing that and nothing else. |
 
 ## Documentation
 

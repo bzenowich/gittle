@@ -31,3 +31,25 @@ proc repo*(c: Ctx): Repository =
 
 proc usage*(msg: string) {.noreturn.} =
   fail(msg)
+
+proc expandShortOptions*(args: openArray[string], withValue: set[char]): seq[string] =
+  ## Split bundled short options so the command's own parser never has to.
+  ##
+  ## `-am msg` becomes `-a -m msg`, `-nv` becomes `-n -v`, and `-mfoo` becomes
+  ## `-m foo` -- a flag in `withValue` takes the rest of its cluster as the
+  ## value, which is the rule that makes those three spellings one thing.
+  ##
+  ## Nothing after `--` is touched, and neither is a bare `-`, which is a file
+  ## name meaning standard input.  Commands with a `-<number>` option (`log`)
+  ## do not use this, because `-5` is not a bundle of five flags.
+  var done = false
+  for a in args:
+    if done or a.len < 2 or a[0] != '-' or a[1] == '-':
+      result.add a
+      if a == "--": done = true
+      continue
+    for k in 1 ..< a.len:
+      result.add "-" & a[k]
+      if a[k] in withValue:
+        if k + 1 < a.len: result.add a[k + 1 .. ^1]
+        break
