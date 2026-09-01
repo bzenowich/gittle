@@ -106,6 +106,41 @@ Interactive add (`-p`/`-i`), rename detection (`-M`/`-C`), line-history (`-L`),
 approxidate (`--since="2 weeks ago"`), textconv, gitattributes filters. Each is
 a self-contained engine behind a single flag.
 
+**R7 — Write the wire, not the API.**
+Implement the bytes as they appear, not the shape of the interfaces the
+reference implementation happens to expose. git's structure is the structure of
+a program that must stay maintainable by hundreds of people across two decades;
+copying it is how a reimplementation acquires a thousand lines it never needed.
+
+Two corollaries carry most of the weight:
+
+* **A family of cases that differs only in constants is a table.** Eight
+  commands that each take "a ref name, then perhaps a new value, then perhaps an
+  old value" are one loop and an eight-row table, not eight nested conditionals.
+  The reader can then *see* the grammar instead of reconstructing it.
+* **Do not build what you immediately consume.** Parse into what the caller
+  needs, not into an object model that exists to be walked once.
+
+[`msgpack-coap-example.c`](msgpack-coap-example.c) is the worked example: twenty
+thousand lines of MessagePack and CoAP library reduced to about a hundred, by a
+mask/type/length table and a single recursive function over the bytes.
+
+R7 is not a licence to guess. It presupposes R8.
+
+**R8 — The oracle decides, not the documentation.**
+Every claim about behavior is settled by running the same input through git and
+through gittle and comparing what came out — exit status, stdout, and the state
+left on disk. Documentation describes intent; the wire is what other tools
+actually depend on, and the two differ more often than is comfortable.
+
+Concretely: when a command has a shape that can be enumerated — a command
+stream, an option matrix, a format vocabulary — write the harness that
+enumerates it rather than a handful of assertions. Assertions written from a
+reading of the manual agree with that reading, including where it was wrong.
+The evidence for this rule is in [`phase-2.md`](phase-2.md): six compatibility
+bugs in one command, none visible in its documented grammar, five hand-written
+tests that had all confidently passed.
+
 ---
 
 ### 3.1 What R2 costs, measured
@@ -479,6 +514,19 @@ with the transport protocol.
 
 Each phase should end somewhere useful, with real git available as the oracle:
 create state with one tool, verify with the other, in both directions.
+
+**Every phase ends the same way**, and none is finished until all four are done:
+
+1. **The differential sweep passes** — `tests/oracle.sh --full`, with the new
+   commands enumerated rather than spot-checked (R8).
+2. **A minimization pass** — reread the phase's code against R7. Tables for
+   families of cases; delete every exported symbol with no caller; look for the
+   same loop written twice. Budget the time: it has paid for itself so far
+   mostly by *finding bugs*, and the line count is the smaller prize.
+3. **The budget is recorded** in the phase document, against the lines in §5,
+   with over-runs explained rather than smoothed over.
+4. **What was left undone is written down** in the phase document, with the
+   phase it belongs to.
 
 1. **Object store.** `hash-object`, `cat-file`. Read loose and packed objects,
    apply deltas, write loose. *Oracle: hashes match git's byte for byte.*

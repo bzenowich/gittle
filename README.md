@@ -22,8 +22,10 @@ after everything gittle writes. Phase 3 — the index and trees — is next.
 
 2,753 lines of the ~9,000 budgeted.
 
-- [`docs/plan.md`](docs/plan.md) — goals, design rules, scope, budget, the ten
-  decisions, build order. **Read this first.**
+- [`docs/plan.md`](docs/plan.md) — goals, the eight design rules, scope,
+  budget, the ten decisions, build order. **Read this first.**
+- [`CLAUDE.md`](CLAUDE.md) — the short version: the rules that bind, the
+  environment, and what finishing a phase requires.
 - [`docs/phase-1.md`](docs/phase-1.md), [`docs/phase-2.md`](docs/phase-2.md) —
   the finished phases: what was built, what it was verified against, what was
   left for later, and where the budget stands.
