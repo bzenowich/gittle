@@ -58,13 +58,11 @@ proc cmdStatus*(c: Ctx, args: seq[string]): int =
   # Paths are printed relative to the directory the command was run in, unless
   # `status.relativePaths` says otherwise -- or unless the format is porcelain
   # v1, whose whole promise is that its output does not depend on where you
-  # stood.
-  let relative = repo.cfg.getBool("status.relativePaths", true)
-  let prefix = if relative: repo.prefix else: ""
-  if fmt == sfLong:
-    stdout.write longStatus(st, untracked, prefix)
-  else:
-    stdout.write shortLines(st, fmt, branch, nulTerm,
-                            relative and fmt != sfPorcelainV1, repo.prefix)
+  # stood.  Which is the whole of the difference between v1 and `-s`, so it is
+  # said here and the renderer never asks again.
+  let relative = repo.cfg.getBool("status.relativePaths", true) and
+                 fmt != sfPorcelainV1
+  stdout.write renderStatus(st, fmt, untracked,
+                            (if relative: repo.prefix else: ""), branch, nulTerm)
   stdout.flushFile()
   0

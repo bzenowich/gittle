@@ -96,18 +96,18 @@ const unmergedTable = [
   ## `wt_status_unmerged_status_string`).  Stage 1 is the base, 2 ours, 3
   ## theirs, so mask 3 is "we have it, they deleted it".
 
-func unmergedLetters(mask: int): (char, char) =
-  ## The two columns of the short format for an unmerged path, from its
-  ## stage mask.
-  for (m, letters, _) in unmergedTable:
-    if m == mask: return (letters[0], letters[1])
-  ('U', 'U')
+const headsPrefix = refsPrefix & "heads/"
+  ## Where a branch name lives.  `status` strips it twice: once from HEAD, and
+  ## once from the branch a rebase is moving.
 
-func unmergedLabel(mask: int): string =
-  ## The long format's label for an unmerged path, from its stage mask.
-  for (m, _, label) in unmergedTable:
-    if m == mask: return label
-  "unmerged:"
+func unmergedRow(mask: int): (string, string) =
+  ## The short format's two letters and the long format's label for an
+  ## unmerged path, looked up together because they are one row of one table.
+  ## A mask of 0 cannot reach here -- a path with no stages is not conflicted
+  ## -- but the lookup is kept total rather than partial.
+  for (m, letters, label) in unmergedTable:
+    if m == mask: return (letters, label)
+  ("UU", "unmerged:")
 
 proc hasTrackedUnder(idx: Index, dir: string): bool =
   ## Does the index hold anything inside this directory?
@@ -168,9 +168,8 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
   ## The whole model, in the order the two letters are defined.
   let h = repo.refs.resolveRef(headRef)
   result.branch = repo.headRefName
-  const heads = refsPrefix & "heads/"
-  if result.branch.startsWith(heads):
-    result.branch = result.branch[heads.len .. ^1]
+  if result.branch.startsWith(headsPrefix):
+    result.branch = result.branch[headsPrefix.len .. ^1]
   else:
     result.detached = true
     result.headDesc = headDescription(repo)
@@ -201,7 +200,8 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
     u.stageOids[e.stage - 1] = e.oid
   if u.stagemask != 0: byPath.add u
   for i in 0 ..< byPath.len:
-    (byPath[i].x, byPath[i].y) = unmergedLetters(byPath[i].stagemask)
+    let letters = unmergedRow(byPath[i].stagemask)[0]
+    (byPath[i].x, byPath[i].y) = (letters[0], letters[1])
 
   # An entry is indexed by path so the two diffs can meet in it: a path may
   # appear in both, and `MM` is exactly that case.
@@ -249,9 +249,8 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
                           else: "REVERT_HEAD")
     result.opHead = repo.uniqueAbbrev(o, repo.autoAbbrev)
   of opRebase:
-    const heads = refsPrefix & "heads/"
     let name = repo.readState(rebaseDir / "head-name").strip()
-    if name.startsWith(heads): result.opBranch = name[heads.len .. ^1]
+    if name.startsWith(headsPrefix): result.opBranch = name[headsPrefix.len .. ^1]
     let onto = repo.readState(rebaseDir / "onto").strip()
     if onto.len == OidHexLen:
       result.opOnto = repo.uniqueAbbrev(parseOid(onto), repo.autoAbbrev)
@@ -280,99 +279,35 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
                        else: collapseUntracked(idx, found)
 
 # ---------------------------------------------------------------------------
-# The short and porcelain formats
+# Rendering: one walk, four formats
 # ---------------------------------------------------------------------------
-
-proc shortLines*(st: Status, fmt: StatusFormat, branch: bool, nulTerm: bool,
-                 relative: bool, prefix: string): string =
-  ## `-s`, `--porcelain` and `--porcelain=v2`, which differ in three things:
-  ## how the branch header is spelled, whether the per-path record carries
-  ## modes and object IDs, and whether an untracked path is `??` or `?`.
-  ##
-  ## And in a fourth thing that is easy to miss: **porcelain v1 is the only
-  ## format with root-relative paths.**  `wt-status.c:wt_porcelain_print`
-  ## clears `relative_paths` for v1 and the v2 printer does not, so
-  ## `--porcelain=v2` from a subdirectory says `../top.txt` where
-  ## `--porcelain` says `top.txt`.  Surprising, and it is the wire.
-  let sep = if nulTerm: "\0" else: "\n"
-
-  proc name(p: string): string =
-    ## A path as the short formats print it: relative or not, quoted or not.
-    # `-z` is the one mode with no quoting: the terminator already makes every
-    # byte unambiguous, which is why it exists.
-    let rel = if relative: relativeTo(p, prefix) else: p
-    if nulTerm: rel else: quotePath(rel)
-
-  if branch:
-    if fmt == sfPorcelainV2:
-      result.add "# branch.oid " &
-                 (if st.initial: "(initial)" else: $st.headOid) & sep
-      result.add "# branch.head " &
-                 (if st.detached: "(detached)" else: st.branch) & sep
-      # Both lines are omitted entirely when there is no upstream: an absent
-      # relationship is silence, not a zero.
-      if st.tracking.upstream.len > 0:
-        result.add "# branch.upstream " & st.tracking.upstream & sep
-        if not st.tracking.gone:
-          result.add "# branch.ab +" & $st.tracking.ahead & " -" &
-                     $st.tracking.behind & sep
-    else:
-      if st.detached: result.add "## HEAD (no branch)" & sep
-      elif st.initial: result.add "## No commits yet on " & st.branch & sep
-      else:
-        # `## main...origin/main [ahead 1, behind 2]`.  The counts are omitted
-        # when the two are level, so the common case is just the two names.
-        result.add "## " & st.branch
-        if st.tracking.upstream.len > 0:
-          result.add "..." & st.tracking.upstream
-          if st.tracking.ahead > 0 or st.tracking.behind > 0:
-            result.add " ["
-            if st.tracking.ahead > 0: result.add "ahead " & $st.tracking.ahead
-            if st.tracking.ahead > 0 and st.tracking.behind > 0: result.add ", "
-            if st.tracking.behind > 0: result.add "behind " & $st.tracking.behind
-            result.add "]"
-          elif st.tracking.gone: result.add " [gone]"
-        result.add sep
-
-  # Porcelain v2 prints every changed entry and *then* every unmerged one --
-  # two passes rather than one path-sorted list, which is the only place where
-  # a format's order is not path order
-  # (`wt-status.c:wt_porcelain_v2_print`).  Every other format interleaves.
-  let passes = if fmt == sfPorcelainV2: 1 else: 0
-  for pass in 0 .. passes:
-    for e in st.entries:
-      if passes == 1 and (e.stagemask != 0) != (pass == 1): continue
-      if fmt != sfPorcelainV2:
-        result.add e.x & e.y & " " & name(e.path) & sep
-      elif e.stagemask != 0:
-        # The `u` record carries *four* modes -- the three stages and the
-        # working tree -- and three object IDs, where the `1` record carries
-        # three modes and two IDs.  A parser tells them apart by the leading
-        # letter, not by counting.
-        result.add "u " & e.x & e.y & " N... "
-        for m in e.stageModes: result.add formatMode(m) & " "
-        result.add formatMode(e.workMode) & " "
-        for o in e.stageOids: result.add $o & " "
-        result.add name(e.path) & sep
-      else:
-        # Porcelain v2 spells "unchanged" as `.` where the short format spells
-        # it as a space, so that every field is non-blank and the record
-        # splits on whitespace.
-        let x = if e.x == ' ': '.' else: e.x
-        let y = if e.y == ' ': '.' else: e.y
-        result.add "1 " & x & y & " N... " &
-                   formatMode(e.headMode) & " " & formatMode(e.indexMode) &
-                   " " & formatMode(e.workMode) & " " &
-                   $e.headOid & " " & $e.indexOid & " " & name(e.path) & sep
-
-  for p in st.untracked:
-    result.add (if fmt == sfPorcelainV2: "? " else: "?? ") & name(p) & sep
-
-# ---------------------------------------------------------------------------
-# The long format
-# ---------------------------------------------------------------------------
+#
+# All four formats are the same three things in the same order: a header
+# saying where HEAD is, a series of *sections* -- an optional heading and one
+# row per path -- and, for the long format, a closing sentence.  So there is
+# one renderer, and what the formats disagree about is which of four buckets
+# a path lands in and how its row is spelled:
+#
+# | bucket | long | porcelain v2 | short, porcelain v1 |
+# |---|---|---|---|
+# | 0 | staged, `modified:  f` | every merged path, `1 …` | *every* path, `XY f` |
+# | 1 | unmerged, `both modified:  f` | every unmerged path, `u …` | -- |
+# | 2 | unstaged, `modified:  f` | -- | -- |
+# | 3 | untracked, `f` | untracked, `? f` | untracked, `?? f` |
+#
+# Bucket 1 is why porcelain v2 needs one at all: it prints every changed path
+# and *then* every unmerged one, which is the only place where a format's
+# order is not path order (`wt-status.c:wt_porcelain_v2_print`).  The short
+# format has a single bucket because it puts both letters of a path on one
+# line and so has nothing to split; the long format has three because it lists
+# an `MM` path twice, once as staged and once as not.
 
 const
+  sectionHeadings = ["Changes to be committed", "Unmerged paths",
+                     "Changes not staged for commit", "Untracked files"]
+    ## The long format's heading per bucket
+    ## (`wt-status.c:wt_longstatus_print`).  The machine formats print no
+    ## headings at all, so they never read this.
   changeLabels = [
     ('A', "new file:"), ('M', "modified:"), ('D', "deleted:"),
     ('T', "typechange:"), ('U', "unmerged:")]
@@ -380,14 +315,40 @@ const
     ## below, which is why the table holds the bare word.
   labelWidth = 12
 
-proc labelFor(c: char): string =
+func labelFor(c: char): string =
   ## The long format's label for a change letter, padded to the column.
   for (k, text) in changeLabels:
     if k == c: return text.alignLeft(labelWidth)
   "unknown:".alignLeft(labelWidth)
 
+func dotted(c: char): char =
+  ## Porcelain v2 spells "unchanged" as `.` where the short format spells it
+  ## as a space, so that every field of a record is non-blank and the record
+  ## splits on whitespace.
+  if c == ' ': '.' else: c
+
+proc v2Row(e: Entry, path: string): string =
+  ## One porcelain-v2 record: space-separated fields with the path last.
+  ##
+  ## The two record shapes differ only in how many fields of each kind they
+  ## carry, which is the whole reason they are one proc.  A `u` record has
+  ## *four* modes -- the three stages and the working tree -- and three object
+  ## IDs; a `1` record has three modes (HEAD, index, working tree) and two
+  ## IDs.  A parser tells them apart by the leading letter, not by counting
+  ## (`wt-status.c:wt_porcelain_v2_print_*`).  `N...` is the rename score,
+  ## which is always that: gittle detects no renames.
+  let u = e.stagemask != 0
+  let modes = if u: @(e.stageModes) & @[e.workMode]
+              else: @[e.headMode, e.indexMode, e.workMode]
+  let oids = if u: @(e.stageOids) else: @[e.headOid, e.indexOid]
+  var f = @[(if u: "u" else: "1"), dotted(e.x) & dotted(e.y), "N..."]
+  for m in modes: f.add formatMode(m)
+  for o in oids: f.add $o
+  f.add path
+  f.join(" ")
+
 proc trackingLine*(t: Tracking): string =
-  ## `Your branch is up to date with 'origin/main'.` and its three siblings.
+  ## `Your branch is up to date with 'origin/main'.` and its four siblings.
   ## Printed by `checkout` and `status` alike, which is why it lives here
   ## rather than in either (`wt-status.c:wt_status_print_tracking`).  The
   ## `(use "git pull" …)` lines under each are `advice.statusHints`, cut.
@@ -395,25 +356,23 @@ proc trackingLine*(t: Tracking): string =
   let name = t.upstream
   if t.gone:
     return "Your branch is based on '" & name & "', but the upstream is gone.\n"
-  let ahead = t.ahead
-  let behind = t.behind
 
   # `1 commit`, `2 commits`.
   proc commits(n: int): string = $n & (if n == 1: " commit" else: " commits")
-  if ahead == 0 and behind == 0:
+  if t.ahead == 0 and t.behind == 0:
     "Your branch is up to date with '" & name & "'.\n"
-  elif behind == 0:
-    "Your branch is ahead of '" & name & "' by " & commits(ahead) & ".\n"
-  elif ahead == 0:
-    "Your branch is behind '" & name & "' by " & commits(behind) &
+  elif t.behind == 0:
+    "Your branch is ahead of '" & name & "' by " & commits(t.ahead) & ".\n"
+  elif t.ahead == 0:
+    "Your branch is behind '" & name & "' by " & commits(t.behind) &
     ", and can be fast-forwarded.\n"
   else:
     # The plural is decided by the *sum* of the two counts, not by either of
     # them (`remote.c`, the `Q_()` around this string) -- so one commit each
     # way still says "commits".
     "Your branch and '" & name & "' have diverged,\nand have " &
-    $ahead & " and " & $behind & " different commit" &
-    (if ahead + behind == 1: "" else: "s") & " each, respectively.\n"
+    $t.ahead & " and " & $t.behind & " different commit" &
+    (if t.ahead + t.behind == 1: "" else: "s") & " each, respectively.\n"
 
 proc inProgressBlock(st: Status, unmerged: bool): string =
   ## "You have unmerged paths." and its four siblings: which operation is in
@@ -427,78 +386,135 @@ proc inProgressBlock(st: Status, unmerged: bool): string =
     let noun = if st.op == opCherryPick: "cherry-picking" else: "reverting"
     result = "You are currently " & noun & " commit " & st.opHead & ".\n"
   of opRebase:
-    func plural(n: int, one, many: string): string =
-      ## `1 command` / `2 commands`.
-      $n & " " & (if n == 1: one else: many)
-    if st.opDone.len == 0: result.add "No commands done.\n"
-    else:
-      result.add "Last command" & (if st.opDone.len == 1: "" else: "s") &
-                 " done (" & plural(st.opDone.len, "command", "commands") &
-                 " done):\n"
-      for k in max(st.opDone.len - 2, 0) ..< st.opDone.len:
-        result.add "   " & st.opDone[k] & "\n"
-    if st.opTodo.len == 0: result.add "No commands remaining.\n"
-    else:
-      result.add "Next command" & (if st.opTodo.len == 1: "" else: "s") &
-                 " to do (" & plural(st.opTodo.len, "remaining command",
-                                     "remaining commands") & "):\n"
-      for k in 0 ..< min(2, st.opTodo.len):
-        result.add "   " & st.opTodo[k] & "\n"
+    # A rebase's two halves are one sentence with different words in it, and
+    # both pluralise on the same count (`wt-status.c:show_rebase_information`)
+    # -- so `$` marks where the `s` goes and the pair is a table.  Two lines
+    # of each are shown: the *last* two done, the *next* two to do.
+    for (lines, isDone, label, noun) in [
+        (st.opDone, true, "Last command$ done", "command$ done"),
+        (st.opTodo, false, "Next command$ to do", "remaining command$")]:
+      let n = lines.len
+      let s = if n == 1: "" else: "s"
+      if n == 0:
+        result.add "No commands " & (if isDone: "done" else: "remaining") & ".\n"
+      else:
+        result.add label.replace("$", s) & " (" & $n & " " &
+                   noun.replace("$", s) & "):\n"
+        let start = if isDone: n - min(2, n) else: 0
+        for k in 0 ..< min(2, n): result.add "   " & lines[start + k] & "\n"
     result.add (if st.opBranch.len > 0:
-                "You are currently rebasing branch '" & st.opBranch & "' on '" &
-                st.opOnto & "'.\n"
-              else: "You are currently rebasing.\n")
+                  "You are currently rebasing branch '" & st.opBranch &
+                  "' on '" & st.opOnto & "'.\n"
+                else: "You are currently rebasing.\n")
   result.add "\n"
 
-proc longStatus*(st: Status, untracked: UntrackedMode, prefix: string): string =
-  ## The default format.  It is git's own with `advice.statusHints=false`:
-  ## the 26 parenthesised `(use "git …")` hints and the two decision trees
-  ## that chose between them went in the minimization pass (docs/minimize.md
-  ## §3, tier 3) -- the headings say what state a path is in, which is the
-  ## information, and the oracle compares against git with hints off.
-  var staged, unstaged, unmerged: seq[Entry]
-  for e in st.entries:
-    if e.stagemask != 0: unmerged.add e
+proc header(st: Status, fmt: StatusFormat, branch: bool, sep: string): string =
+  ## Where HEAD is, in each format's own words: up to four `# branch.*` lines
+  ## for porcelain v2, one `##` line for the short formats, a paragraph for
+  ## the long one.  All three say the same four things -- the branch, whether
+  ## it is detached or unborn, the upstream, and how far apart the two are --
+  ## in prose that shares no bytes with the others, which is why this is a
+  ## case and not a table.  The machine formats print it only under `-b`; the
+  ## long format always does.
+  # `-b` is the machine formats' switch for this whole block; the long format
+  # has no such switch and always says where HEAD is.
+  if fmt != sfLong and not branch: return
+  let t = st.tracking
+  case fmt
+  of sfPorcelainV2:
+    # Built as fields because the last two are omitted *entirely* when there
+    # is no upstream: an absent relationship is silence here, not a zero.
+    var fields = @[("oid", if st.initial: "(initial)" else: $st.headOid),
+                   ("head", if st.detached: "(detached)" else: st.branch)]
+    if t.upstream.len > 0:
+      fields.add(("upstream", t.upstream))
+      if not t.gone: fields.add(("ab", "+" & $t.ahead & " -" & $t.behind))
+    for (k, v) in fields: result.add "# branch." & k & " " & v & sep
+  of sfShort, sfPorcelainV1:
+    if st.detached: result = "## HEAD (no branch)" & sep
+    elif st.initial: result = "## No commits yet on " & st.branch & sep
     else:
-      if e.x != ' ': staged.add e
-      if e.y != ' ': unstaged.add e
-  if st.op == opRebase and st.opOnto.len > 0:
-    result.add "interactive rebase in progress; onto " & st.opOnto & "\n"
-  elif st.detached:
-    result.add st.headDesc & "\n"
-  else:
-    result.add "On branch " & st.branch & "\n"
-    let track = st.tracking.trackingLine
-    if track.len > 0: result.add track & "\n"
-  if st.initial:
-    result.add "\nNo commits yet\n\n"
-  result.add inProgressBlock(st, unmerged.len > 0)
-  proc section(title: string, lines: seq[string]): string =
-    ## One block of the long format: a heading, then one tab-indented line
-    ## per path, then a blank line; nothing when there are no paths.
-    if lines.len == 0: return
-    result = title & ":\n"
-    for l in lines: result.add "\t" & l & "\n"
-    result.add "\n"
-  var rows: seq[string]
-  for e in staged: rows.add labelFor(e.x) & quotePath(relativeTo(e.path, prefix))
-  result.add section("Changes to be committed", rows)
-  rows = @[]
-  for e in unmerged:
-    rows.add unmergedLabel(e.stagemask).alignLeft(labelWidth + 5) &
-             quotePath(relativeTo(e.path, prefix))
-  result.add section("Unmerged paths", rows)
-  rows = @[]
-  for e in unstaged: rows.add labelFor(e.y) & quotePath(relativeTo(e.path, prefix))
-  result.add section("Changes not staged for commit", rows)
-  rows = @[]
-  for p in st.untracked: rows.add quotePath(relativeTo(p, prefix))
-  result.add section("Untracked files", rows)
-  if untracked == umNo and staged.len > 0:
+      # `## main...origin/main [ahead 1, behind 2]`.  The bracket is dropped
+      # when the two are level, so the common case is just the two names; a
+      # `[gone]` upstream reports no counts, because there is nothing to count
+      # against.
+      var ab: seq[string]
+      if t.gone: ab.add "gone"
+      if t.ahead > 0: ab.add "ahead " & $t.ahead
+      if t.behind > 0: ab.add "behind " & $t.behind
+      result = "## " & st.branch &
+               (if t.upstream.len > 0: "..." & t.upstream else: "") &
+               (if ab.len > 0: " [" & ab.join(", ") & "]" else: "") & sep
+  of sfLong:
+    if st.op == opRebase and st.opOnto.len > 0:
+      result = "interactive rebase in progress; onto " & st.opOnto & "\n"
+    elif st.detached: result = st.headDesc & "\n"
+    else:
+      result = "On branch " & st.branch & "\n"
+      let track = t.trackingLine
+      if track.len > 0: result.add track & "\n"
+    if st.initial: result.add "\nNo commits yet\n\n"
+
+proc renderStatus*(st: Status, fmt: StatusFormat, untracked: UntrackedMode,
+                   prefix: string, branch = false, nulTerm = false): string =
+  ## The report, in whichever of the four formats was asked for.
+  ##
+  ## `prefix` is the directory paths are printed relative to, and `""` prints
+  ## them from the repository root.  That is porcelain v1's whole promise --
+  ## its output does not depend on where you stood -- and it is the caller's
+  ## decision to pass `""`, which is why v1 is nowhere distinguished from `-s`
+  ## below.  It is also the one thing that is easy to miss about the wire:
+  ## `wt-status.c:wt_porcelain_print` clears `relative_paths` for v1 and the
+  ## v2 printer does not, so `--porcelain=v2` from a subdirectory says
+  ## `../top.txt` where `--porcelain` says `top.txt`.
+  ##
+  ## `branch` is `-b`; the long format ignores it and always names the branch.
+  let long = fmt == sfLong
+  let v2 = fmt == sfPorcelainV2
+  let sep = if nulTerm: "\0" else: "\n"
+
+  proc pathField(p: string): string =
+    ## A path as a record carries it: relative, and quoted -- except under
+    ## `-z`, the one mode with no quoting, because the NUL terminator already
+    ## makes every byte unambiguous, which is why `-z` exists.
+    let rel = relativeTo(p, prefix)
+    if nulTerm: rel else: quotePath(rel)
+
+  var rows: array[4, seq[string]]
+  for e in st.entries:
+    let p = pathField(e.path)
+    let u = e.stagemask != 0
+    if v2: rows[ord(u)].add v2Row(e, p)
+    elif not long: rows[0].add e.x & e.y & " " & p
+    elif u: rows[1].add unmergedRow(e.stagemask)[1].alignLeft(labelWidth + 5) & p
+    else:
+      if e.x != ' ': rows[0].add labelFor(e.x) & p
+      if e.y != ' ': rows[2].add labelFor(e.y) & p
+  for p in st.untracked:
+    rows[3].add (if long: "" elif v2: "? " else: "?? ") & pathField(p)
+
+  result = header(st, fmt, branch, sep)
+  if long: result.add inProgressBlock(st, rows[1].len > 0)
+  for i, group in rows:
+    if group.len == 0: continue
+    # A long-format section is a heading, tab-indented rows and a blank line;
+    # a machine-format one is the rows and nothing else.
+    if long: result.add sectionHeadings[i] & ":\n"
+    for line in group: result.add (if long: "\t" & line & "\n" else: line & sep)
+    if long: result.add "\n"
+  if not long: return
+
+  # The closing sentence, which is about what was *not* printed above.
+  if untracked == umNo and rows[0].len > 0:
     result.add "Untracked files not listed\n"
-  if staged.len == 0:
+  if rows[0].len == 0:
     result.add (
-      if unstaged.len > 0 or unmerged.len > 0: "no changes added to commit\n"
+      if rows[1].len > 0 or rows[2].len > 0: "no changes added to commit\n"
       elif st.untracked.len > 0: "nothing added to commit but untracked files present\n"
       elif st.initial or untracked == umNo: "nothing to commit\n"
       else: "nothing to commit, working tree clean\n")
+
+proc longStatus*(st: Status, untracked: UntrackedMode, prefix: string): string =
+  ## The long format alone, for `commit` and `stash` to paste into the editor
+  ## template as commented-out lines.  `status` calls `renderStatus` directly.
+  renderStatus(st, sfLong, untracked, prefix)
