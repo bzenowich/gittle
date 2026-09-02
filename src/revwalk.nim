@@ -188,6 +188,57 @@ proc start*(w: RevWalk, o: Oid, uninteresting = false, left = false) =
   if uninteresting: w.markUninteresting(o)
 
 # ---------------------------------------------------------------------------
+# The object walk
+# ---------------------------------------------------------------------------
+#
+# `rev-list --objects`, `pack-objects` and `push` all ask the same question --
+# *which objects are on this side and not on that one* -- so the two halves of
+# the answer live here rather than in any one of them.
+
+proc collectTree*(repo: Repository, root: Oid, seen: var HashSet[Oid]) =
+  ## Every tree and blob under `root`, marked as seen and not reported.  This
+  ## is the *excluded* side: what the other end already has.
+  if root in seen: return
+  seen.incl root
+  for e in treeEntries(repo.readObject(root).data):
+    if modeType(e.mode) == otTree: repo.collectTree(e.oid, seen)
+    elif modeType(e.mode) != otCommit: seen.incl e.oid
+
+proc walkObjects*(repo: Repository, root: Oid, path: string,
+                  seen: var HashSet[Oid],
+                  emit: proc (o: Oid, p: string) {.closure.}) =
+  ## Pre-order, in tree-entry order: the tree itself, then each entry, a
+  ## subtree fully before its next sibling (`list-objects.c:process_tree`).
+  ##
+  ## That order is not decorative.  Each object is reported with the **path it
+  ## was found at**, and a packer reads the resulting sequence as a hint that
+  ## neighbours will delta well against each other.
+  if root in seen: return
+  seen.incl root
+  emit(root, path)
+  for e in treeEntries(repo.readObject(root).data):
+    let full = if path.len == 0: e.name else: path & "/" & e.name
+    case modeType(e.mode)
+    of otTree: repo.walkObjects(e.oid, full, seen, emit)
+    of otCommit: discard        # a gitlink names a commit in another repository
+    else:
+      if e.oid notin seen:
+        seen.incl e.oid
+        emit(e.oid, full)
+
+proc edgeTrees*(repo: Repository, w: RevWalk, commits: seq[Oid],
+                seen: var HashSet[Oid]) =
+  ## **The edge.**  What the excluded side already has is exactly the trees of
+  ## the shown commits' excluded *parents*, taken whole
+  ## (`list-objects.c:mark_edges_uninteresting`).  Marking them seen is what
+  ## makes `HEAD ^origin/main` the set of objects the other end is missing --
+  ## and it is why a fetch, and a push, is small.
+  for o in commits:
+    for p in repo.readCommit(o).parents:
+      if w.isUninteresting(p):
+        repo.collectTree(repo.readCommit(p).tree, seen)
+
+# ---------------------------------------------------------------------------
 # Comparing two trees under a pathspec
 # ---------------------------------------------------------------------------
 
@@ -516,6 +567,29 @@ proc paintDownToCommon(repo: Repository, one: Oid,
       flags[item.oid] = f
     for p in repo.readCommit(item.oid).parents:
       enqueue(p, f)
+
+proc objectsBetween*(repo: Repository, wants, haves: openArray[Oid]): seq[Oid] =
+  ## Every object reachable from `wants` and not from `haves`, commits first.
+  ## The set a push has to send, and what `pack-objects --revs` is given.
+  let w = newRevWalk(repo)
+  var tags: seq[Oid]
+  for h in haves:
+    if not repo.hasObject(h): continue
+    let (peeled, _) = repo.peelTo(h, otCommit)
+    w.start(peeled, uninteresting = true)
+  for o in wants:
+    if repo.objectInfo(o).kind == otTag: tags.add o
+    w.start(repo.peelTo(o, otCommit).oid)
+  var commits: seq[Oid]
+  for e in w.walk: commits.add e.oid
+
+  var seen: HashSet[Oid]
+  repo.edgeTrees(w, commits, seen)
+  var objs = tags & commits
+  for o in commits:
+    repo.walkObjects(repo.readCommit(o).tree, "", seen,
+                     proc (x: Oid, p: string) = objs.add x)
+  objs
 
 proc isAncestor*(repo: Repository, a, b: Oid): bool =
   ## Is `a` reachable from `b`?  `merge-base --is-ancestor`, and the safety

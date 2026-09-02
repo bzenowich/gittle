@@ -43,33 +43,6 @@ const usageText = """usage: gittle rev-list [<options>] <commit>… [[--] <path>
    --objects                 also print every reachable tree and blob
    --pretty[=<fmt>], --format=<fmt>, --abbrev-commit, --date=<fmt>"""
 
-proc collectTree(repo: Repository, root: Oid, seen: var HashSet[Oid]) =
-  ## Every tree and blob under `root`, added to `seen`.  Used only for the
-  ## excluded side of an `--objects` range: what the other end already has.
-  if root in seen: return
-  seen.incl root
-  for e in treeEntries(repo.readObject(root).data):
-    if modeType(e.mode) == otTree: repo.collectTree(e.oid, seen)
-    elif modeType(e.mode) != otCommit: seen.incl e.oid
-
-proc showTree(repo: Repository, root: Oid, path: string, seen: var HashSet[Oid]) =
-  ## Pre-order, in tree-entry order: the tree itself, then each entry, a
-  ## subtree fully before its next sibling (`list-objects.c:process_tree`).
-  ## That order is not decorative -- a packer reads it as a hint that the
-  ## objects near each other here will delta well against each other.
-  if root in seen: return
-  seen.incl root
-  echo $root & " " & path
-  for e in treeEntries(repo.readObject(root).data):
-    let full = if path.len == 0: e.name else: path & "/" & e.name
-    case modeType(e.mode)
-    of otTree: repo.showTree(e.oid, full, seen)
-    of otCommit: discard          # a gitlink names a commit in another repository
-    else:
-      if e.oid notin seen:
-        seen.incl e.oid
-        echo $e.oid & " " & full
-
 proc cmdRevList*(c: Ctx, args: seq[string]): int =
   if args.len == 0:
     # git's usage exit for a command given nothing at all.  With any option at
@@ -170,15 +143,7 @@ proc cmdRevList*(c: Ctx, args: seq[string]): int =
       swap(commits[k], commits[commits.high - k])
   for l in lines: stdout.write l
   if ri.objects:
-    # **The edge.**  What the excluded side already has is exactly the trees of
-    # the shown commits' excluded *parents*, taken whole
-    # (`list-objects.c:mark_edges_uninteresting`).  Removing them is what makes
-    # `rev-list --objects HEAD ^origin/main` the set of objects the other end
-    # is missing -- and it is why a fetch is small.
-    for o in commits:
-      for p in repo.readCommit(o).parents:
-        if w.isUninteresting(p):
-          repo.collectTree(repo.readCommit(p).tree, seen)
+    repo.edgeTrees(w, commits, seen)
     # Tags first, named as the tag object names *itself* rather than as the ref
     # that found it, then every commit's tree in the order the commits came out
     # (`revision.c:prepare_revision_walk` refills `pending` in that order).
@@ -190,6 +155,8 @@ proc cmdRevList*(c: Ctx, args: seq[string]): int =
       if repo.objectInfo(p.oid).kind != otTag: continue
       seen.incl p.oid
       echo $p.oid & " " & headerField(repo.readObject(p.oid).data, "tag")
-    for o in commits: repo.showTree(repo.readCommit(o).tree, "", seen)
+    for o in commits:
+      repo.walkObjects(repo.readCommit(o).tree, "", seen,
+                       proc (x: Oid, p: string) = echo $x & " " & p)
   stdout.flushFile()
   0

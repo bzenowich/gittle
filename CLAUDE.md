@@ -41,6 +41,8 @@ first, by anyone, in every phase:
 | Comparing a **merge** | The same kind again: git's merge asks its diff for the default algorithm and gittle only has `--minimal`, so `merge-file` gets `--diff-algorithm=minimal` and `merge` would get `-Xdiff-algorithm=minimal`. |
 | Testing a command that **writes** | Comparing stdout is not enough: a `checkout` that prints the right thing and leaves the wrong index is the failure worth catching. `oracle.sh`'s `p6mut` runs the command in two identical copies of a fixture and compares every ref, HEAD, the config, every reflog, every working-tree file, the whole index, **every in-progress marker** (`MERGE_HEAD`, `rebase-merge/…`) and **each tool's own `status` and `branch`** (`p6own`). Nine of phase 6's eleven bugs and four of phase 7's were found in those comparisons and not in the output. |
 | Testing a command that **resumes** | `$GITX` inside a `PREP` is the tool under test in that copy, so `PREP='$GITX cherry-pick topic' p6mut cherry-pick --continue` asks gittle to continue a state gittle created. Continuing git's state with git's tool proves nothing about interoperability; the two states being interchangeable is the claim. |
+| Testing a command that **talks to a remote** | `p8mut` keeps **two servers as well as two clients** — a bare copy of the source per tool, each client pointed at its own — and compares all four afterwards. A push that prints the right thing and leaves the wrong ref on the far side is caught by the far side and nowhere else. The tests need `$REFREPO` on `PATH` so that `git-upload-pack` and `git-receive-pack` resolve; `oracle.sh` puts it there. |
+| Reaching a remote at all | One transport: **a program with a pipe on each end**. `ssh host "git-upload-pack '<path>'"` and `git-upload-pack <path>` are the same thing with a prefix, so `clone file:///path` exercises every line of the protocol with no server and no network. A local path is *not* an object-store copy — plan.md §6, "A local path is not a second transport". |
 | Naming | gittle says `gittle` where git says `git`, in messages and in hints. The oracle normalises that away (`p6norm`) rather than testing it. |
 
 ## Documentation
@@ -72,9 +74,11 @@ None of these is optional; `plan.md` §7 has the detail.
 `plan.md` §5 is **a measurement, not a limit** — that was settled after phase 6,
 along with cutting the server. Do not cram to hit a figure, and do not let it
 drift unremarked either: record the line count at the end of every phase and
-explain the over-runs. §5.1 and §5.2 have the running total (10,756 after phase 7,
-~13,000 projected for v1) and the reason the command layer costs what it
-does — which after phase 7 is *state machines*, not option surface.
+explain the over-runs. §5.1–§5.3 have the running total (12,841 after phase 8,
+~13,000 projected for v1) and the reasons the command layer costs what it
+does — after phase 7 *state machines*, and after phase 8 *compatibility
+surface*: the rules a tool has to reproduce because someone else's output
+already defines them. Neither is option surface, which is what §5 models.
 
 An optimisation and refactoring pass is planned once v1 is feature-complete, so
 prefer the clear version now over the clever one.
@@ -82,4 +86,9 @@ prefer the clear version now over the clever one.
 **The server is cut** (plan.md §6 decision 2): no `upload-pack`, no
 `receive-pack`, no `git-shell`, and phase 9 is empty. gittle is a transport
 client. `index-pack`'s validation still matters — a *fetch* takes a packfile
-from the other end too.
+from the other end too — and it is now built: pack checksum, every object's
+own hash, then connectivity, and no ref moves until all three pass
+(`docs/phase-8.md`).
+
+**Phase 10 is all that is left**: `gc`, `worktree`, `clean`, `check-ignore`,
+plus `mv`, `rm` and `stage`.

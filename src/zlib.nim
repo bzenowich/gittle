@@ -46,6 +46,8 @@ proc inflateInit2u(strm: var ZStream, windowBits: cint, version: cstring,
 proc inflateRaw(strm: var ZStream, flush: cint): cint {.importc: "inflate", zlibh.}
 proc inflateEnd(strm: var ZStream): cint {.importc: "inflateEnd", zlibh.}
 proc compressBound(sourceLen: culong): culong {.importc, zlibh.}
+proc crc32c(crc: culong, buf: ptr byte, len: cuint): culong
+  {.importc: "crc32", zlibh.}
 proc compress2(dest: ptr byte, destLen: var culong, source: ptr byte,
                sourceLen: culong, level: cint): cint {.importc, zlibh.}
 
@@ -171,3 +173,9 @@ proc deflateAll*(src: pointer, srcLen: int, level: cint): string =
                      cast[ptr byte](src), culong(srcLen), level)
   failIf(rc != ZOk, "compress2 failed (" & $rc & ")")
   result.setLen(int(bound))
+
+proc crc32*(data: pointer, len: int): uint32 =
+  ## The checksum a pack index records for every object's stored bytes.  zlib
+  ## has it already -- it needs one for the gzip container -- so the alternative
+  ## was a table nobody would ever read.
+  uint32(crc32c(crc32c(0, nil, 0), cast[ptr byte](data), cuint(len)))

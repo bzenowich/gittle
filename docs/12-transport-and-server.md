@@ -1,9 +1,16 @@
 # 12 — Transport endpoints and server-side helpers
 
-> **PARTIALLY IN SCOPE.** gittle v1 is a transport **client only**.
-> `clone`/`fetch`/`push` speak protocol v2 over ssh, spawning
-> `git-upload-pack` / `git-receive-pack` on the far side, and use a direct
-> object-store copy for local paths.
+> **PARTIALLY IN SCOPE — built, `phase-8.md`.** gittle v1 is a transport
+> **client only**. `clone`/`fetch`/`push` speak protocol v2 over ssh (falling
+> back to v0 when the server does not get `GIT_PROTOCOL`), spawning
+> `git-upload-pack` / `git-receive-pack` on the far side.
+>
+> A **local path uses the same transport**, running `git-upload-pack` here
+> instead of over ssh. ~~a direct object-store copy for local paths~~ — that
+> was the original plan and phase 8 rejected it: a copy is a second transport
+> (R4), tested by none of the protocol tests, for the case where two
+> repositories sit on one disk. The cost is that a local clone needs
+> `git-upload-pack` on the machine.
 >
 > The **server halves are cut** (2026-09-01, plan.md §6 decision 2):
 > `upload-pack`, `receive-pack` and `git-shell` were in scope until the end of
@@ -32,6 +39,10 @@ in `gitprotocol-pack`, `gitprotocol-v2`, `gitprotocol-common`, and
 (the anonymous `git://` protocol), and `instaweb`/`gitweb`.
 
 ---
+
+The client halves below are marked out of scope as *commands*: gittle has no
+`fetch-pack` or `send-pack` binary. What they do is inside `clone`, `fetch`
+and `push` — see `plan.md` §7 phase 8 and `phase-8.md`.
 
 ## `fetch-pack` — client half of fetch
 

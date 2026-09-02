@@ -369,7 +369,8 @@ proc cmdRebase*(c: Ctx, argv: seq[string]): int =
       parsePathspec(@[])))
     stdout.flushFile()
   repo.refs.updateRef(headRef, ontoOid, noDeref = true,
-                      msg = "rebase (start): checkout " & ontoName)
+                      msg = (if c.reflogAction.len > 0: c.reflogAction else: "rebase") &
+                            " (start): checkout " & ontoName)
 
   repo.writeState(rebaseDir / "head-name", st.headName & "\n")
   repo.writeState(rebaseDir / "onto", $ontoOid & "\n")

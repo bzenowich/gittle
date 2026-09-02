@@ -22,6 +22,11 @@ type
     gitDirOpt*, workTreeOpt*: string
     bare*: bool
     overrides*: Config
+    reflogAction*: string
+      ## What the reflog should call whatever happens next, when it is not the
+      ## running command's own name.  git carries this in `GIT_REFLOG_ACTION`
+      ## and it exists for exactly one situation: `pull` runs a fetch and then
+      ## a merge or a rebase, and every entry all three write says `pull`.
     cached: Repository
 
 proc repo*(c: Ctx): Repository =

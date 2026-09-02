@@ -226,7 +226,8 @@ proc cmdMerge*(c: Ctx, argv: seq[string]): int =
     repo.applyPlan(idx, plan, repo.flatten(newTree))
     idx.writeIndex()
     repo.refs.updateRef(headRef, theirs, oldOid = ours, checkOld = true,
-                        msg = "merge " & target & ": Fast-forward")
+                        msg = (if c.reflogAction.len > 0: c.reflogAction
+                               else: "merge " & target) & ": Fast-forward")
     if not quiet: printStat(repo, oldTree, newTree)
     return 0
   if ff == ffOnly:
@@ -271,7 +272,8 @@ proc cmdMerge*(c: Ctx, argv: seq[string]): int =
   let newOid = commitMerge(repo, idx, @[ours, theirs], msg,
                            useEditor = forceEdit and not noEdit,
                            signoff = signoff,
-                           reflogPrefix = "merge " & target & ": ",
+                           reflogPrefix = (if c.reflogAction.len > 0: c.reflogAction
+                                           else: "merge " & target) & ": ",
                            reflogTail = made).oid
   if not quiet:
     echo made

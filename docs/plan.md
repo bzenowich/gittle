@@ -100,8 +100,12 @@ costs nothing because they live in files we simply don't open.
 **R4 — One of everything.**
 One diff algorithm (Myers). One hash (SHA-1). One ref backend (`files`). One
 index version on write (v2, or v3 when extended flags are needed — matching
-git's own rule). One merge strategy. One transport (ssh, plus a direct
-object-store copy for local paths).
+git's own rule). One merge strategy. **One transport**: a program with a pipe
+on each end, speaking pkt-line. `ssh host "git-upload-pack '<path>'"` for a
+remote and `git-upload-pack <path>` for a local one are the same thing with a
+prefix — *not* a copy of the object store for local paths, which was the
+original wording and which phase 8 rejected as a second transport (§6, "A
+local path is not a second transport").
 
 **R5 — A tree merge that refuses rather than resolves.**
 The 526 → 5,608 line jump between file-level and tree-level merging is almost
@@ -442,6 +446,42 @@ gc, worktree, clean, check-ignore                             300
 
 which puts v1 near **13,000**.  Recorded, not cut against (§5's own rule).
 
+### 5.3 After phase 8
+
+**12,841 lines**, eight of nine phases done (nine is empty).  Phase 8 cost
+2,083 — [phase-8.md](phase-8.md) has the breakdown — and it split the same way
+phase 7 did, for a new reason:
+
+| | budgeted | actual |
+|---|---:|---:|
+| wire protocol v2 over ssh: ls-refs, fetch, push | 700 | **402** |
+| pack write + delta reuse (and `index-pack`) | 500 | **327** |
+| refspecs and the fetch engine | — | **382** |
+| the phase's eight commands | — | **860** |
+| everything else (thirteen files touched) | — | 112 |
+
+Both algorithms came in **under**, and the 700 for the wire was wrong in an
+instructive way: it assumed that supporting protocol v0 *and* v2 costs twice.
+It does not.  The two differ only in how the same want/have exchange is
+framed, so the second one is forty lines — and it is not optional, because an
+`sshd` that does not forward `GIT_PROTOCOL` answers in v0 and there are a lot
+of those.
+
+The command layer over-ran again, and again it is not option surface.  `push`
+(282 lines) has eight flags; what fills it is the **six ways a ref update can
+be refused** and the six paragraphs of advice git prints for them.
+`remotes.nim` (335) is the ref map — how a refspec, a command-line argument
+and a configured default combine — plus the two column widths of the report.
+Neither is a state machine, so phase 7's diagnosis does not cover them.  Call
+it a third cost, after option combinations and state: **compatibility
+surface**, the rules a tool has to reproduce because someone else's output
+already defines them.
+
+Eight of the fifteen commands left after phase 7 have now cost 860.  The seven
+remaining — `gc`, `worktree`, `clean`, `check-ignore`, `mv`, `rm`, and `stage`
+as an alias of `add` — are phase 10 and are mostly small.  The estimate is
+**unchanged: v1 lands near 13,000**.
+
 ---
 
 ## 6. Decisions
@@ -728,6 +768,7 @@ create state with one tool, verify with the other, in both directions.
    *Done: [phase-7.md](phase-7.md).*
 8. **Transport.** pkt-line, protocol v2 `ls-refs` and `fetch`, `index-pack`,
    then `clone`/`fetch`/`pull`; then `pack-objects` and `push`.
+   *Done: [phase-8.md](phase-8.md).*
 9. ~~**Serving.**~~ **Cut (2026-09-01)**, with decision 2. It was `argv[0]`
    dispatch and the `git-*` symlinks, then `upload-pack`, `receive-pack` and
    `git-shell`.

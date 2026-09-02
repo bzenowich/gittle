@@ -37,6 +37,7 @@ can be marked up in place.
 | **CUT from v1** | Section banner: every option below it is out of scope, reason inline |
 
 Current recommendation: **53 of 161 commands, 447 of 2,341 option entries.**
+Forty-six of them are built (phases 1–8); the seven left are phase 10's.
 The reasoning, the design rules behind it, the budget, and eight open questions
 are in **[plan.md](plan.md)** — read that before revising the marks. All ten open questions
 are now decided; §6 is a decision record.

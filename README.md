@@ -10,14 +10,14 @@ share a repository with real git, and plausible in a busybox-class environment.
   pushes to a git host, and does not host one.
 - **One static binary**, busybox-style `argv[0]` dispatch. Only external
   dependency is the system zlib.
-- **Small enough to read in an afternoon** — 10.8 kloc of Nim today, and
+- **Small enough to read in an afternoon** — 12.8 kloc of Nim today, and
   ~13 projected for the whole of v1.
 
 ## Status
 
-**Phases 1–7 complete: the object store, refs and config, the index and
-trees, the first commit, diff, history, and merge.** Thirty-six commands work
-and agree with real git. `gittle init`, `gittle add .`, `gittle commit` produces a
+**Phases 1–8 complete: the object store, refs and config, the index and
+trees, the first commit, diff, history, merge, and the transport.**
+Forty-four commands work and agree with real git. `gittle init`, `gittle add .`, `gittle commit` produces a
 repository real git continues in without noticing — identical commit objects,
 reflogs and index — and `gittle log` reproduces git's output over 20,000
 commits of the repository next door. `git fsck --strict` is clean after
@@ -52,10 +52,24 @@ these commands write is state for the next command to continue from. A merge
 gittle stopped is concluded by `git commit`; a cherry-pick git stopped is
 continued by `gittle cherry-pick --continue`.
 
+Phase 8 is the wire. `clone`, `fetch`, `pull`, `push`, `remote`, `ls-remote`,
+`index-pack` and `pack-objects`, over one transport: **a program with a pipe on
+each end**, speaking pkt-line. `ssh host "git-upload-pack '/srv/repo'"` and
+`git-upload-pack /srv/repo` are the same line with a prefix, which is what lets
+every protocol test run against a real `git-upload-pack` with no server, no
+account and no network. Protocol v2 where the server gets `GIT_PROTOCOL`, v0
+where it does not, and v0 for push always — `receive-pack` has no v2 form.
+
+Two claims are measured rather than asserted. The `.idx` that `index-pack`
+writes is **byte-identical to git's over all 420,113 objects** of the
+repository next door, a 318 MiB pack. And R2 — never search for a delta, only
+pass on one you were given — makes `pack-objects` 54 lines and still
+**reuses 28,284 deltas** when packing two thousand commits of that history.
+
 `grep` and `log --grep` use libc's POSIX regex rather than a vendored engine —
 which is what git itself does, and what turned a 500-line budget line into 45.
 
-10,756 lines of code so far, against an original sketch of ~9,000 for the whole
+12,841 lines of code so far, against an original sketch of ~9,000 for the whole
 of v1. That sketch is now a measurement rather than a limit: the server was cut
 (it is the one phase with no client-side benefit), the rest is accepted at an
 estimated ~13,000, and an optimisation and refactoring pass comes once v1 is
@@ -69,7 +83,8 @@ numbers.
 - [`docs/phase-1.md`](docs/phase-1.md), [`docs/phase-2.md`](docs/phase-2.md),
   [`docs/phase-3.md`](docs/phase-3.md), [`docs/phase-4.md`](docs/phase-4.md),
   [`docs/phase-5.md`](docs/phase-5.md), [`docs/phase-6.md`](docs/phase-6.md),
-  [`docs/phase-7.md`](docs/phase-7.md) — the finished phases: what was built, what it was verified against, what was
+  [`docs/phase-7.md`](docs/phase-7.md), [`docs/phase-8.md`](docs/phase-8.md) —
+  the finished phases: what was built, what it was verified against, what was
   left for later, and where the budget stands.
 - [`docs/README.md`](docs/README.md) — index to the feature inventory
   (`01`–`15`), where every git command and option is marked in or out of scope.
@@ -84,6 +99,10 @@ nim c -d:release -d:static --out:build/gittle src/gittle.nim  # one static binar
 tests/oracle.sh          # differential tests against real git, sampled
 tests/oracle.sh --full   # ... over every object in the reference repository
 ```
+
+The transport tests need `git-upload-pack` and `git-receive-pack` to be
+findable by name, so they put the reference build on `PATH`; nothing else is
+required, and no test contacts a network.
 
 The tests prefer a `git` built from the reference checkout above this one over
 whatever is on `PATH`, because the installed one may be years older than the

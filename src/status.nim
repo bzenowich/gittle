@@ -404,9 +404,12 @@ proc trackingLine*(t: Tracking): string =
     ", and can be fast-forwarded.\n" &
     "  (use \"gittle pull\" to update your local branch)\n"
   else:
+    # The plural is decided by the *sum* of the two counts, not by either of
+    # them (`remote.c`, the `Q_()` around this string) -- so one commit each
+    # way still says "commits".
     "Your branch and '" & name & "' have diverged,\nand have " &
-    commits(ahead) & " and " & commits(behind) &
-    " different each respectively.\n" &
+    $ahead & " and " & $behind & " different commit" &
+    (if ahead + behind == 1: "" else: "s") & " each, respectively.\n" &
     "  (use \"gittle pull\" if you want to integrate the remote branch with " &
     "yours)\n"
 

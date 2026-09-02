@@ -199,6 +199,15 @@ proc get*(c: Config, key: string): string =
     if c.entries[i].key.toLowerAscii == k: return c.entries[i].value
   ""
 
+iterator getAll*(c: Config, key: string): string =
+  ## Every value set for `key`, in file order.  Most variables are
+  ## last-one-wins, but a few are genuinely lists -- a remote may have several
+  ## `fetch` refspecs, and taking only the last would silently stop tracking
+  ## most of them.
+  let k = key.toLowerAscii
+  for e in c.entries:
+    if e.key.toLowerAscii == k: yield e.value
+
 proc has*(c: Config, key: string): bool =
   let k = key.toLowerAscii
   for e in c.entries:

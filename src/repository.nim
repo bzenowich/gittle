@@ -216,12 +216,27 @@ proc loadPacks(r: Repository) =
     for i in idxs:
       r.packs.add openPack(i)
 
+proc reopenPacks*(r: Repository) =
+  ## Forget the packs that were open and look again.  Every other lookup path
+  ## caches, which is right for a process that reads; `fetch` is the one that
+  ## *adds* a pack mid-run, and an object it just received would otherwise be
+  ## invisible until the next command.
+  for p in r.packs: p.close()
+  r.packs.setLen(0)
+  r.packsLoaded = false
+
 proc findPacked(r: Repository, o: Oid): tuple[pack: Pack, offset: int] =
   r.loadPacks()
   for p in r.packs:
     let i = p.find(o)
     if i >= 0: return (p, p.offsetAt(i))
   (nil, 0)
+
+proc findPackedAt*(r: Repository, o: Oid): tuple[pack: Pack, offset: int] =
+  ## Where an object lies packed, if it does.  Only `pack-objects` needs this:
+  ## reusing a delta means reading the bytes as *stored*, which every other
+  ## caller is deliberately insulated from.
+  r.findPacked(o)
 
 proc findLoose(r: Repository, o: Oid): string =
   for d in r.objDirs:

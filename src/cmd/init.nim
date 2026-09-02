@@ -25,6 +25,31 @@ const
     ## `filemode` is written true rather than probed: decision 6 makes gittle
     ## Linux-only, and every filesystem it will meet honors the execute bit.
 
+proc createRepository*(gitDir: string, bare: bool, branch: string): bool =
+  ## Lay out a repository, and report whether one was already there.
+  ##
+  ## Shared with `clone`, which is `init` plus a `fetch` plus a `checkout` and
+  ## must produce exactly the same directory for the same options.
+  ##
+  ## A repository already here is re-initialised, not replaced: git creates
+  ## whatever is missing and leaves HEAD, the config and every ref alone.  That
+  ## is what makes `git init` safe to run twice, and losing a branch to a typed
+  ## command that usually does nothing would be unforgivable.
+  result = fileExists(gitDir / "HEAD")
+  for d in ["objects/info", "objects/pack", "refs/heads", "refs/tags"]:
+    createDir(gitDir / d)
+  if not result:
+    writeFile(gitDir / "HEAD", "ref: refs/heads/" & branch & "\n")
+    writeFile(gitDir / "config", if bare: bareConfig else: workConfig)
+
+proc defaultInitialBranch*(): string =
+  ## `init.defaultBranch` from the *user's* configuration: there is no
+  ## repository yet to read one from.  git 2.55 still defaults to `master` and
+  ## warns that 3.0 will change it; gittle follows the version it is
+  ## compatible with rather than the one that does not exist.
+  result = loadConfig(globalConfigPath()).get("init.defaultBranch")
+  if result.len == 0: result = "master"
+
 proc cmdInit*(c: Ctx, args: seq[string]): int =
   var quiet = false
   var bare = c.bare
@@ -68,27 +93,10 @@ proc cmdInit*(c: Ctx, args: seq[string]): int =
              else: c.startDir
   let gitDir = if bare: root else: root / ".git"
 
-  # A repository already here is re-initialised, not replaced: git creates
-  # whatever is missing and leaves HEAD, the config and every ref alone.  That
-  # is what makes `git init` safe to run twice, and losing a branch to a typed
-  # command that usually does nothing would be unforgivable.
-  let existing = fileExists(gitDir / "HEAD")
-
-  # `init.defaultBranch` is read from the *user's* configuration: there is no
-  # repository yet to read one from.  git 2.55 still defaults to `master` and
-  # warns that 3.0 will change it; gittle follows the version it is compatible
-  # with rather than the one that does not exist.
-  if branch.len == 0:
-    branch = loadConfig(globalConfigPath()).get("init.defaultBranch")
-  if branch.len == 0: branch = "master"
+  if branch.len == 0: branch = defaultInitialBranch()
   failIf(not isValidRefname(refsPrefix & "heads/" & branch),
          "invalid initial branch name: '" & branch & "'")
-
-  for d in ["objects/info", "objects/pack", "refs/heads", "refs/tags"]:
-    createDir(gitDir / d)
-  if not existing:
-    writeFile(gitDir / "HEAD", "ref: refs/heads/" & branch & "\n")
-    writeFile(gitDir / "config", if bare: bareConfig else: workConfig)
+  let existing = createRepository(gitDir, bare, branch)
 
   if not quiet:
     # git prints the git directory with a trailing slash, and says which of the

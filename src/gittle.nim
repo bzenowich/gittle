@@ -26,6 +26,9 @@ import cmd/stash as cmdstash
 import cmd/diff as cmddiff
 import cmd/status as cmdstatus
 import cmd/grep as cmdgrep
+import cmd/indexpack, cmd/clone, cmd/fetch, cmd/lsremote
+import cmd/packobjects, cmd/push as cmdpush, cmd/remote as cmdremote
+import cmd/pull as cmdpull
 
 const
   version = "gittle version 0.1.0"
@@ -47,23 +50,31 @@ Commands:
    cat-file              inspect objects
    checkout              switch branches, or restore files
    cherry-pick           replay existing commits onto this branch
+   clone                 copy a repository into a new directory
    commit                record the staged content as a new commit
    commit-tree           create a commit object
    config                read and write configuration
    diff                  show changes between trees, index and working tree
+   fetch                 download objects and refs from a remote
    for-each-ref          list refs through a format string
    grep                  search tracked content
    hash-object           compute, and optionally store, an object ID
+   index-pack            build a .idx for a packfile
    init                  create a repository
    log                   show commit history
    ls-files              list index and working-tree files
+   ls-remote             list the refs a remote advertises
    ls-tree               list a tree object's entries
    merge                 join another history into this one
    merge-base            find the common ancestor of two commits
    merge-file            three-way merge of three files
+   pack-objects          create a packfile
+   pull                  fetch from a remote and integrate
+   push                  send refs and objects to a remote
    rebase                replay commits onto a different base
    read-tree             load a tree into the index
    reflog                show where a ref has been
+   remote                manage the set of named remotes
    reset                 move HEAD, the index and the working tree
    restore               restore working-tree and index files
    rev-list              walk history and list the objects it reaches
@@ -104,6 +115,14 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   of "status": cmdstatus.cmdStatus(c, args)
   of "grep": cmdgrep.cmdGrep(c, args)
   of "commit-tree": cmdCommitTree(c, args)
+  of "index-pack": cmdIndexPack(c, args)
+  of "clone": cmdClone(c, args)
+  of "fetch": cmdFetch(c, args)
+  of "ls-remote": cmdLsRemote(c, args)
+  of "pack-objects": cmdPackObjects(c, args)
+  of "push": cmdpush.cmdPush(c, args)
+  of "pull": cmdpull.cmdPull(c, args)
+  of "remote": cmdremote.cmdRemote(c, args)
   of "merge": cmdmerge.cmdMerge(c, args)
   of "merge-base": cmdMergeBase(c, args)
   of "merge-file": cmdMergeFile(c, args)

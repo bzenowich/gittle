@@ -449,6 +449,13 @@ type
     forceLog*: bool       ## write a reflog whatever the policy says.  `stash`
                           ## is the case: the stack of stashes *is* the reflog
                           ## of `refs/stash`, so it cannot be optional
+    noLog*: bool          ## write no reflog at all.  git's
+                          ## `REF_TRANSACTION_FLAG_INITIAL`, used when a
+                          ## repository is being *populated* rather than
+                          ## changed -- `clone` writes a hundred thousand
+                          ## remote-tracking refs and a log of "this ref came
+                          ## into existence at clone time" for each is noise
+                          ## no one reads
     msg*: string          ## reflog reason
 
   RefLock = object
@@ -474,6 +481,7 @@ type
     delete: bool
     verifyOnly: bool  ## locked and checked, but left exactly as it was
     forceLog: bool
+    noLog: bool
     msg: string
 
   RefTransaction* = ref object
@@ -690,7 +698,8 @@ proc prepare*(tx: RefTransaction) =
 
   try:
     for u in tx.updates:
-      var p = Plan(msg: u.msg, target: u.name, forceLog: u.forceLog)
+      var p = Plan(msg: u.msg, target: u.name, forceLog: u.forceLog,
+                   noLog: u.noLog)
 
       # Following a symbolic ref is the default for *every* kind of update:
       # `update-ref HEAD <oid>` moves the branch HEAD names rather than turning
@@ -752,7 +761,7 @@ proc prepare*(tx: RefTransaction) =
     # batch half applied, which is exactly what the transaction exists to
     # prevent -- and the identity is the one input that can fail this late.
     for p in tx.plans:
-      if not p.delete and not p.verifyOnly and
+      if not p.delete and not p.verifyOnly and not p.noLog and
          (p.forceLog or s.willWriteReflog(p.target) or
           (p.alias.len > 0 and s.willWriteReflog(p.alias))):
         discard s.identFn()
@@ -804,6 +813,7 @@ proc commit*(tx: RefTransaction) =
       # HEAD's own log survives, and records that what it pointed at is gone.
       if p.alias.len > 0: s.appendReflog(p.alias, p.before, nullOid, p.msg)
       continue
+    if p.noLog: continue
     let after = s.resolveRef(p.target).oid
     if not p.noop: s.appendReflog(p.target, p.logBefore, after, p.msg,
                                   force = p.forceLog)
@@ -845,14 +855,15 @@ proc deleteRef*(s: RefStore, name: string, oldOid = nullOid, checkOld = false,
     tx.add RefUpdate(kind: ruDelete, name: name, oldOid: oldOid,
                      haveOldOid: checkOld, noDeref: noDeref, msg: msg)
 
-proc writeSymRef*(s: RefStore, name, target: string, msg = "") =
+proc writeSymRef*(s: RefStore, name, target: string, msg = "",
+                  noLog = false) =
   ## Make `name` itself a symbolic ref pointing at `target`.
   ##
   ## `noDeref` is deliberate: `symbolic-ref A B` must rewrite A even when A is
   ## already a symbolic ref, or the command could never repoint one.
   withTransaction(s, tx):
     tx.add RefUpdate(kind: ruSetSymbolic, name: name, newTarget: target,
-                     noDeref: true, msg: msg)
+                     noDeref: true, msg: msg, noLog: noLog)
 
 proc newRefStore*(gitDir, commonDir: string, policy: LogRefsPolicy,
                   identFn: proc (): Ident {.closure.},

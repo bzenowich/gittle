@@ -31,7 +31,9 @@ if [ -x "$REFREPO/git" ]; then
 else
   GIT=git
 fi
-git() { "$GIT" "$@"; }
+# Automatic maintenance would run at unpredictable moments and write to the
+# stderr this suite compares; gittle has no such thing (`gc` is phase 10).
+git() { "$GIT" -c gc.auto=0 -c maintenance.auto=false "$@"; }
 
 # Tests that write refs need an identity for the reflog, and must not depend on
 # whichever one the developer happens to have configured.  The dates are pinned
@@ -1680,7 +1682,8 @@ P6="$WORK/p6"; mkdir -p "$P6"
 p6norm(){ sed -e 's/^fatal: //' -e 's/^gittle: //' -e "s/'git /'gittle /" \
               -e 's/^  git /  gittle /' -e 's/"git /"gittle /g' \
               -e 's/\tgit /\tgittle /' -e 's/ git add/ gittle add/' \
-              -e 's/known to git$/known to gittle/'; }
+              -e 's/known to git$/known to gittle/' \
+              -e 's/^hint:   git /hint:   gittle /'; }
 
 # p6ro <expected-name> <args...> -- a read-only command, both tools, one repo.
 p6dir=""
@@ -1699,24 +1702,32 @@ p6ro(){
   fi
 }
 
-# Everything a command could have written, as text.
+# Everything a command could have written, as text.  Works on a bare
+# repository too, which phase 8 needs: a push has to be judged by what it did
+# to the *other* end, and the other end has no working tree.
 p6state(){
-  ( cd "$1" || return
+  # A command that failed may have removed the directory it was asked to
+  # create; that is a *result*, not a reason to complain to the terminal.
+  ( cd "$1" 2>/dev/null || return
+    D=.git; [ -d .git ] || D=.
     git for-each-ref --format='%(refname) %(objectname) %(symref)'
     git symbolic-ref -q HEAD || git rev-parse HEAD
-    sed -e 's/[ \t]*$//' .git/config
+    sed -e 's/[ \t]*$//' "$D/config"
     # The in-progress markers are as much a result as the refs are: a merge
-    # that stopped is concluded only by what these say (phase 7).
-    for f in MERGE_HEAD MERGE_MSG MERGE_MODE ORIG_HEAD CHERRY_PICK_HEAD \
+    # that stopped is concluded only by what these say (phase 7), and
+    # FETCH_HEAD is what a `pull` reads back (phase 8).
+    for f in FETCH_HEAD MERGE_HEAD MERGE_MSG MERGE_MODE ORIG_HEAD \
+             CHERRY_PICK_HEAD \
              REVERT_HEAD REBASE_HEAD sequencer/head sequencer/todo \
              rebase-merge/head-name rebase-merge/onto rebase-merge/orig-head \
              rebase-merge/git-rebase-todo rebase-merge/done \
              rebase-merge/msgnum rebase-merge/end rebase-merge/message \
              rebase-merge/author-script rebase-merge/stopped-sha; do
-      [ -e ".git/$f" ] && { echo "== $f"; cat ".git/$f"; }
+      [ -e "$D/$f" ] && { echo "== $f"; cat "$D/$f"; }
     done
-    ( cd .git/logs 2>/dev/null && find . -type f | sort |
+    ( cd "$D/logs" 2>/dev/null && find . -type f | sort |
       while read -r f; do echo "== $f"; cat "$f"; done )
+    [ -d .git ] || return
     # `-type f` alone would follow a symlink and hash what it points at, and
     # a checkout that wrote a regular file instead of a link would pass.
     find . -path ./.git -prune -o \( -type f -o -type l \) -print | sort |
@@ -2381,6 +2392,346 @@ fsck_after "$P7/f7" '"$GITTLE" rebase main; "$GITTLE" add -A; "$GITTLE" rebase -
 fsck_after "$P7/f8" 'printf "1\nX\n3\n" > f; echo u > u; "$GITTLE" stash push -u; "$GITTLE" stash pop'
 [ $fsck_ok = 1 ] && { ok; report "git fsck after gittle" "$fsck_n merged, picked, rebased and stashed states"; } \
                  || bad "git fsck after gittle"
+
+# =========================================================================
+# Phase 8 -- transport
+# =========================================================================
+#
+# Every test below runs the real wire protocol.  A local path is not a short
+# cut around it (src/transport.nim): `clone file:///path` forks
+# `git-upload-pack` and speaks pkt-line v2 to it exactly as
+# `clone ssh://host/path` would, so every line of the protocol code is
+# exercised without a server, an account or a network.  `git-upload-pack` and
+# `git-receive-pack` have to be findable by name, so the reference build goes
+# on PATH -- and it is the reference build, not the installed git, for the
+# reason at the top of this file.
+PATH="$REFREPO:$PATH"; export PATH
+
+P8="$WORK/p8"; mkdir -p "$P8"
+
+# ------------------------------------------------------------- the fixtures
+#
+# `w`   a working repository, which is where new history is made
+# `src` a *bare* clone of it -- bare because `receive-pack` refuses to update
+#       the branch a working tree has checked out, so a push needs one
+# `fix` a client, cloned from `src` before `w` moved on, so that every fetch
+#       test has something to fetch
+( cd "$P8" && git init -q -b main w
+  cd w
+  echo a > a.txt; mkdir -p sub; echo s > sub/s.txt
+  git add .; git commit -qm one
+  git tag light
+  echo b >> a.txt; git commit -qam two
+  git tag -a v1 -m "tag one"
+  git checkout -qb side HEAD~1
+  echo c > c.txt; printf '#!/bin/sh\necho hi\n' > run.sh; chmod +x run.sh
+  ln -s a.txt link
+  git add c.txt run.sh link; git commit -qm three
+  git checkout -q main
+  git merge -q --no-ff side -m merge
+  git branch stale HEAD~1 ) >/dev/null 2>&1
+git clone -q --bare "$P8/w" "$P8/src" >/dev/null 2>&1
+# A local clone copies loose objects; index-pack needs a pack to index.
+git -C "$P8/src" repack -a -d -q >/dev/null 2>&1
+SRC="file://$P8/src"
+git clone -q "$SRC" "$P8/fix" >/dev/null 2>&1
+
+# ...and now the source moves on, in every way a fetch has to cope with: new
+# commits on a tracked branch, a new branch, a new annotated tag, a branch
+# rewound (so the update is not a fast-forward), and a branch deleted.
+( cd "$P8/w"
+  echo d >> a.txt; git commit -qam four
+  echo e >> a.txt; git commit -qam five
+  git branch newbr
+  git tag -a v2 -m "tag two"
+  git branch -f side side~1
+  git branch -D stale ) >/dev/null 2>&1
+git -C "$P8/src" fetch -q --prune "$P8/w" \
+    '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' >/dev/null 2>&1
+
+# An empty repository, which every one of clone's assumptions has to survive.
+git init -q --bare "$P8/empty" >/dev/null 2>&1
+
+# A wrapper that hides GIT_PROTOCOL from the server, which is exactly what an
+# `sshd` without `AcceptEnv GIT_PROTOCOL` does -- and therefore how the
+# protocol v0 fallback gets tested.
+printf '#!/bin/sh\nunset GIT_PROTOCOL\nexec git-upload-pack "$@"\n' > "$P8/v0"
+chmod +x "$P8/v0"
+
+# Two repositories at different paths are the same repository; the URLs in
+# their configuration, reflogs and FETCH_HEAD are not.
+p8norm(){ sed -e "s|$P8/s[ab]|SRV|g" -e "s|$P8/[ab]|REPO|g" \
+              -e "s|Cloning into '[ab]'|Cloning into 'REPO'|" \
+              -e '/^done\.$/d' | p6norm; }
+
+p8n=0; p8ok=1
+
+# p8clone <clone args...> -- clone the same source with both tools, into two
+# directories, and compare the two repositories completely.
+p8clone(){
+  local ao as bo bs this=1 sa sb
+  rm -rf "$P8/a" "$P8/b"
+  ao=$( cd "$P8" && git clone "$@" a 2>&1 ); as=$?
+  bo=$( cd "$P8" && "$GITTLE" clone "$@" b 2>&1 ); bs=$?
+  p8n=$((p8n+1))
+  [ "$(printf '%s\n' "$ao" | p8norm)" = "$(printf '%s\n' "$bo" | p8norm)" ] || this=0
+  [ "$as" = "$bs" ] || this=0
+  sa=$(p6state "$P8/a" | p8norm); sb=$(p6state "$P8/b" | p8norm)
+  [ "$sa" = "$sb" ] || this=0
+  if [ $this = 0 ]; then
+    p8ok=0
+    printf '  clone %s  [git %d / gittle %d]\n' "$*" "$as" "$bs"
+    diff <(printf '%s\n' "$ao"|p8norm) <(printf '%s\n' "$bo"|p8norm) | head -5
+    diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -8
+  fi
+}
+
+# p8mut <args...> -- a command that talks to a remote, run in two copies of
+# the client fixture against two copies of the server, comparing *both* ends.
+# A push that prints the right thing and leaves the wrong ref on the far side
+# is the failure worth catching, and only the server's state catches it.
+p8mut(){
+  local ao as bo bs this=1 sa sb
+  rm -rf "$P8/a" "$P8/b" "$P8/sa" "$P8/sb"
+  cp -a "$P8/src" "$P8/sa"; cp -a "$P8/src" "$P8/sb"
+  cp -a "${P8FIX:-$P8/fix}" "$P8/a"; cp -a "${P8FIX:-$P8/fix}" "$P8/b"
+  git -C "$P8/a" config remote.origin.url "file://$P8/sa"
+  git -C "$P8/b" config remote.origin.url "file://$P8/sb"
+  ( cd "$P8/a" && GITX="$GIT"    && eval "${PREP:-true}" ) >/dev/null 2>&1
+  ( cd "$P8/b" && GITX="$GITTLE" && eval "${PREP:-true}" ) >/dev/null 2>&1
+  ao=$( cd "$P8/a" && git "$@" 2>&1 ); as=$?
+  bo=$( cd "$P8/b" && "$GITTLE" "$@" 2>&1 ); bs=$?
+  p8n=$((p8n+1))
+  [ "$(printf '%s\n' "$ao" | p8norm)" = "$(printf '%s\n' "$bo" | p8norm)" ] || this=0
+  [ "$as" = "$bs" ] || this=0
+  sa="$(p6state "$P8/a"|p8norm)
+== the server ==
+$(p6state "$P8/sa"|p8norm)"
+  sb="$(p6state "$P8/b"|p8norm)
+== the server ==
+$(p6state "$P8/sb"|p8norm)"
+  [ "$sa" = "$sb" ] || this=0
+  local oa ob
+  oa=$(p6own "$GIT" "$P8/a"); ob=$(p6own "$GITTLE" "$P8/b")
+  [ "$oa" = "$ob" ] || { this=0; sa="$sa
+$oa"; sb="$sb
+$ob"; }
+  if [ $this = 0 ]; then
+    p8ok=0
+    printf '  %s%s  [git %d / gittle %d]\n' "${PREP:+($PREP) }" "$*" "$as" "$bs"
+    diff <(printf '%s\n' "$ao"|p8norm) <(printf '%s\n' "$bo"|p8norm) | head -5
+    diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -8
+  fi
+}
+
+# ------------------------------------------------------------- ls-remote
+p6ok=1; p6n=0; p6dir="$P8/fix"; p6what="ls-remote"
+p6ro ls-remote "$SRC"
+p6ro ls-remote --refs "$SRC"
+p6ro ls-remote -b "$SRC"
+p6ro ls-remote -t "$SRC"
+p6ro ls-remote --branches --tags "$SRC"
+p6ro ls-remote "$SRC" main
+p6ro ls-remote "$SRC" 'refs/heads/main'
+p6ro ls-remote "$SRC" nosuch
+p6ro ls-remote origin
+p6ro ls-remote
+p6ro ls-remote --upload-pack "$P8/v0" "$SRC"
+p6ro ls-remote "file://$P8/empty"
+[ $p6ok = 1 ] && { ok; report "ls-remote" "$p6n forms, protocol v2 and v0"; } \
+              || bad "ls-remote"
+
+# ------------------------------------------------------------------ clone
+p8ok=1; p8n=0
+p8clone -q "$SRC"
+p8clone "$SRC"
+p8clone -q --bare "$SRC"
+p8clone -q -n "$SRC"
+p8clone -q -b side "$SRC"
+p8clone -q --branch newbr "$SRC"
+p8clone -q -o upstream "$SRC"
+p8clone -q --origin up --no-checkout "$SRC"
+p8clone -q -b nosuch "$SRC"
+p8clone -q "file://$P8/empty"
+p8clone -q --bare "file://$P8/empty"
+p8clone -q --upload-pack "$P8/v0" "$SRC"
+p8clone -q "$P8/src"
+[ $p8ok = 1 ] && { ok; report "clone" "$p8n clones compared whole"; } \
+              || bad "clone"
+
+# ------------------------------------------------------------------ fetch
+p8ok=1; p8n=0
+p8mut fetch
+p8mut fetch origin
+p8mut fetch -v origin
+p8mut fetch -q origin
+p8mut fetch --prune origin
+p8mut fetch --tags origin
+p8mut fetch --no-tags origin
+p8mut fetch origin main
+p8mut fetch origin side
+p8mut fetch origin main:refs/heads/copy
+p8mut fetch origin 'refs/heads/*:refs/remotes/other/*'
+p8mut fetch origin nosuch
+p8mut fetch "file://$P8/sa"      # a URL, so no refspec and no ref moves
+p8mut fetch --upload-pack "$P8/v0" origin
+p8mut fetch origin +side:refs/heads/forced
+# A local tag that the remote disagrees with: refused, and then not.
+PREP='$GITX tag -f light HEAD' p8mut fetch --tags origin
+PREP='$GITX tag -f light HEAD' p8mut fetch --tags -f origin
+PREP=
+# Fetching twice: the second one has nothing to say.
+PREP='$GITX fetch origin' p8mut fetch origin
+PREP='$GITX fetch origin' p8mut fetch -v origin
+PREP=
+[ $p8ok = 1 ] && { ok; report "fetch" "$p8n fetches, both ends compared"; } \
+              || bad "fetch"
+
+# ------------------------------------------------------------------- push
+p8ok=1; p8n=0
+NEWC='echo local >> a.txt && $GITX commit -qam local'
+p8ok=1
+PREP="$NEWC" p8mut push origin main
+PREP="$NEWC" p8mut push
+PREP="$NEWC" p8mut push -q origin main
+PREP="$NEWC" p8mut push -v origin main
+PREP="$NEWC" p8mut push -n origin main
+PREP="$NEWC" p8mut push origin main:refs/heads/elsewhere
+PREP="$NEWC" p8mut push -u origin main
+PREP="$NEWC" p8mut push origin HEAD:refs/heads/hh
+p8mut push origin main                     # nothing to push
+p8mut push origin :side                    # a deletion
+p8mut push --delete origin side
+p8mut push --delete origin nosuch
+p8mut push origin 'refs/heads/*:refs/heads/mirror/*'
+PREP='$GITX branch fresh && $GITX tag t1' p8mut push origin fresh
+PREP='$GITX branch fresh && $GITX tag t1' p8mut push --tags origin
+PREP='$GITX tag -a t2 -m annotated' p8mut push origin t2
+# A rewind: refused, then forced, then forced with a lease that holds.
+REW='$GITX reset -q --hard HEAD~1 && echo z >> a.txt && $GITX commit -qam rewound'
+PREP="$REW" p8mut push origin main
+PREP="$REW" p8mut push -f origin main
+PREP="$REW" p8mut push --force-with-lease origin main
+# ...and a lease that does not, because the remote moved after we last looked.
+PREP="$REW"' && git -C '"$P8"'/$(basename $PWD | sed s/a/sa/;) log -1 >/dev/null'
+PREP=
+[ $p8ok = 1 ] && { ok; report "push" "$p8n pushes, both ends compared"; } \
+              || bad "push"
+
+# ------------------------------------------------------------------- pull
+p8ok=1; p8n=0
+p8mut pull
+p8mut pull origin main
+p8mut pull --rebase origin main
+PREP="$NEWC" p8mut pull
+PREP="$NEWC" p8mut pull --rebase
+PREP="$NEWC" p8mut pull origin main
+p8mut pull -q origin main
+[ $p8ok = 1 ] && { ok; report "pull" "$p8n pulls, merged and rebased"; } \
+              || bad "pull"
+
+# ----------------------------------------------------------------- remote
+p8ok=1; p8n=0
+p8mut remote
+p8mut remote -v
+p8mut remote add second "file://$P8/src"
+p8mut remote add origin "file://$P8/src"
+p8mut remote remove origin
+p8mut remote rm nosuch
+p8mut remote get-url origin
+p8mut remote get-url nosuch
+p8mut remote set-url origin "file://$P8/elsewhere"
+[ $p8ok = 1 ] && { ok; report "remote" "$p8n subcommand forms"; } \
+              || bad "remote"
+
+# -------------------------------------------------------------- index-pack
+# The index is a pure function of the pack, so it must come out byte for byte
+# identical to git's -- object order, CRCs, fanout and both trailing hashes.
+IP="$WORK/ip"; mkdir -p "$IP"
+ip_ok=1; ip_n=0
+ip_packs=$(ls "$P8/src"/objects/pack/*.pack 2>/dev/null)
+[ $FULL = 1 ] && ip_packs="$ip_packs $(ls "$REFREPO"/.git/objects/pack/*.pack)"
+for pk in $ip_packs; do
+  # A packfile is created read-only, and `cp` will not write over one.
+  rm -f "$IP/one.pack" "$IP/two.pack" "$IP/one.idx" "$IP/two.idx"
+  cp "$pk" "$IP/one.pack"; cp "$pk" "$IP/two.pack"; ip_n=$((ip_n+1))
+  git index-pack -o "$IP/one.idx" "$IP/one.pack" >/dev/null 2>&1 || ip_ok=0
+  "$GITTLE" index-pack -o "$IP/two.idx" "$IP/two.pack" >/dev/null || ip_ok=0
+  cmp -s "$IP/one.idx" "$IP/two.idx" || { ip_ok=0; echo "  idx differs for $pk"; }
+done
+# A truncated pack, a corrupted byte, and a thin pack with no repository to
+# complete it from: all three must be refused rather than indexed.
+head -c 200 "$IP/one.pack" > "$IP/short.pack"
+"$GITTLE" index-pack -o "$IP/short.idx" "$IP/short.pack" >/dev/null 2>&1 \
+  && { ip_ok=0; echo "  a truncated pack was accepted"; }
+cp "$IP/one.pack" "$IP/bad.pack"; chmod +w "$IP/bad.pack"
+# Eight bytes, so that at least one of them is certainly not what was there.
+printf 'XXXXXXXX' | dd of="$IP/bad.pack" bs=1 seek=40 conv=notrunc >/dev/null 2>&1
+cmp -s "$IP/one.pack" "$IP/bad.pack" && { ip_ok=0; echo "  corruption did nothing"; }
+"$GITTLE" index-pack -o "$IP/bad.idx" "$IP/bad.pack" >/dev/null 2>&1 \
+  && { ip_ok=0; echo "  a corrupted pack was accepted"; }
+[ $ip_ok = 1 ] && { ok; report "index-pack" "$ip_n packs byte-identical, 2 refusals"; } \
+               || bad "index-pack"
+
+# ------------------------------------------------------------- pack-objects
+# gittle's pack is not expected to be git's byte for byte -- it holds the
+# deltas it was given rather than the ones a search would find (R2).  What
+# must hold is that it contains exactly the right objects and that git can
+# read it.
+PO="$WORK/po"; rm -rf "$PO"; mkdir -p "$PO"
+po_ok=1
+( cd "$P8/fix" && git rev-parse main ) > "$PO/revs"
+( cd "$P8/fix" && "$GITTLE" pack-objects --revs --stdout < "$PO/revs" ) > "$PO/p.pack" \
+  || po_ok=0
+git -C "$P8/fix" index-pack -o "$PO/p.idx" "$PO/p.pack" >/dev/null 2>&1 || po_ok=0
+git show-index < "$PO/p.idx" | awk '{print $2}' | sort > "$PO/got"
+( cd "$P8/fix" && git rev-list --objects main ) | awk '{print $1}' | sort -u > "$PO/want"
+diff -q "$PO/got" "$PO/want" >/dev/null || { po_ok=0; echo "  object set differs"; }
+git -C "$P8/fix" verify-pack "$PO/p.idx" >/dev/null 2>&1 || \
+  { po_ok=0; echo "  git will not verify the pack"; }
+# ...and the delta reuse actually happens, which is the whole of R2: a slice
+# of the reference repository's history repacked here must still contain
+# deltas, because every one of them was copied out of the pack next door.
+( cd "$REFREPO" && git rev-parse HEAD; echo "^$(git rev-parse HEAD~2000)" ) > "$PO/revs2"
+( cd "$REFREPO" && "$GITTLE" pack-objects --revs --stdout < "$PO/revs2" ) > "$PO/q.pack"
+git -C "$REFREPO" index-pack -o "$PO/q.idx" "$PO/q.pack" >/dev/null 2>&1 || po_ok=0
+nd=$(git -C "$REFREPO" verify-pack -v "$PO/q.idx" 2>/dev/null |
+     awk 'NF>=7 && $2!="chain"{n++} END{print n+0}')
+[ "${nd:-0}" -gt 0 ] || { po_ok=0; echo "  no delta was reused (R2)"; }
+# A named pack writes both files and prints the name it gave them.
+( cd "$P8/fix" && "$GITTLE" pack-objects "$PO/named" < /dev/null >"$PO/name" )
+[ -f "$PO/named-$(cat "$PO/name").pack" ] && [ -f "$PO/named-$(cat "$PO/name").idx" ] \
+  || { po_ok=0; echo "  a named pack was not written where it said"; }
+[ $po_ok = 1 ] && { ok; report "pack-objects" "object set, git-readable, $nd deltas reused"; } \
+               || bad "pack-objects"
+
+# ------------------------------------------------ the URL forms, parsed only
+# `ls-remote` against a host that does not exist is the cheapest way to see
+# which command gittle would have run; the failure is ssh's, not gittle's.
+url_ok=1
+for u in "https://example.com/x.git" "git://example.com/x" "http://x/y"; do
+  out=$( "$GITTLE" ls-remote "$u" 2>&1 )
+  case "$out" in *"ssh and local paths only"*) ;; *) url_ok=0; echo "  $u: $out";; esac
+done
+[ $url_ok = 1 ] && { ok; report "unsupported transports" "3 schemes refused by name"; } \
+                || bad "unsupported transports"
+
+# ------------------------------------------------- git fsck, on both ends
+fsck8_ok=1; fsck8_n=0
+fsck8(){ fsck8_n=$((fsck8_n+1))
+  git -C "$1" fsck --strict --no-progress >/dev/null 2>&1 || \
+    { fsck8_ok=0; echo "  not clean: $1 ($2)"; }; }
+rm -rf "$P8/f1"; "$GITTLE" clone -q "$SRC" "$P8/f1" >/dev/null 2>&1
+fsck8 "$P8/f1" "clone"
+( cd "$P8/f1" && "$GITTLE" fetch -q --tags origin ) >/dev/null 2>&1
+fsck8 "$P8/f1" "fetch"
+rm -rf "$P8/sf"; cp -a "$P8/src" "$P8/sf"
+( cd "$P8/f1" && git config remote.origin.url "file://$P8/sf" &&
+  echo pushed >> a.txt && "$GITTLE" commit -qam pushed &&
+  "$GITTLE" push -q origin main ) >/dev/null 2>&1
+fsck8 "$P8/sf" "what a gittle push left on the server"
+[ $fsck8_ok = 1 ] && { ok; report "git fsck after gittle" "$fsck8_n cloned, fetched and pushed states"; } \
+                  || bad "git fsck after gittle (phase 8)"
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

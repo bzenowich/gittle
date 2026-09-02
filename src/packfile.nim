@@ -73,6 +73,7 @@ type
     nObjects*: int
     ## Byte offsets of the `.idx` tables, all derived from `nObjects`.
     oidsAt, crcAt, ofsAt, bigOfsAt: int
+    byOffset: Table[int, int]   ## pack offset -> index, built on demand
     baseCache: Table[int, GitObject]
     baseOrder: Deque[int]
     baseBytes: int
@@ -214,23 +215,27 @@ proc contains*(p: Pack, o: Oid): bool = p.find(o) >= 0
 
 # -- pack object headers ----------------------------------------------------
 
-proc readEntry*(p: Pack, offset: int): PackEntry =
+proc readEntryAt*(pack: ptr UncheckedArray[byte], packLen, offset: int,
+                  name: string): PackEntry =
   ## Parse the object header at `offset`.  Does not inflate anything.
-  failIf(offset < packHeaderLen or offset >= p.packLen - trailerLen,
-         "offset " & $offset & " is outside " & p.packPath)
+  ##
+  ## Takes the mapping rather than a `Pack` because `index-pack` has to read
+  ## exactly these headers out of a pack that has no index yet -- that being
+  ## what it is about to write.
+  failIf(offset < packHeaderLen or offset >= packLen - trailerLen,
+         "offset " & $offset & " is outside " & name)
   var at = offset
-  var c = p.pack[at]
+  var c = pack[at]
   inc at
   result.kind = packTypeFromInt(int((c shr 4) and 7))
-  failIf(result.kind == otBad, "bad object type in " & p.packPath &
-                               " at " & $offset)
+  failIf(result.kind == otBad, "bad object type in " & name & " at " & $offset)
   # The size varint: four bits in the first byte (the other four are the type
   # and the continuation flag), then seven per byte, little-endian.
   var size = int(c and 15)
   var shift = 4
   while (c and 0x80) != 0:
-    failIf(at >= p.packLen, "truncated object header in " & p.packPath)
-    c = p.pack[at]
+    failIf(at >= packLen, "truncated object header in " & name)
+    c = pack[at]
     inc at
     size = size or (int(c and 0x7F) shl shift)
     shift += 7
@@ -240,28 +245,37 @@ proc readEntry*(p: Pack, offset: int): PackEntry =
   of otOfsDelta:
     # The relative-offset encoding: 7 bits per byte, but each continuation adds
     # one so that no value has two encodings.  (Same varint as index v4.)
-    var b = p.pack[at]
+    var b = pack[at]
     inc at
     var ofs = int(b and 0x7F)
     while (b and 0x80) != 0:
-      failIf(at >= p.packLen, "truncated ofs-delta base in " & p.packPath)
-      b = p.pack[at]
+      failIf(at >= packLen, "truncated ofs-delta base in " & name)
+      b = pack[at]
       inc at
       ofs = ((ofs + 1) shl 7) or int(b and 0x7F)
     failIf(ofs <= 0 or ofs > offset - packHeaderLen,
-           "ofs-delta base out of range in " & p.packPath)
+           "ofs-delta base out of range in " & name)
     result.baseOffset = offset - ofs
   of otRefDelta:
-    failIf(at + OidLen > p.packLen, "truncated ref-delta base in " & p.packPath)
-    result.baseOid = oidAtRaw(p.pack, at)
+    failIf(at + OidLen > packLen, "truncated ref-delta base in " & name)
+    result.baseOid = oidAtRaw(pack, at)
     at += OidLen
   else:
     discard
   result.dataAt = at
 
+proc inflateEntryAt*(pack: ptr UncheckedArray[byte], packLen: int,
+                     e: PackEntry): tuple[data: string, consumed: int] =
+  ## The object's stored bytes -- the content itself, or the delta -- and how
+  ## many compressed bytes they occupied, which is the only way to find where
+  ## the next object begins.
+  inflateExact(addr pack[e.dataAt], packLen - e.dataAt, e.size)
+
+proc readEntry*(p: Pack, offset: int): PackEntry =
+  readEntryAt(p.pack, p.packLen, offset, p.packPath)
+
 proc inflateEntry(p: Pack, e: PackEntry): string =
-  ## The object's stored bytes: the content itself, or the delta.
-  inflateExact(addr p.pack[e.dataAt], p.packLen - e.dataAt, e.size).data
+  inflateEntryAt(p.pack, p.packLen, e).data
 
 # -- deltas -----------------------------------------------------------------
 
@@ -340,6 +354,38 @@ proc applyDelta*(base, delta: string): string =
   failIf(outPos != resultSize,
          "delta produced " & $outPos & " bytes, header said " & $resultSize)
 
+# -- writing headers --------------------------------------------------------
+#
+# The two encodings `readEntry` decodes, written back out.  They live here,
+# beside the reader that has to agree with them, because a pack whose header
+# is written by one rule and read by another is a repository that cannot be
+# read back.
+
+func packEntryHeader*(kind: ObjectType, size: int): string =
+  ## Type and size: three type bits and the low four size bits in the first
+  ## byte, then seven size bits per byte, little-endian.  `ObjectType`'s
+  ## numbering *is* the pack's, which is why there is no table here.
+  var n = size
+  result.add char((int(kind) shl 4) or (n and 15) or
+                  (if n shr 4 > 0: 0x80 else: 0))
+  n = n shr 4
+  while n > 0:
+    result.add char((n and 0x7F) or (if n shr 7 > 0: 0x80 else: 0))
+    n = n shr 7
+
+func ofsDeltaHeader*(distance: int): string =
+  ## The distance back to an OBJ_OFS_DELTA's base, most significant group
+  ## first, each continuation biased by one so no value has two spellings.
+  var buf: array[16, char]
+  var i = buf.high
+  var n = distance
+  buf[i] = char(n and 0x7F)
+  while (n shr 7) > 0:
+    n = (n shr 7) - 1
+    dec i
+    buf[i] = char(0x80 or (n and 0x7F))
+  for k in i .. buf.high: result.add buf[k]
+
 # -- reading objects --------------------------------------------------------
 
 const
@@ -395,6 +441,38 @@ proc readAt*(p: Pack, offset: int,
   ## Read the object at `offset`, applying any delta chain.  `findExternal`
   ## resolves a ref-delta base that lives outside this pack.
   p.readAtDepth(offset, 0, findExternal)
+
+proc offsetToIndex(p: Pack, offset: int): int =
+  ## Which object in the index lives at this pack offset, or -1.
+  ##
+  ## The pack has no such map -- that is what the `.rev` file git writes is
+  ## for, and R3 says gittle does not read one -- so it is built once, on
+  ## demand, from the index that is already open.  Only `pack-objects` asks,
+  ## and only when it is reusing a delta whose base it must be able to *name*.
+  if p.byOffset.len == 0 and p.nObjects > 0:
+    for i in 0 ..< p.nObjects: p.byOffset[p.offsetAt(i)] = i
+  p.byOffset.getOrDefault(offset, -1)
+
+proc storedDelta*(p: Pack, offset: int): tuple[base: Oid, raw: string] =
+  ## The object at `offset` exactly as it lies in the pack, when it lies there
+  ## as a delta: the base's *name* and the delta's still-compressed bytes.
+  ##
+  ## An empty `raw` means it is not a delta and there is nothing to reuse.
+  ## This is the whole of R2 on the writing side (plan.md §3.1): gittle never
+  ## searches for a delta, it only ever passes on one somebody else already
+  ## found.
+  let e = p.readEntry(offset)
+  if not e.kind.isDelta: return
+  case e.kind
+  of otOfsDelta:
+    let i = p.offsetToIndex(e.baseOffset)
+    if i < 0: return
+    result.base = p.oidAt(i)
+  of otRefDelta: result.base = e.baseOid
+  else: discard
+  let n = inflateEntryAt(p.pack, p.packLen, e).consumed
+  result.raw = newString(n)
+  if n > 0: copyMem(addr result.raw[0], addr p.pack[e.dataAt], n)
 
 proc typeAndSizeAt*(p: Pack, offset: int,
                     findExternal: proc (o: Oid): GitObject {.closure.} = nil):
