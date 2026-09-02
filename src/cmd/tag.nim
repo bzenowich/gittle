@@ -20,8 +20,8 @@
 ##                           (blank line)
 ##     <message>
 ##
-## Listing is `for-each-ref` over `refs/tags/` -- `reffilter.nim` -- printing
-## names, and nothing else.  The selection and formatting options `tag` once
+## Listing is `for-each-ref` over `refs/tags/` -- `collectRefs` in
+## `cmd/foreachref.nim` -- printing names, and nothing else.  The selection and formatting options `tag` once
 ## shared with `branch` (`--contains`, `--merged`, `--points-at`, `--sort`,
 ## `--format`) and the `-n<num>` annotation listing were trimmed in the
 ## minimisation pass (docs/minimize.md §3): a survey of use found `tag -l`
@@ -31,8 +31,9 @@
 ## every other command: `-n2` was the one spelling that was not a cluster.
 
 import std/strutils
-import ../cli, ../commitobj, ../ident, ../objects, ../oid, ../reffilter,
+import ../cli, ../commitobj, ../ident, ../objects, ../oid,
        ../refname, ../refs, ../repository, ../revision, ../util
+import foreachref
 
 const tagsPrefix = refsPrefix & "tags/"
 

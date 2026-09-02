@@ -3,7 +3,11 @@
 ## A branch is a file in `refs/heads/` holding one object ID.  Everything
 ## below is bookkeeping around that fact, and the listing is a `for-each-ref`
 ## with a format built for it -- which is literally how git does it
-## (`builtin/branch.c:build_format`), and why `reffilter.nim` exists.
+## (`builtin/branch.c:build_format`).  git builds that format as a string and
+## runs it through `ref-filter.c`; gittle no longer has an atom grammar to run
+## it through (docs/minimize-2.md B5), so `listBranches` renders its own
+## columns and borrows only the *selection* -- `collectRefs` and `RefFilter`,
+## in `cmd/foreachref.nim`.
 ##
 ## ## The three things a branch is, besides a ref
 ##
@@ -31,10 +35,12 @@
 ## §3): a survey of use found none of them, and `for-each-ref refs/heads`
 ## answers the first five.  Each refuses by name rather than being ignored.
 ## `--contains`, `--merged`, `-vv` and `--show-current` -- everything the
-## survey did find -- stay.
+## survey did find -- stay.  The second pass then took the engine out from
+## under `--contains` and `--merged`: they are two `isAncestor` calls now, not
+## a memoised reachability cache (docs/minimize-2.md B5).
 
 import std/[os, strutils]
-import ../cli, ../config, ../reffilter, ../refname, ../refs,
+import ../cli, ../commitobj, ../config, ../refname, ../refs,
        ../repository, ../revision, ../revwalk, ../sequencer, ../util,
        ../worktrees
 import foreachref
@@ -102,6 +108,17 @@ proc trackText(repo: Repository, refName: string, brackets: bool): string =
               else: "ahead " & $ahead & ", behind " & $behind
   if brackets: "[" & inner & "]" else: inner
 
+proc tipSubject(repo: Repository, o: Oid): string =
+  ## The first paragraph of the commit's message, folded onto one line: the
+  ## last column of `branch -v`.  git asks `ref-filter.c` for
+  ## `%(contents:subject)`; a branch always names a commit, so there is no tag
+  ## to peel here and no atom grammar to go through.
+  ##
+  ## The signature is stripped first because a signed commit keeps it inside
+  ## the message (`gpg-interface.c:parse_signed_buffer`), and a subject that
+  ## began with a line of base64 would be worse than useless.
+  subject(stripSignature(repo.readCommit(o).message))
+
 proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
                   verbose: int): int =
   ## `kinds` is which namespaces to list: 0 local, 1 remote-tracking.
@@ -113,7 +130,8 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
   # so that `origin/main` cannot be mistaken for a local branch of that name.
   let remotePrefix = if kinds == {1}: "" else: "remotes/"
 
-  var rows = repo.collectRefs(prefixes, f)
+  let headBranch = repo.headRefName
+  let rows = repo.collectRefs(prefixes, f)
 
   proc shownName(r: RefRow): string =
     ## The name as the listing shows it: `main`, or `remotes/origin/main` when
@@ -143,43 +161,44 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
   var width = detached.len
   for r in rows: width = max(width, shownName(r).len)
 
-  proc line(mark, name: string, r: RefRow, symTarget: string): string =
+  proc line(mark, name: string, oid: Oid, refName, symTarget: string): string =
     ## One listing row: the mark, the padded name, and under `-v` the tip,
-    ## the upstream state and the subject.
+    ## the upstream state and the subject.  `refName` is empty for the
+    ## detached-HEAD row below, which is not a ref: it has no worktree of its
+    ## own to name and no upstream to compare against.
     result = mark & (if verbose > 0: name.alignLeft(width) else: name)
     if symTarget.len > 0:
       # A symbolic ref -- `origin/HEAD` -- names another ref, and that is all
       # there is to say about it: no object ID, no subject.
       return result & " -> " & repo.refs.shortenRef(symTarget)
     if verbose == 0: return
-    var row = r
-    result.add " " & repo.uniqueAbbrev(row.self.oid, repo.autoAbbrev) & " "
+    result.add " " & repo.uniqueAbbrev(oid, repo.autoAbbrev) & " "
     # `-vv` names the other worktree a branch is checked out in, just after
     # the object ID: it is the reason `+` was printed and the reason a
     # `checkout` of it will be refused.
-    if verbose > 1 and not row.isHead:
-      let wtPath = repo.checkedOutAt(row.rf.name)
+    if verbose > 1 and refName.len > 0 and refName != headBranch:
+      let wtPath = repo.checkedOutAt(refName)
       if wtPath.len > 0: result.add "(" & wtPath & ") "
-    if verbose > 1 and repo.upstreamRef(row.rf.name).len > 0:
-      let up = repo.refs.shortenRef(repo.upstreamRef(row.rf.name))
-      let t = trackText(repo, row.rf.name, brackets = false)
-      result.add "[" & up & (if t.len > 0: ": " & t else: "") & "] "
-    elif verbose == 1:
-      let t = trackText(repo, row.rf.name, brackets = true)
+    let up = if refName.len > 0: repo.upstreamRef(refName) else: ""
+    if verbose > 1 and up.len > 0:
+      let t = trackText(repo, refName, brackets = false)
+      result.add "[" & repo.refs.shortenRef(up) &
+                 (if t.len > 0: ": " & t else: "") & "] "
+    elif verbose == 1 and refName.len > 0:
+      let t = trackText(repo, refName, brackets = true)
       if t.len > 0: result.add t & " "
-    result.add repo.fieldValue(row, "contents:subject")
+    result.add tipSubject(repo, oid)
 
   if detached.len > 0:
-    echo line("* ", detached, RefRow(self: ObjInfo(
-                oid: repo.refs.resolveRef(headRef).oid)), "")
-  for i in 0 ..< rows.len:
+    echo line("* ", detached, repo.refs.resolveRef(headRef).oid, "", "")
+  for r in rows:
     # `+` marks a branch some *other* worktree has checked out, which is a
     # branch this one may not move (worktrees.nim).  git spells the same rule
     # as `%(if)%(HEAD)%(then)*%(else)%(if)%(worktreepath)%(then)+`.
-    let mark = if rows[i].isHead: "* "
-               elif repo.checkedOutAt(rows[i].rf.name).len > 0: "+ "
+    let mark = if r.rf.name == headBranch: "* "
+               elif repo.checkedOutAt(r.rf.name).len > 0: "+ "
                else: "  "
-    echo line(mark, shownName(rows[i]), rows[i], rows[i].rf.symTarget)
+    echo line(mark, shownName(r), r.oid, r.rf.name, r.rf.symTarget)
   0
 
 # ---------------------------------------------------------------------------

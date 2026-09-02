@@ -470,22 +470,34 @@ done
 
 # ------------------------------------------------------------- for-each-ref
 fer_ok=1
-for a in "" "--sort=-refname" "--sort=objecttype --sort=refname" "--count=2" \
+for a in "" "--count=2" \
          "refs/heads" "refs/tags" "refs/heads/*" "refs/*/side"; do
   diff <(git -C "$REFS" for-each-ref $a) <("$GITTLE" -C "$REFS" for-each-ref $a) \
     >/dev/null || { fer_ok=0; echo "  for-each-ref $a differs"; }
 done
-for f in '%(refname)' '%(refname:short)' '%(refname:lstrip=2)' \
-         '%(refname:rstrip=1)' '%(objectname)' '%(objectname:short)' \
-         '%(objectname:short=12)' '%(objecttype)' '%(objectsize)' \
-         '%(HEAD)%(refname)' '%(symref)' '%(upstream)' \
-         '%(*objectname)' '%(*objecttype)' '%(*objectsize)' \
-         'x%%y%09z' '%(refname)|%(objecttype)|%(objectsize)'; do
+for f in '%(refname)' '%(refname:short)' '%(objectname)' '%(objecttype)' \
+         '%(upstream)' 'x%%y%09z' '%(refname)|%(objecttype)'; do
   diff <(git -C "$REFS" for-each-ref --format="$f") \
        <("$GITTLE" -C "$REFS" for-each-ref --format="$f") >/dev/null \
     || { fer_ok=0; echo "  --format=$f differs"; }
 done
-[ $fer_ok = 1 ] && { ok; report "for-each-ref" "8 option sets, 17 formats"; } \
+# The atom grammar and --sort went with reffilter.nim (docs/minimize-2.md B5).
+# What is asserted of a cut spelling is that it refuses and names itself: an
+# ignored --sort would silently hand back a differently ordered list, and an
+# ignored atom would silently print nothing where a value was expected.
+nfer_ref=0
+for x in "--sort=-refname" "--format=%(refname:lstrip=2)" \
+         "--format=%(objectname:short)" "--format=%(objectsize)" \
+         "--format=%(HEAD)" "--format=%(symref)" "--format=%(*objectname)" \
+         "--format=%(subject)" "--format=%(contents)" \
+         "--format=%(committerdate)"; do
+  nfer_ref=$((nfer_ref+1))
+  "$GITTLE" -C "$REFS" for-each-ref "$x" >/dev/null 2>"$WORK/fer.e" \
+    && { fer_ok=0; echo "  for-each-ref $x was accepted"; }
+  grep -q "out of scope" "$WORK/fer.e" \
+    || { fer_ok=0; echo "  for-each-ref $x: no refusal"; }
+done
+[ $fer_ok = 1 ] && { ok; report "for-each-ref" "6 option sets, 7 formats, $nfer_ref refusals"; } \
                 || bad "for-each-ref"
 
 # Refs packed by git must read back exactly the same as loose ones.
@@ -1921,21 +1933,22 @@ fanwait
 # ---------------------------------------------------------- for-each-ref
 p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="for-each-ref"
 fanstart
-for f in '%(refname)' '%(refname:short)' '%(objectname)' '%(objectname:short)' \
-         '%(objectname:short=12)' '%(objecttype)' '%(subject)' '%(contents)' \
-         '%(contents:subject)' '%(contents:body)' '%(contents:lines=1)' \
-         '%(contents:lines=3)' '%(*objectname)' '%(HEAD)%(refname)' \
+for f in '%(refname)' '%(refname:short)' '%(objectname)' '%(objecttype)' \
          '%(upstream) %(upstream:short)'; do
   fanjob ro1 for-each-ref --format="$f" refs/tags
 done
 fanjob ro1 for-each-ref refs/heads
 fanjob ro1 for-each-ref 'refs/tags/v2.3*'
 fanjob ro1 for-each-ref --count=5
-fanjob ro1 for-each-ref --sort=objectname
-fanjob ro1 for-each-ref --sort=-refname
-# The four ancestry filters ask one reachability question per ref, and there
-# are 800 tags: over a glob they ask 30 and test the same four answers.
-FT=refs/tags/v2.3; [ $FULL = 1 ] && FT=refs/tags
+# The four ancestry filters, over every tag in the repository -- 1,008 of them.
+# `refs/tags/v2.3` stood here and matches *nothing*: no trailing `*`, and a
+# path prefix has to end at a `/`, so these four checks asserted nothing at all
+# until now.  Every tag is affordable because both directions are amortised
+# across the whole listing -- `--merged` is one `ancestry` walk, `--contains`
+# one memo of what cannot reach the target (cmd/foreachref.nim) -- so gittle
+# answers all four in about 2s together.  The time this block costs is now
+# almost entirely git's own.
+FT=refs/tags
 fanjob ro1 for-each-ref --contains v2.30.0 "$FT"
 fanjob ro1 for-each-ref --no-contains v2.30.0 "$FT"
 fanjob ro1 for-each-ref --merged v2.31.0 "$FT"
