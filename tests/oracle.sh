@@ -51,6 +51,12 @@ export GIT_AUTHOR_DATE GIT_COMMITTER_DATE
 # -- has to turn it off or it is comparing that, and nothing else.
 NOMAILMAP=--no-use-mailmap
 
+# "Now" is pinned.  `--date=relative` renders "5 months ago", and two programs
+# run a second apart eventually land on opposite sides of a boundary -- which
+# makes the comparison a comparison of when they ran rather than of what they
+# print.  git reads `GIT_TEST_DATE_NOW` (`date.c:get_time`) and so does gittle.
+GIT_TEST_DATE_NOW=1800000000; export GIT_TEST_DATE_NOW
+
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 

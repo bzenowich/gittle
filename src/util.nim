@@ -10,7 +10,7 @@
 ## in the error text itself -- see the repository extension gate for the shape
 ## that takes.
 
-import std/[os, posix, strutils]
+import std/[os, posix, strutils, times]
 
 type
   GittleError* = object of CatchableError
@@ -120,6 +120,20 @@ proc interpolate*(format: string, atom: proc (name: string): string): string =
         v = v * 16 + d
       result.add char(v)
       i += 3
+
+proc dateNow*(): int64 =
+  ## "Now", for every relative and human date gittle prints.
+  ##
+  ## `GIT_TEST_DATE_NOW` overrides it, which is git's own facility
+  ## (`date.c:get_time`) and exists for exactly one reason: a comparison of
+  ## `--date=relative` between two programs run a second apart is a
+  ## comparison of *when they ran*.  One of them eventually lands on the far
+  ## side of a "5 months ago"/"6 months ago" boundary and the test fails for
+  ## no reason at all.
+  let x = getEnv("GIT_TEST_DATE_NOW")
+  if x.len > 0:
+    try: return int64(parseInt(x.strip())) except ValueError: discard
+  getTime().toUnix()
 
 proc readWholeFile*(path: string): string =
   ## Like `readFile`, but reports the path when it fails.

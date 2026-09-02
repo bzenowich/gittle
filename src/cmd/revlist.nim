@@ -22,7 +22,7 @@
 ## fetch: `rev-list --objects HEAD ^origin/main` is exactly the set of objects
 ## the other side is missing.
 
-import std/[sets, strutils, times]
+import std/[sets, strutils]
 import ../cli, ../objects, ../oid, ../pretty, ../repository, ../revision,
        ../revwalk, ../util
 
@@ -53,7 +53,7 @@ proc cmdRevList*(c: Ctx, args: seq[string]): int =
   let repo = c.repo
   let w = newRevWalk(repo)
   var ri = initRevInput()
-  var opts = PrettyOpts(now: getTime().toUnix())
+  var opts = PrettyOpts(now: dateNow())
   var pretty = false
   var showParents = false
   var abbrevLen = 0

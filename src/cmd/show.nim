@@ -20,7 +20,7 @@
 ## Note the tree header: git echoes **the name you asked with**, not the object
 ## ID, so `show HEAD:Documentation` says `tree HEAD:Documentation`.
 
-import std/[strutils, times]
+import std/strutils
 import ../cli, ../commitobj, ../diffcore, ../ident, ../pathspec, ../pretty,
        ../repository, ../revision, ../util
 
@@ -60,7 +60,7 @@ proc showTag(repo: Repository, o: Oid, obj: GitObject, opts: PrettyOpts) =
   if blank >= 0: stdout.write obj.data[blank + 2 .. ^1]
 
 proc cmdShow*(c: Ctx, args: seq[string]): int =
-  var opts = PrettyOpts(kind: pkMedium, now: getTime().toUnix())
+  var opts = PrettyOpts(kind: pkMedium, now: dateNow())
   var dopts = defaultDiffOpts()
   var abbrevLen = 0
   var names: seq[string]

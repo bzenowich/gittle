@@ -219,11 +219,16 @@ algorithm and eight were in agreeing with git.**
    submodule (`entry.c:write_entry`, `case S_IFGITLINK`); without it the very
    first `status` after a clone reports the submodule as deleted. Cloning
    the reference repository, which has one, is what showed it.
-9. And one in the *test*: a packfile is created read-only, so the `dd` that
-   was supposed to corrupt one for the "this must be refused" check silently
-   did nothing and the check passed for the wrong reason. It now compares the
-   file with the original first. A test that passes because nothing happened
-   is the failure mode worth naming.
+9. And two in the *tests themselves*. A packfile is created read-only, so
+   the `dd` that was supposed to corrupt one for the "this must be refused"
+   check silently did nothing and the check passed for the wrong reason; it
+   now compares the file with the original first. And the `--date=relative`
+   comparison was a comparison of *when the two programs ran* — one of them
+   eventually lands on the far side of a "5 months ago" boundary — so "now"
+   is pinned with `GIT_TEST_DATE_NOW`, which git already honours
+   (`date.c:get_time`) and gittle now does too. A test that passes because
+   nothing happened, and a test that fails for no reason, are the two failure
+   modes worth naming.
 
 ## Results
 
@@ -324,12 +329,12 @@ wire protocol v2 over ssh                      700      402   pktline 84 + trans
 pack write + delta reuse                       500      327   packwrite 54 + indexpack 273
 refspecs and the fetch engine                  ---      382   refspec 47 + remotes 335
 the phase's 8 commands                         ---      860   clone, fetch, pull, push, remote, ls-remote, index-pack, pack-objects
-everything else (14 files touched)             ---      118   revwalk +46, packfile +41, the driver +19, rev-list -20, worktree +6, and nine one-liners
+everything else (18 files touched)             ---      123   revwalk +46, packfile +41, the driver +19, rev-list -20, worktree +6, util +11, and a dozen one-liners
                                                     -------
-phase 8                                                2,089
+phase 8                                                2,094
 ```
 
-Total: **12,847 lines of code** (20,488 including comments), against the
+Total: **12,852 lines of code** (20,502 including comments), against the
 ~13,000 [plan.md](plan.md) §5.2 projects for v1 with phase 10 still to build.
 The static binary is 3.3 MB.
 

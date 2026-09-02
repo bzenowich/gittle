@@ -24,7 +24,7 @@
 ## otherwise it is an error naming both possibilities.  `--` settles it, which
 ## is why scripts should use it and why the error message says so.
 
-import std/[strutils, times]
+import std/strutils
 import ../cli, ../commitobj, ../diffcore, ../ident, ../oid, ../pretty,
        ../regex, ../repository, ../revision, ../revwalk, ../util
 
@@ -112,7 +112,7 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
   let repo = c.repo
   let w = newRevWalk(repo)
   var ri = initRevInput()
-  var opts = PrettyOpts(kind: pkMedium, now: getTime().toUnix())
+  var opts = PrettyOpts(kind: pkMedium, now: dateNow())
   var decorateMode = "auto"
   var abbrevLen = 0
   var dopts = defaultDiffOpts()
