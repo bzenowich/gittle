@@ -1118,8 +1118,8 @@ for f in "" "--oneline" "--pretty=oneline" "--pretty=raw" "--pretty=full" \
          "--pretty=fuller" "--date=iso8601" "--date=iso8601-strict" \
          "--date=rfc2822" "--date=short" "--date=raw" "--date=unix" \
          "--date=local" "--date=iso-local" \
-         "--parents" "--abbrev-commit" "--abbrev=12" \
-         "--abbrev=12 --abbrev-commit" "--reverse" "--skip=7" \
+         "--parents" "--abbrev=12" \
+         "--reverse" "--skip=7" \
          "--first-parent" "--no-walk" "--format=%B" "--format=%b" \
          "--format=%s" "--format=%H" \
          "--pretty=format:%h|%p|%T|%t|%ci|%an|%ae|%ad" \
@@ -1183,9 +1183,17 @@ ndef=0
 for o in --graph --follow --full-diff --min-parents=1 --max-parents=1 \
          --ancestry-path --cherry-pick --boundary --simplify-merges --objects \
          --walk-reflogs --children --source \
-         -M -C --patience --histogram --word-diff --summary; do
+         -M -C --patience --histogram --word-diff --summary \
+         --color --no-color --shortstat --full-index --no-prefix -a --text \
+         -R -b --ignore-space-change --ignore-space-at-eol \
+         --abbrev-commit --no-abbrev-commit --all-match --invert-grep; do
   ndef=$((ndef+1))
-  "$GITTLE" -C "$REFREPO" log -1 "$o" >/dev/null 2>&1 && { def_ok=0; echo "  $o was accepted"; }
+  "$GITTLE" -C "$REFREPO" log -1 "$o" >/dev/null 2>"$WORK/def.e" \
+    && { def_ok=0; echo "  $o was accepted"; }
+  # Refusing is half of it: the message has to name the option, or the user
+  # cannot tell which of several flags was the one that was not understood.
+  grep -q -- "${o%%=*}" "$WORK/def.e" \
+    || { def_ok=0; printf '  %s: refusal does not name it: %s\n' "$o" "$(head -1 "$WORK/def.e")"; }
 done
 [ $def_ok = 1 ] && { ok; report "log deferrals" "$ndef out-of-scope options refuse by name"; } \
                || bad "log deferrals"
@@ -1258,9 +1266,9 @@ for c in $(git -C "$REFREPO" rev-list --no-merges -n $PAIRN HEAD); do
     git -C "$REFREPO" cat-file blob "$c^:$f" > "$ENG/a" 2>/dev/null || continue
     git -C "$REFREPO" cat-file blob "$c:$f"  > "$ENG/b" 2>/dev/null || continue
     npair=$((npair+1))
-    case $((npair % 7)) in
+    case $((npair % 5)) in
       0) fl="";;  1) fl="-U0";; 2) fl="-U10";; 3) fl="-w";;
-      4) fl="-b";; 5) fl="--ignore-space-at-eol";; 6) fl="-U1";;
+      4) fl="-U1";;
     esac
     # `-U<n>` implies `-p` in both tools, so the counts are taken without it.
     case $fl in -U*) nfl="";; *) nfl=$fl;; esac
@@ -1292,15 +1300,15 @@ git init -q "$DR"
   && chmod +x sub/c.txt )
 
 diff_ok=1; ndiff=0
-for f in "" "--raw" "--stat" "--numstat" "--shortstat" "--name-only" \
+for f in "" "--raw" "--stat" "--numstat" "--name-only" \
          "--name-status" "--cached" "--cached --raw" "--cached --stat" \
          "HEAD" "HEAD --raw" "HEAD --stat" "HEAD --name-status" \
-         "-U0" "-U1" "-U10" "-R" "-R --raw" "--full-index" "--no-prefix" \
-         "--abbrev=12" "--abbrev=12 --raw" "-w" "-b" "--ignore-space-at-eol" \
-         "--ignore-cr-at-eol" "-a" "--diff-filter=D" "--diff-filter=A" \
+         "-U0" "-U1" "-U10" \
+         "--abbrev=12" "--abbrev=12 --raw" "-w" \
+         "--ignore-cr-at-eol" "--diff-filter=D" "--diff-filter=A" \
          "--diff-filter=M" "--diff-filter=T" "-S four" "-S nothing" \
          "--stat -p" "--numstat --name-only" "--name-only --numstat" \
-         "--raw --name-only" "--raw --name-status" "--color" "-s" \
+         "--raw --name-only" "--raw --name-status" "-s" \
          "-s -p" "-p -s" "-s --stat" "--stat -s" "-s --raw" "--raw -s" \
          "-- a.txt" "-- sub" "HEAD -- a.txt" "--cached -- d.txt"; do
   ndiff=$((ndiff+1))
@@ -1348,10 +1356,10 @@ diff <(git diff --no-index --minimal "$WORK/p5.n1" "$WORK/p5.n2" 2>&1) \
 LOGD=60
 [ $FULL = 1 ] && LOGD=400
 ld_ok=1; nld=0
-for f in "-p" "--stat" "--numstat" "--shortstat" "--raw" "--name-only" \
+for f in "-p" "--stat" "--numstat" "--raw" "--name-only" \
          "--name-status" "-p --stat" "-p --oneline" "--stat --oneline" \
          "-p --format=%s" "-p --format=format:%s" "-p -U1" "-p -w" \
-         "-p --full-index" "--stat --format=full" "--numstat -z" \
+         "--stat --format=full" "--numstat -z" \
          "-p --abbrev=12"; do
   nld=$((nld+1))
   # A patch's hunks may sit elsewhere than git's (docs/minimize.md §5, the
@@ -1367,7 +1375,7 @@ SHOWOBJ="HEAD $(git -C "$REFREPO" rev-parse HEAD~3) \
          $(git -C "$REFREPO" rev-list --max-parents=0 HEAD | tail -1) \
          v2.50.0 v1.0rc1"
 for f in "" "-s" "--stat" "--numstat" "-p --stat" "--oneline" "--name-status" \
-         "--raw" "-U1" "--shortstat" "--name-only" "--format=raw" \
+         "--raw" "-U1" "--name-only" "--format=raw" \
          "--format=full" "--format=fuller" "--format=%s"; do
   for obj in $SHOWOBJ; do
     nld=$((nld+1))
@@ -1384,9 +1392,10 @@ done
 # --------------------------------------------- log's limiting patterns
 # --grep, --author and --committer, and how they combine.  Measured against
 # git rather than read off the manual: different kinds AND, repeats of one
-# kind OR, and --all-match turns the message group into an AND too.
+# kind OR.  `--all-match` and `--invert-grep` were cut (docs/minimize-2.md
+# §B4) and are asserted in the deferral list instead.
 lim_ok=1; nlim=0
-# The AND/OR/--all-match/-i/-F semantics are settled within the first
+# The AND/OR/-i/-F semantics are settled within the first
 # thousand commit messages; the depth only multiplies the walk.
 LIMN=1000
 [ $FULL = 1 ] && LIMN=20000
@@ -1396,8 +1405,7 @@ lim_one(){  # one pattern combination, both tools
     || echo "  log $* differs"
 }
 fanstart
-for f in "--grep=pack" "--grep=pack --grep=ref" "--grep=pack --grep=ref --all-match" \
-         "--grep=pack --invert-grep" "--author=Junio" "--committer=Junio" \
+for f in "--grep=pack" "--grep=pack --grep=ref" "--author=Junio" "--committer=Junio" \
          "--author=Junio --grep=pack" "--author=Junio --committer=Taylor" \
          "--grep=PACK -i" "--grep=pack -F" "--grep=p.ck" "--author=gitster@pobox.com"; do
   nlim=$((nlim+1))
@@ -1912,7 +1920,7 @@ fanstart
 for a in "-n $RN HEAD" "-n $RN --topo-order HEAD" "-n $RN --date-order HEAD" \
          "-n $RN --first-parent HEAD" "-n $RN --merges HEAD" \
          "-n $RN --no-merges HEAD" "-n 50 --parents HEAD" \
-         "-n 50 --parents --abbrev-commit HEAD" "HEAD~50..HEAD" \
+         "HEAD~50..HEAD" \
          "HEAD~50...HEAD~20" "--left-right HEAD~50...HEAD~20" \
          "-n 100 --reverse HEAD" "--no-walk HEAD HEAD~5 HEAD~2" \
          "--no-walk=unsorted HEAD HEAD~5 HEAD~2" "-n 100 HEAD -- Makefile" \
@@ -1922,7 +1930,7 @@ for a in "-n $RN HEAD" "-n $RN --topo-order HEAD" "-n $RN --date-order HEAD" \
          "HEAD~3^!" "HEAD~3^@" "-n 5 --oneline HEAD" "-n 3 --pretty=medium HEAD" \
          "-n 3 --pretty=raw HEAD" "-n 3 --pretty=fuller HEAD" \
          "-n 3 --pretty=oneline HEAD" "-n 5 --format=%h HEAD" \
-         "-n 5 --format=%h --abbrev-commit HEAD" "--count v2.30.0..v2.31.0" \
+         "--count v2.30.0..v2.31.0" \
          "--left-right --count v2.30.0...v2.31.0" \
          "-n 200 --since=2024-01-01 HEAD" "-n 200 --until=2020-01-01 HEAD" \
          "-n 60 --topo-order $RP -- t/" "--count --all"; do

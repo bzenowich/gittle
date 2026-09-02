@@ -35,23 +35,17 @@ type Limiters = object
   ## Measured against git rather than read off the manual (R8): patterns of
   ## **different kinds are AND-ed** -- `--author=A --committer=B` selects
   ## commits matching both, and matches nothing when nobody is both -- while
-  ## repeated patterns of the *same* kind are OR-ed, unless `--all-match`
-  ## turns the message group into an AND as well.  `--invert-grep` inverts the
-  ## message group only, and leaves the identity groups alone.
+  ## repeated patterns of the *same* kind are OR-ed.  git's two switches over
+  ## that rule, `--all-match` (AND the message group too) and `--invert-grep`,
+  ## are cut: neither occurs in the tool-call logs of docs/minimize.md §2.2,
+  ## and both refuse by name (docs/minimize-2.md §B4).
   grep, author, committer: seq[Regex]
-  allMatch, invertGrep: bool
 
 proc anyMatch(pats: seq[Regex], s: string): bool =
   ## Does any pattern match?
   for p in pats:
     if p.matches(s): return true
   false
-
-proc allMatchOf(pats: seq[Regex], s: string): bool =
-  ## Do all patterns match? (`--all-match`)
-  for p in pats:
-    if not p.matches(s): return false
-  true
 
 proc selects(l: Limiters, c: Commit): bool =
   ## The identity a pattern is matched against is `Name <email>`, which is the
@@ -62,10 +56,7 @@ proc selects(l: Limiters, c: Commit): bool =
   if l.committer.len > 0 and
      not anyMatch(l.committer, c.committer.name & " <" & c.committer.email & ">"):
     return false
-  if l.grep.len > 0:
-    let hit = if l.allMatch: allMatchOf(l.grep, c.message)
-              else: anyMatch(l.grep, c.message)
-    if hit == l.invertGrep: return false
+  if l.grep.len > 0 and not anyMatch(l.grep, c.message): return false
   true
 
 const
@@ -73,8 +64,8 @@ const
   options = [
     opt("--full-diff|--follow|--graph|--min-parents|--max-parents|--ancestry-path|--cherry-pick|--cherry-mark|--boundary|--simplify-by-decoration|--simplify-merges|--objects|--walk-reflogs|--author-date-order|--children|--source", okRefused, help = "docs/04, docs/07"),
     opt("--oneline", help = "one line per commit: abbreviated ID and subject"),
-    opt("--abbrev-commit", help = "abbreviate the commit ID"),
-    opt("--no-abbrev-commit"),
+    opt("--abbrev-commit|--no-abbrev-commit|--all-match|--invert-grep",
+        okRefused, help = "docs/minimize-2.md §B4"),
     opt("--relative-date", okRefused, help = "docs/minimize.md §3"),
     opt("--decorate", okOptValue, arg = "[=short|no|auto]", help = "show the refs at each commit"),
     opt("--no-decorate"),
@@ -90,8 +81,6 @@ const
     opt("-E|--extended-regexp", help = "POSIX ERE, which is what gittle always uses (plan.md 6.4)"),
     opt("-G|--basic-regexp|-P|--perl-regexp", okRefused,
         help = "patterns are POSIX extended regular expressions, always (docs/07)"),
-    opt("--all-match", help = "every --grep must match, not any"),
-    opt("--invert-grep", help = "commits whose message does not match"),
   ]
 
 proc cmdLog*(c: Ctx, args: seq[string]): int =
@@ -121,8 +110,6 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
       case k
       of "parents": opts.showParents = true
       of "oneline": (opts.kind = pkOneline; opts.abbrevCommit = true)
-      of "abbrev-commit": opts.abbrevCommit = true
-      of "no-abbrev-commit": opts.abbrevCommit = false
       of "no-decorate": decorateMode = "no"
       of "decorate": decorateMode = if v.len == 0: "short" else: v
       of "abbrev": abbrevLen = parseInt(v)
@@ -133,8 +120,6 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
       of "committer": committers.add v
       of "regexp-ignore-case": icase = true
       of "fixed-strings": fixed = true
-      of "all-match": lim.allMatch = true
-      of "invert-grep": lim.invertGrep = true
       else: discard
   for g in greps: lim.grep.add compileRegex(g, icase, fixed)
   for g in authors: lim.author.add compileRegex(g, icase, fixed)

@@ -31,8 +31,8 @@ const
   synopsis = "[<options>] <commit>… [[--] <path>…]"
   options = [
     opt("--oneline", help = "one line per commit: abbreviated ID and subject"),
-    opt("--abbrev-commit", help = "abbreviate the commit ID"),
-    opt("--no-abbrev-commit"),
+    opt("--abbrev-commit|--no-abbrev-commit", okRefused,
+        help = "docs/minimize-2.md §B4"),
     opt("--abbrev", okValue, arg = "<n>", help = "abbreviate object IDs to <n> digits"),
     opt("--date", okValue, arg = "<format>", help = "the date format"),
     opt("--pretty|--format", okOptValue, key = "format", arg = "[=<format>]",
@@ -61,8 +61,6 @@ proc cmdRevList*(c: Ctx, args: seq[string]): int =
       case k
       of "parents": showParents = true
       of "oneline": (pretty = true; opts.kind = pkOneline; opts.abbrevCommit = true)
-      of "abbrev-commit": opts.abbrevCommit = true
-      of "no-abbrev-commit": opts.abbrevCommit = false
       of "abbrev": abbrevLen = parseInt(v)
       of "date": opts.dateMode = parseDateMode(v)
       of "format": (pretty = true; parsePretty(v, opts))

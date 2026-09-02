@@ -39,28 +39,33 @@
 ## **Combined diffs for merge commits** (`-c`, `--cc`).  docs/03 cuts the whole
 ## family; `log`/`show` print a merge commit with no diff at all, which is what
 ## `--diff-merges=off` does and what git did by default before 1.5.
+##
+## **The display side of the option surface** (docs/minimize-2.md §B4).  `-R`,
+## `-a`/`--text`, `--full-index`, `--no-prefix`, `--shortstat`, `--color` and
+## the two middle whitespace modes (`-b`, `--ignore-space-at-eol`) are gone:
+## none of them occurs once in the two tool-call logs of docs/minimize.md
+## §2.2, and each cost a branch inside the format writers rather than a line
+## of table.  What is left is what those logs actually ask for -- the patch,
+## `--stat`, `--numstat`, `--raw`, the name formats, `-z`, `-U<n>`, `-S`,
+## `--diff-filter`, `--abbrev`, and the two whitespace modes anyone used
+## (`-w` and `--ignore-cr-at-eol`).  Every cut name refuses by name below; a
+## silently-ignored `-w` would print a *different diff* and say nothing.
 
-import std/[os, posix, strutils, algorithm, unicode]
+import std/[os, strutils, algorithm, unicode]
 import cli, diff, index, objects, oid, pathspec, repository, trees, util
 
 type
   DiffFormat* = enum
-    dfPatch, dfRaw, dfStat, dfShortstat, dfNumstat, dfNameOnly, dfNameStatus,
-    dfNone
+    dfPatch, dfRaw, dfStat, dfNumstat, dfNameOnly, dfNameStatus, dfNone
 
   DiffOpts* = object
     formats*: set[DiffFormat]  ## several may be asked for at once
     ctxLen*: int
     ws*: WsMode
     abbrev*: int
-    fullIndex*: bool
-    noPrefix*: bool
-    text*: bool                ## `-a`: never call a file binary
-    reverse*: bool             ## `-R`
     nulTerminate*: bool        ## `-z`
     filter*: string            ## `--diff-filter=`, upper-case letters kept
     pickaxe*: string           ## `-S`
-    color*: bool
     exitCode*: bool
     quiet*: bool
     statWidth*: int            ## `--stat=<width>`; 0 means the 80-column default
@@ -113,30 +118,29 @@ const diffOptions* = [
   opt("--raw", help = "the raw format"),
   opt("--stat", okOptValue, arg = "[=<width>]", help = "the diffstat"),
   opt("--numstat", help = "added and deleted line counts per file"),
-  opt("--shortstat", help = "the diffstat's last line only"),
   opt("--name-only", help = "changed paths"),
   opt("--name-status", help = "changed paths with their status letter"),
-  opt("--full-index", help = "full object IDs on the index line"),
-  opt("--no-prefix", help = "no a/ and b/ on the paths"),
-  opt("-a|--text", help = "never call a file binary"),
-  opt("-R", help = "swap the two sides"),
   opt("-z", help = "NUL after each path"),
   opt("--exit-code", help = "exit 1 when there were differences"),
   opt("--quiet", help = "no output; implies --exit-code"),
   opt("-w|--ignore-all-space", help = "ignore whitespace entirely"),
-  opt("-b|--ignore-space-change", help = "ignore changes in the amount of whitespace"),
-  opt("--ignore-space-at-eol", help = "ignore whitespace at the end of a line"),
   opt("--ignore-cr-at-eol", help = "ignore a carriage return at the end of a line"),
   opt("-U|--unified", okValue, arg = "<n>", help = "lines of context"),
   opt("--diff-filter", okValue, arg = "<letters>", help = "only these kinds of change: A D M T"),
   opt("-S", okValue, arg = "<string>", help = "changes that add or remove the string"),
   opt("--abbrev", okValue, arg = "<n>", help = "abbreviate object IDs to <n> digits"),
-  opt("--color", okOptValue, arg = "[=<when>]", help = "colour: always, never or auto"),
-  opt("--no-color"),
-  # Everything in docs/03 that gittle does not implement, so each refuses by
-  # name instead of being silently ignored.  `--no-renames` is in the list
-  # because gittle never detects renames: accepting the flag would imply the
-  # other setting exists.
+  # Two refusal rows, and the split is the record of where each name went.
+  # This one was implemented and then cut in the second minimization pass: no
+  # use in either tool-call log, and each cost a branch inside a writer.  A
+  # refusal rather than a silent no-op because `-b` and `-R` change the diff
+  # itself -- accepted and ignored, they would print a different answer and
+  # say nothing about it.
+  opt("--color|--no-color|--shortstat|--full-index|--no-prefix|-a|--text|-R|" &
+      "-b|--ignore-space-change|--ignore-space-at-eol",
+      okRefused, help = "docs/minimize-2.md §B4"),
+  # And this one was never implemented at all.  `--no-renames` is in it because
+  # gittle never detects renames: accepting the flag would imply that the other
+  # setting exists.
   opt("-M|--find-renames|-C|--find-copies|--find-copies-harder|-B|--break-rewrites|-D|--irreversible-delete|--diff-algorithm|--minimal|--patience|--histogram|--anchored|--indent-heuristic|--no-indent-heuristic|-c|--cc|--dd|--diff-merges|--remerge-diff|--combined-all-paths|--word-diff|--color-words|--word-diff-regex|--color-moved|--dirstat|-X|--cumulative|--compact-summary|--summary|--binary|--check|--ws-error-highlight|--ignore-blank-lines|-I|--ignore-matching-lines|--function-context|-W|--inter-hunk-context|--src-prefix|--dst-prefix|--default-prefix|--relative|--no-relative|--textconv|--no-textconv|--ext-diff|--no-ext-diff|--submodule|--ignore-submodules|-G|--pickaxe-regex|--pickaxe-all|--find-object|-O|--skip-to|--rotate-to|--output|--line-prefix|--ita-invisible-in-index|--no-renames|--rename-empty|-t|--patch-with-raw|--patch-with-stat|--no-stat",
       okRefused, help = "docs/03"),
 ]
@@ -172,13 +176,8 @@ proc applyDiffOpts*(p: Opts, o: var DiffOpts) =
                "--stat=<width>,<name-width> is out of scope for gittle v1")
         o.statWidth = parseInt(parts[0])
     of "numstat": o.formats.incl dfNumstat
-    of "shortstat": o.formats.incl dfShortstat
     of "name-only": o.formats.incl dfNameOnly
     of "name-status": o.formats.incl dfNameStatus
-    of "full-index": o.fullIndex = true
-    of "no-prefix": o.noPrefix = true
-    of "text": o.text = true
-    of "R": o.reverse = true
     of "z": o.nulTerminate = true
     of "exit-code": o.exitCode = true
     of "quiet":
@@ -186,8 +185,6 @@ proc applyDiffOpts*(p: Opts, o: var DiffOpts) =
       o.exitCode = true
       o.formats = {dfNone}
     of "ignore-all-space": o.ws = wsIgnoreAll
-    of "ignore-space-change": o.ws = wsIgnoreChange
-    of "ignore-space-at-eol": o.ws = wsIgnoreEol
     of "ignore-cr-at-eol": o.ws = wsIgnoreCr
     of "unified":
       # `-U<n>` implies the patch (`diff.c`: `--unified` sets DIFF_FORMAT_PATCH).
@@ -198,17 +195,9 @@ proc applyDiffOpts*(p: Opts, o: var DiffOpts) =
       for c in o.filter:
         failIf(c notin {'A', 'D', 'M', 'T', '*'},
                "unsupported --diff-filter character '" & c &
-               "'\n  gittle detects no renames or copies, so only A, D, M " &
-               "and T can occur")
+               "': gittle detects no renames or copies, so only A, D, M and T occur")
     of "S": o.pickaxe = v
     of "abbrev": o.abbrev = parseInt(v)
-    of "no-color": o.color = false
-    of "color":
-      o.color = case (if v.len == 0: "always" else: v)
-        of "always": true
-        of "never": false
-        of "auto": isatty(stdout.getFileHandle()) != 0
-        else: fail("invalid --color argument: " & v)
     else: discard
 
 # ---------------------------------------------------------------------------
@@ -395,19 +384,14 @@ func countOccurrences(hay, needle: string): int =
 
 proc applyFilters(repo: Repository, pairs: seq[DiffPair],
                    o: DiffOpts): seq[DiffPair] =
-  ## `-R`, `--diff-filter` and `-S`, in that order.
-  for p0 in pairs:
-    var p = p0
-    if o.reverse:
-      p = DiffPair(path: p0.path,
-                   oldMode: p0.newMode, oldOid: p0.newOid, oldValid: p0.newValid,
-                   newMode: p0.oldMode, newOid: p0.oldOid, newValid: p0.oldValid)
-      # Reversing means the working tree becomes the *old* side, and there is
-      # nowhere to record that; hash it now so the swap is complete.
-      p.oldFromWork = p0.newFromWork
-      p.newFromWork = p0.oldFromWork
-      p.oldPath = p0.path
-      p.path = p0.oldName
+  ## `--diff-filter` and `-S`, in that order.
+  ##
+  ## `-S<string>` is the *pickaxe*, and what it looks for is not "the string
+  ## appears in the diff" but "the two sides contain it a different number of
+  ## times" (`diffcore-pickaxe.c:has_changes`) -- which is why it finds the
+  ## commit that introduced a symbol and not every commit that touched a line
+  ## near it.
+  for p in pairs:
     if o.filter.len > 0 and o.filter != "*" and p.status notin o.filter:
       continue
     if o.pickaxe.len > 0 and
@@ -419,15 +403,6 @@ proc applyFilters(repo: Repository, pairs: seq[DiffPair],
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
-
-const
-  colReset = "\e[m"
-  colMeta = "\e[1m"
-  colFrag = "\e[36m"
-  colOld = "\e[31m"
-  colNew = "\e[32m"
-    ## git's defaults (`color.diff.*` in `diff.c:parse_diff_color_slot`).
-    ## Configuring them is out of scope (docs/11), so the five are constants.
 
 proc quoteTwo(prefix, path0: string): string =
   ## `a/` and the path quoted as one string when either needs it, which is why
@@ -464,44 +439,37 @@ proc writePatch(repo: Repository, p0: DiffPair, o: DiffOpts, out0: var string) =
     return
   var p = p0
   repo.fillOid(p)
-  # `-R` swaps the *prefixes* as well as the contents, so a reversed patch
-  # reads `diff --git b/x a/x`.  git does the same (`diff.c:builtin_diff`
-  # swaps `name_a`/`name_b` together with the two prefixes), and it is what
-  # keeps `a/` meaning "the side the patch would apply to".
-  let aPre = if o.noPrefix: "" elif o.reverse: "b/" else: "a/"
-  let bPre = if o.noPrefix: "" elif o.reverse: "a/" else: "b/"
+  # `a/` is the side the patch would apply *to* and `b/` the side it produces;
+  # `--src-prefix`, `--no-prefix` and `-R` -- the three ways git has of moving
+  # them -- are all cut, so they are constants.
+  const aPre = "a/"
+  const bPre = "b/"
 
-  template meta(s: string) =
-    ## One header line, coloured when colour is on.
-    if o.color: out0.add colMeta & s & colReset & "\n" else: out0.add s & "\n"
-
-  meta "diff --git " & quoteTwo(aPre, p.oldName) & " " & quoteTwo(bPre, p.path)
+  out0.add "diff --git " & quoteTwo(aPre, p.oldName) & " " &
+           quoteTwo(bPre, p.path) & "\n"
 
   if p.oldMode != 0 and p.newMode != 0 and p.oldMode != p.newMode:
-    meta "old mode " & formatMode(p.oldMode)
-    meta "new mode " & formatMode(p.newMode)
+    out0.add "old mode " & formatMode(p.oldMode) & "\n"
+    out0.add "new mode " & formatMode(p.newMode) & "\n"
   elif p.oldMode == 0:
-    meta "new file mode " & formatMode(p.newMode)
+    out0.add "new file mode " & formatMode(p.newMode) & "\n"
   elif p.newMode == 0:
-    meta "deleted file mode " & formatMode(p.oldMode)
+    out0.add "deleted file mode " & formatMode(p.oldMode) & "\n"
 
   let a = repo.oldText(p)
   let b = repo.newText(p)
   if a == b and p.oldMode != p.newMode and p.oldMode != 0 and p.newMode != 0:
     return          # a pure mode change has no index line and no body
 
-  # `--full-index` prints forty digits on both sides, including the forty
-  # zeroes of an absent one -- an abbreviated null OID next to a full one
-  # would not line up and could not be pasted into `git apply`.
-  let hexA = if o.fullIndex: (if p.oldMode != 0: $p.oldOid else: repeat('0', OidHexLen))
-             else: repo.abbrevOf(o, p.oldOid, p.oldValid and p.oldMode != 0)
-  let hexB = if o.fullIndex: (if p.newMode != 0: $p.newOid else: repeat('0', OidHexLen))
-             else: repo.abbrevOf(o, p.newOid, p.newValid and p.newMode != 0)
-  var idx = "index " & hexA & ".." & hexB
+  # The `index` line abbreviates to whatever `--abbrev` or the repository's own
+  # automatic width says; `--full-index` is cut.
+  var idx = "index " &
+            repo.abbrevOf(o, p.oldOid, p.oldValid and p.oldMode != 0) & ".." &
+            repo.abbrevOf(o, p.newOid, p.newValid and p.newMode != 0)
   if p.oldMode == p.newMode: idx.add " " & formatMode(p.oldMode)
-  meta idx
+  out0.add idx & "\n"
 
-  if not o.text and (isBinary(a) or isBinary(b)):
+  if isBinary(a) or isBinary(b):
     # git names the two sides the way it named them above, `/dev/null` and all.
     let an = if p.oldMode == 0: "/dev/null" else: quoteTwo(aPre, p.oldName)
     let bn = if p.newMode == 0: "/dev/null" else: quoteTwo(bPre, p.path)
@@ -511,48 +479,25 @@ proc writePatch(repo: Repository, p0: DiffPair, o: DiffOpts, out0: var string) =
   let d = diffText(a, b, o.ctxLen, o.ws)
   if d.hunks.len == 0: return      # an empty creation: header only, no body
 
-  meta "--- " & (if p.oldMode == 0: "/dev/null" else: quoteTwo(aPre, p.oldName))
-  meta "+++ " & (if p.newMode == 0: "/dev/null" else: quoteTwo(bPre, p.path))
+  out0.add "--- " &
+           (if p.oldMode == 0: "/dev/null" else: quoteTwo(aPre, p.oldName)) & "\n"
+  out0.add "+++ " &
+           (if p.newMode == 0: "/dev/null" else: quoteTwo(bPre, p.path)) & "\n"
 
   for h in d.hunks:
     var hdr = "@@ -" & (if h.c1 == 0: $(h.s1 - 1) else: $h.s1) &
               (if h.c1 == 1: "" else: "," & $h.c1) &
               " +" & (if h.c2 == 0: $(h.s2 - 1) else: $h.s2) &
               (if h.c2 == 1: "" else: "," & $h.c2) & " @@"
-    if o.color: out0.add colFrag & hdr & colReset
-    else: out0.add hdr
+    out0.add hdr
     if h.funcName.len > 0: out0.add " " & h.funcName
     out0.add "\n"
     for l in h.lines:
-      let sign = case l.kind
-                 of dlContext: " "
-                 of dlDelete: "-"
-                 of dlAdd: "+"
-      if not o.color:
-        out0.add sign & l.text
-      else:
-        # Three shapes, and they are not symmetric (`diff.c:emit_line_0` and
-        # `emit_line_ws_markup`).  A context line has no colour at all but
-        # still ends in a reset; a deleted line is one red span over the sign
-        # and the text together; an added line is *two* green spans, because
-        # git splits the marker from the content so that a whitespace error
-        # in the content can be repainted without disturbing the `+`.
-        case l.kind
-        of dlContext:
-          out0.add " " & l.text & colReset
-        of dlDelete:
-          out0.add colOld & "-" & l.text & colReset
-        of dlAdd:
-          out0.add colNew & "+" & colReset
-          if l.text.len > 0: out0.add colNew & l.text & colReset
-      out0.add "\n"
-      if l.noNewline:
-        # git emits this through the *context* colour, which is empty by
-        # default -- so under `--color` it is the bare text plus a reset
-        # (`diff.c`, `DIFF_SYMBOL_CONTEXT_INCOMPLETE`).
-        out0.add "\\ No newline at end of file"
-        if o.color: out0.add colReset
-        out0.add "\n"
+      out0.add (case l.kind
+                of dlContext: " "
+                of dlDelete: "-"
+                of dlAdd: "+") & l.text & "\n"
+      if l.noNewline: out0.add "\\ No newline at end of file\n"
 
 proc splitTypeChange(pairs: seq[DiffPair]): seq[DiffPair] =
   ## A `T` pair becomes a deletion followed by a creation.
@@ -611,7 +556,7 @@ proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
     if not p.unmerged:
       let a = repo.oldText(p)
       let b = repo.newText(p)
-      if not o.text and (isBinary(a) or isBinary(b)):
+      if isBinary(a) or isBinary(b):
         r.binary = true
         r.deleted = a.len
         r.added = b.len
@@ -653,12 +598,7 @@ proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
     totalDel += r.deleted
     out0.add align($(r.added + r.deleted), numberWidth) &
              (if r.added + r.deleted > 0: " " else: "")
-    if o.color:
-      if add > 0: out0.add colNew & repeat('+', add) & colReset
-      if del > 0: out0.add colOld & repeat('-', del) & colReset
-    else:
-      out0.add repeat('+', add) & repeat('-', del)
-    out0.add "\n"
+    out0.add repeat('+', add) & repeat('-', del) & "\n"
   out0.add summaryLine(rows.len, totalAdd, totalDel)
 
 func pathField(o: DiffOpts, path: string): string =
@@ -685,7 +625,7 @@ proc writeNumstat(repo: Repository, p: DiffPair, o: DiffOpts, out0: var string) 
     return
   let a = repo.oldText(p)
   let b = repo.newText(p)
-  if not o.text and (isBinary(a) or isBinary(b)):
+  if isBinary(a) or isBinary(b):
     out0.add "-\t-\t"
   else:
     let c = diffCounts(a, b, o.ws)
@@ -701,7 +641,10 @@ proc writeNames(p: DiffPair, o: DiffOpts, withStatus: bool, out0: var string) =
   out0.add pathField(o, p.path)
 
 proc shortstat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts): string =
-  ## `--shortstat`: the summary line alone.
+  ## The `--stat` summary line alone: `3 files changed, 9 insertions(+)`.
+  ## `--shortstat` is cut (§B4), but `commit` prints this line under its
+  ## `[main abc1234] subject` header, so the format stays and only the option
+  ## has gone.
   var add = 0
   var del = 0
   var files = 0
@@ -710,7 +653,7 @@ proc shortstat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts): string =
     inc files
     let a = repo.oldText(p)
     let b = repo.newText(p)
-    if not o.text and (isBinary(a) or isBinary(b)): continue
+    if isBinary(a) or isBinary(b): continue
     let c = diffCounts(a, b, o.ws)
     add += c.added
     del += c.deleted
@@ -754,14 +697,11 @@ proc renderDiff*(repo: Repository, pairs0: seq[DiffPair], o: DiffOpts):
     for p in pairs: repo.writeNumstat(p, o, out0)
   if dfStat in o.formats:
     repo.writeStat(pairs, o, out0)
-  if dfShortstat in o.formats:
-    out0.add repo.shortstat(pairs, o)
   if dfPatch in o.formats:
     # A blank line goes between any statistics block and the patch under it
     # (`diff.c:diff_flush`, `DIFF_SYMBOL_STAT_SEP`).  It is the only place
     # where asking for two formats at once changes either of them.
-    if out0.len > 0 and
-       ({dfStat, dfShortstat, dfNumstat} * o.formats).card > 0:
+    if out0.len > 0 and ({dfStat, dfNumstat} * o.formats).card > 0:
       out0.add "\n"
     for p in splitTypeChange(pairs): repo.writePatch(p, o, out0)
   result.text = out0

@@ -58,8 +58,8 @@ const
   synopsis = "[<options>] [<object>…]"
   options = [
     opt("--oneline", help = "one line per commit: abbreviated ID and subject"),
-    opt("--abbrev-commit", help = "abbreviate the commit ID"),
-    opt("--no-abbrev-commit"),
+    opt("--abbrev-commit|--no-abbrev-commit", okRefused,
+        help = "docs/minimize-2.md §B4"),
     opt("--relative-date", okRefused, help = "docs/minimize.md §3"),
     opt("--decorate", okOptValue, arg = "[=short]", help = "show the refs at each commit"),
     opt("--no-decorate"),
@@ -81,8 +81,6 @@ proc cmdShow*(c: Ctx, args: seq[string]): int =
   for (k, v) in p.occurrences:
     case k
     of "oneline": (opts.kind = pkOneline; opts.abbrevCommit = true)
-    of "abbrev-commit": opts.abbrevCommit = true
-    of "no-abbrev-commit": opts.abbrevCommit = false
     of "abbrev": abbrevLen = parseInt(v)
     of "date": opts.dateMode = parseDateMode(v)
     of "decorate": opts.decorate = true
