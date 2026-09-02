@@ -82,16 +82,3 @@ func shortenRefname*(name: string): string =
     if name.startsWith(p) and name.len > p.len:
       return name[p.len .. ^1]
   name
-
-func lstripRefname*(name: string, n: int): string =
-  ## Drop the first `n` slash-separated components, or the last `-n` if `n` is
-  ## negative.  `%(refname:lstrip=2)` turns `refs/heads/main` into `main`.
-  let parts = name.split('/')
-  let drop = if n >= 0: n else: max(0, parts.len + n)
-  if drop >= parts.len: "" else: parts[drop .. ^1].join("/")
-
-func rstripRefname*(name: string, n: int): string =
-  ## Drop the last `n` components, or all but the first `-n` if negative.
-  let parts = name.split('/')
-  let keep = if n >= 0: parts.len - n else: min(parts.len, -n)
-  if keep <= 0: "" else: parts[0 ..< keep].join("/")

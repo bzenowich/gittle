@@ -138,9 +138,6 @@ proc testGlob() =
   doAssert shortenRefname("refs/tags/v1") == "v1"
   doAssert shortenRefname("refs/remotes/o/main") == "o/main"
   doAssert shortenRefname("HEAD") == "HEAD"
-  doAssert lstripRefname("refs/heads/main", 2) == "main"
-  doAssert lstripRefname("refs/heads/f/x", -1) == "x"
-  doAssert rstripRefname("refs/heads/main", 1) == "refs/heads"
   doAssert isValidRefname("refs/heads/main")
   doAssert not isValidRefname("refs/heads/a..b")
   doAssert not isValidRefname("main")

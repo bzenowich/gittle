@@ -122,9 +122,19 @@ echo
 # The two modules with no git command in front of them.  `nim` is not required
 # to run the rest of the suite, so skip these if it is missing.
 SELF="$WORK/selftest"
-if command -v nim >/dev/null && \
-   nim c --hints:off -d:release --path:"$(dirname "$0")/../src" \
-       -o:"$SELF" "$(dirname "$0")/selftest.nim" >/dev/null 2>&1; then
+# "nim is missing" and "the harness does not compile" are different answers and
+# only the first is a skip.  They were one branch, and a harness left calling a
+# proc that had been deleted reported `skipped (no nim)` -- three checks
+# stopped running and the suite still said 0 failed.
+HAVE_NIM=0; command -v nim >/dev/null && HAVE_NIM=1
+if [ $HAVE_NIM = 1 ] && \
+   ! nim c --hints:off -d:release --path:"$(dirname "$0")/../src" \
+       -o:"$SELF" "$(dirname "$0")/selftest.nim" >"$WORK/selftest.log" 2>&1; then
+  bad "selftest harness does not compile"; grep -E 'Error' "$WORK/selftest.log" | head -3
+  HAVE_NIM=0
+  SKIPNOTE="the harness above does not compile"
+fi
+if [ $HAVE_NIM = 1 ]; then
 
   # Every 64-byte block boundary, plus the padding cases at 55/56 and 119/120.
   sha_ok=1; nsha=0
@@ -164,7 +174,7 @@ if command -v nim >/dev/null && \
   [ $z_ok = 1 ] && { ok; report "zlib" "$nz round trips, consumed exact"; } \
                 || bad "zlib"
 else
-  report "sha1 and zlib" "skipped (no nim)"
+  report "sha1, zlib, glob" "skipped (${SKIPNOTE:-no nim on PATH})"
 fi
 
 # ---------------------------------------------------------------- hash-object
