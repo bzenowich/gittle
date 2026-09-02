@@ -22,12 +22,15 @@
 ##   (which is shorthand for HEAD).
 ## * At least two components -- `refs/heads/main`, not `main` -- unless the
 ##   caller allows one level, which is how HEAD and the other pseudorefs get in.
+##
+## This module has no glob in it, and the forbidden set is why: every character
+## [glob.nim](glob.nim) would treat as a metacharacter is banned from a ref
+## name outright, so a ref name is always safe to hand a matcher as a literal
+## and never needs escaping first.  `reffilter.nim` relies on that.
 
 import std/strutils
 
 const
-  refnameLockSuffix = ".lock"
-
   forbidden = {'\0' .. '\x1F', '\x7F', ' ', '\t', ':', '?', '[', '\\', '^',
                '~', '*'}
     ## `*` is only legal in a refspec pattern, which v1 never builds, so it is
@@ -38,24 +41,21 @@ type
     rfAllowOneLevel  ## permit `HEAD`-style names with no slash in them
 
 func checkComponent(c: string): bool =
-  ## One slash-separated piece of a ref name.
-  if c.len == 0: return false
-  if c[0] == '.': return false
-  if c.endsWith(refnameLockSuffix): return false
+  ## One slash-separated piece of a ref name.  The two-character rules (`..`
+  ## and `@{`) are checked against the previous character rather than by
+  ## searching, so one pass over the component settles every rule at once.
+  if c.len == 0 or c[0] == '.' or c.endsWith(".lock"): return false
   var last = '\0'
   for ch in c:
-    if ch in forbidden: return false
-    if ch == '.' and last == '.': return false   # ".." is a range expression
-    if ch == '{' and last == '@': return false   # "@{" is a reflog expression
+    if ch in forbidden or (ch == '.' and last == '.') or
+       (ch == '{' and last == '@'): return false
     last = ch
   true
 
 func isValidRefname*(name: string, flags: set[RefnameFlag] = {}): bool =
   ## Is `name` a well-formed reference name?
-  if name.len == 0: return false
-  if name == "@": return false
-  if name.endsWith("."): return false
-  if name.startsWith("/") or name.endsWith("/"): return false
+  if name.len == 0 or name == "@" or name.endsWith(".") or
+     name.startsWith("/") or name.endsWith("/"): return false
   let parts = name.split('/')
   if parts.len < 2 and rfAllowOneLevel notin flags: return false
   for p in parts:

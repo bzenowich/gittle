@@ -1,9 +1,9 @@
-## Shell-style glob matching.
+## Shell-style glob matching -- **the** pattern matcher, for all of gittle.
 ##
-## One engine, used by `for-each-ref` patterns now and by pathspecs and
-## `.gitignore` in phase 4 (plan.md §5 budgets them together for exactly this
-## reason).  It is git's `wildmatch.c` cut down to the syntax git's own
-## documentation promises:
+## `.gitignore` rules, command-line pathspecs and `for-each-ref` patterns look
+## like three pattern languages, and they are one matcher with three thin
+## adapters in front of it.  This module is the matcher: git's `wildmatch.c`
+## cut down to the syntax git's own documentation promises.
 ##
 ##   `?`        one character
 ##   `*`        any run of characters
@@ -11,11 +11,27 @@
 ##   `[abc]`    one of a set; `[a-z]` ranges, `[!abc]` or `[^abc]` negated
 ##   `\x`       a literal `x`
 ##
-## The one subtlety is **pathname mode**.  With it, `*` and `?` refuse to match
-## a `/`, so `refs/*` names the refs directly under `refs/` and not every ref
-## in the repository; `**` is the opt-out that crosses directories.  Without
-## it, every wildcard matches everything, which is what `.gitignore` patterns
-## containing no slash want.
+## Two flags, and nothing else, distinguish the callers' dialects:
+##
+## | flag | what it changes |
+## |---|---|
+## | `gfPathname` | `*` and `?` refuse to cross a `/`; `**` is the opt-out |
+## | `gfIgnoreCase` | ASCII case folding on every literal comparison |
+##
+## Pathname mode is the whole subtlety.  With it, `refs/*` names the refs
+## directly under `refs/` and not every ref in the repository, and `*.c` in a
+## pathspec means a `.c` file in *this* directory.  Without it every wildcard
+## reaches everywhere, which is what a `.gitignore` pattern containing no
+## slash wants, and what a bare `ls-files '*.c'` wants -- see `pathspec.nim`
+## on why that surprises people.
+##
+## What each adapter adds on top, so this file can stay this small:
+##
+## | adapter | adds |
+## |---|---|
+## | `ignore.nim` | `!` negation, `/` anchoring, the basename rule, precedence |
+## | `pathspec.nim` | the `:(magic)` words, the cwd prefix, the subtree rule |
+## | `reffilter.nim` | matching the short name or the full name as a path |
 ##
 ## Matching is recursive with a backtracking `*`.  The pathological input for
 ## that shape is a pattern of many consecutive stars, which no ref name or
@@ -33,15 +49,21 @@ func foldIf(c: char, fold: bool): char {.inline.} =
   if fold and c >= 'A' and c <= 'Z': char(ord(c) + 32) else: c
 
 func matchClass(pat: string, pi: var int, ch: char, fold: bool): bool =
-  ## Match one `[...]` bracket expression, leaving `pi` just past the `]`.
+  ## Match one `[...]` bracket expression against `ch`, leaving `pi` just past
+  ## the closing `]`.
   ##
   ## `]` immediately after the opening bracket (or after the negation) is a
-  ## literal, which is the standard escape hatch for including it in a set.
+  ## literal, which is the standard escape hatch for putting one in a set; a
+  ## `-` with a `]` after it is a literal for the same reason.  An
+  ## unterminated class is a malformed pattern and matches nothing, rather
+  ## than being read past the end of the pattern.
+  ##
+  ## A bare member is a one-character range, so `[abc]` and `[a-c]` are the
+  ## same loop with the endpoints picked differently.
   var i = pi + 1
-  var negated = false
-  if i < pat.len and (pat[i] == '!' or pat[i] == '^'):
-    negated = true
-    inc i
+  let negated = i < pat.len and pat[i] in {'!', '^'}
+  if negated: inc i
+  let c = foldIf(ch, fold)
   var matched = false
   var first = true
   while i < pat.len and (pat[i] != ']' or first):
@@ -50,26 +72,26 @@ func matchClass(pat: string, pi: var int, ch: char, fold: bool): bool =
     if lo == '\\' and i + 1 < pat.len:
       inc i
       lo = pat[i]
+    var hi = lo
     if i + 2 < pat.len and pat[i+1] == '-' and pat[i+2] != ']':
-      var hi = pat[i+2]
+      hi = pat[i+2]
       if hi == '\\' and i + 3 < pat.len:
         inc i
         hi = pat[i+2]
-      let c = foldIf(ch, fold)
-      if foldIf(lo, fold) <= c and c <= foldIf(hi, fold): matched = true
-      i += 3
-    else:
-      if foldIf(lo, fold) == foldIf(ch, fold): matched = true
-      inc i
-  # An unterminated class is a malformed pattern; treat it as no match rather
-  # than reading past the end.
+      i += 2
+    inc i
+    if foldIf(lo, fold) <= c and c <= foldIf(hi, fold): matched = true
   if i >= pat.len: return false
   pi = i + 1
   matched != negated
 
 func matchFrom(pat: string, pi: int, s: string, si: int,
                flags: set[GlobFlag]): bool =
-  ## Match `pat[pi..]` against `s[si..]`.
+  ## Match `pat[pi..]` against the whole of `s[si..]`.
+  ##
+  ## Three atoms and one wildcard: a run of `*`, a single-character wildcard
+  ## (`?` or a `[...]` class), and everything else, which is a literal -- with
+  ## `\x` the way a literal `*`, `?` or `[` is written.
   let pathname = gfPathname in flags
   let fold = gfIgnoreCase in flags
   var p = pi
@@ -77,47 +99,38 @@ func matchFrom(pat: string, pi: int, s: string, si: int,
   while p < pat.len:
     case pat[p]
     of '*':
-      # `**` crosses directory separators; a single `*` does not, in pathname
-      # mode.  Collapse a run of stars first so `***` behaves like `**`.
-      var stars = 0
-      while p < pat.len and pat[p] == '*':
-        inc p
-        inc stars
-      let crossSlash = not pathname or stars >= 2
-      if p >= pat.len:
-        # A trailing star matches the rest, provided it is allowed to.
-        if crossSlash: return true
-        return s.find('/', i) < 0
+      # A run of stars is one wildcard, and two or more of them (`**`) is the
+      # opt-out from pathname mode -- only that form may cross a `/`.  So
+      # `***` behaves like `**`, which is what collapsing the run buys.
+      let star = p
+      while p < pat.len and pat[p] == '*': inc p
+      let crossSlash = not pathname or p - star >= 2
+      # A trailing star takes the whole rest, provided it is allowed to.
+      if p >= pat.len: return crossSlash or s.find('/', i) < 0
       var j = i
       while true:
         if matchFrom(pat, p, s, j, flags): return true
         if j >= s.len: return false
         if not crossSlash and s[j] == '/': return false
         inc j
-    of '?':
-      if i >= s.len: return false
-      if pathname and s[i] == '/': return false
-      inc p
-      inc i
-    of '[':
-      if i >= s.len: return false
-      if pathname and s[i] == '/': return false
-      var np = p
-      if not matchClass(pat, np, s[i], fold): return false
-      p = np
-      inc i
-    of '\\':
-      inc p
-      if p >= pat.len: return false
-      if i >= s.len or foldIf(pat[p], fold) != foldIf(s[i], fold): return false
-      inc p
+    of '?', '[':
+      # Both consume exactly one character, and in pathname mode neither may
+      # consume a `/`; only the class then has to say *which* characters.
+      if i >= s.len or (pathname and s[i] == '/'): return false
+      if pat[p] == '?': inc p
+      elif not matchClass(pat, p, s[i], fold): return false
       inc i
     else:
-      if i >= s.len or foldIf(pat[p], fold) != foldIf(s[i], fold): return false
+      var c = pat[p]
+      if c == '\\':
+        inc p
+        if p >= pat.len: return false     # a trailing backslash matches nothing
+        c = pat[p]
+      if i >= s.len or foldIf(c, fold) != foldIf(s[i], fold): return false
       inc p
       inc i
   i == s.len
 
 func globMatch*(pattern, s: string, flags: set[GlobFlag] = {}): bool =
-  ## Does `s` match `pattern` in full?
+  ## Does the whole of `s` match `pattern`?
   matchFrom(pattern, 0, s, 0, flags)

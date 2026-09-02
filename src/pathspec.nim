@@ -15,6 +15,12 @@
 ##    is what makes `*` stop at a directory separator, which is the opposite of
 ##    what most people expect from the name.
 ##
+## Points 3 and 4 are the whole of what this module adds to
+## [glob.nim](glob.nim); the magic words are a table that turns into the
+## matcher's two flags, and the subtree rule is a prefix comparison in front of
+## it.  So the two `:(…)` words that sound like matcher features --
+## `glob` and `icase` -- are `gfPathname` and `gfIgnoreCase`, and nothing else.
+##
 ## Magic gittle implements: `literal`, `glob`, `icase`, `top`, `exclude`.
 ## `attr` needs gitattributes, which decision 6 cuts.  An unknown magic word is
 ## refused rather than ignored -- silently matching more than was asked for is
@@ -34,10 +40,9 @@ type
   PathspecItem = object
     raw: string          ## as typed, for `--error-unmatch` and error messages
     pattern: string      ## root-relative, after the prefix and magic are applied
+    flags: set[GlobFlag] ## `:(glob)` is `gfPathname`, `:(icase)` is `gfIgnoreCase`
     exclude: bool
     literal: bool        ## no wildcards; the bytes mean themselves
-    globMagic: bool      ## `*` stops at `/`, and there is no subtree rule
-    icase: bool
     wildcardAt: int      ## offset of the first wildcard, or the pattern length
 
   Pathspec* = object
@@ -50,13 +55,6 @@ type
     pmNone, pmRecursive, pmFnmatch, pmExact
 
 const wildcardChars = {'*', '?', '[', '\\'}
-
-func firstWildcard(s: string): int =
-  ## Where the first glob character is, or the length: the literal prefix
-  ## is what a directory walk can prune on.
-  result = s.len
-  for i, c in s:
-    if c in wildcardChars: return i
 
 func stripSlashes(s: string): string =
   ## `foo/` and `foo` name the same thing to a pathspec, and a leading `/` in a
@@ -91,6 +89,11 @@ proc inPrefix*(path, prefix: string): string =
 proc parseItem(spec, prefix: string): PathspecItem =
   ## One pathspec into its parts: the magic (`:(top)`, `:/`, `:!`), the
   ## prefix-relative path, and the literal prefix.
+  ##
+  ## The literal prefix -- everything before the first wildcard -- is what a
+  ## directory walk prunes on, so it is measured once here rather than per
+  ## candidate path.  A `:(literal)` item has no wildcards at all, so its whole
+  ## pattern is literal prefix.
   result.raw = spec
   var top = false
   var i = 0
@@ -106,32 +109,27 @@ proc parseItem(spec, prefix: string): PathspecItem =
         of "": discard
         of "top": top = true
         of "literal": result.literal = true
-        of "glob": result.globMagic = true
-        of "icase": result.icase = true
+        of "glob": result.flags.incl gfPathname
+        of "icase": result.flags.incl gfIgnoreCase
         of "exclude": result.exclude = true
-        else:
-          fail("Invalid pathspec magic '" & word & "' in '" & spec & "'\n" &
-               "  gittle understands top, literal, glob, icase and exclude")
+        else: fail("Invalid pathspec magic '" & word & "' in '" & spec & "'\n" &
+                   "  gittle understands top, literal, glob, icase and exclude")
       i = close + 1
     else:
       # The short form: a run of one-character signatures, ending at `:` or at
       # the first character that is not one.
-      while i < spec.len:
-        case spec[i]
-        of '/': top = true
-        of '!', '^': result.exclude = true
-        of ':':
-          inc i
-          break
-        else: break
+      while i < spec.len and spec[i] in {'/', '!', '^', ':'}:
+        let sig = spec[i]
         inc i
+        if sig == ':': break
+        if sig == '/': top = true else: result.exclude = true
     pattern = spec[i .. ^1]
 
-  failIf(result.literal and result.globMagic,
+  failIf(result.literal and gfPathname in result.flags,
          "'literal' and 'glob' are incompatible in '" & spec & "'")
   result.pattern = applyPrefix(pattern, prefix, top)
-  result.wildcardAt = if result.literal: result.pattern.len
-                      else: firstWildcard(result.pattern)
+  let w = result.pattern.find(wildcardChars)
+  result.wildcardAt = if result.literal or w < 0: result.pattern.len else: w
 
 proc parsePathspec*(specs: openArray[string], prefix = "",
                     implicitPrefix = false): Pathspec =
@@ -151,11 +149,6 @@ proc parsePathspec*(specs: openArray[string], prefix = "",
 # No items: matches everything.
 func isEmpty*(ps: Pathspec): bool = ps.items.len == 0
 
-func globFlags(it: PathspecItem): set[GlobFlag] =
-  ## The glob flags this item's magic asks for.
-  if it.globMagic: result.incl gfPathname
-  if it.icase: result.incl gfIgnoreCase
-
 func matchItem(it: PathspecItem, path: string): PathMatch =
   ## One item against one root-relative path, and *how* it matched.
   ##
@@ -169,21 +162,26 @@ func matchItem(it: PathspecItem, path: string): PathMatch =
   ## `rm dir` from `rm 'dir/*'` -- both of which name the same files -- is
   ## that the first matched them *recursively* and the second by wildcard
   ## (`dir.c:match_pathspec_item`).
-  if it.pattern.len == 0: return pmRecursive    # the whole tree
-  let eq = if it.icase: cmpIgnoreCase(path, it.pattern) == 0 else: path == it.pattern
-  if eq: return pmExact
-  if not it.globMagic:
-    let dirPrefix = it.pattern & "/"
-    if path.len > dirPrefix.len and
-       (if it.icase: cmpIgnoreCase(path[0 ..< dirPrefix.len], dirPrefix) == 0
-        else: path.startsWith(dirPrefix)):
-      return pmRecursive
+  let n = it.pattern.len
+  if n == 0: return pmRecursive                 # the whole tree
+  let icase = gfIgnoreCase in it.flags
+  if (if icase: cmpIgnoreCase(path, it.pattern) == 0 else: path == it.pattern):
+    return pmExact
+  if gfPathname notin it.flags and path.len > n and path[n] == '/' and
+     (if icase: cmpIgnoreCase(path[0 ..< n], it.pattern) == 0
+      else: path.startsWith(it.pattern)):
+    return pmRecursive
   if it.literal: return pmNone
-  if globMatch(it.pattern, path, it.globFlags): pmFnmatch else: pmNone
+  if globMatch(it.pattern, path, it.flags): pmFnmatch else: pmNone
 
 func matchesItem(it: PathspecItem, path: string): bool =
   ## Does the item match the path at all (exactly or by prefix)?
   it.matchItem(path) != pmNone
+
+func matchesAny(it: PathspecItem, paths: openArray[string]): bool =
+  ## Does the item match any one of these paths?
+  for path in paths:
+    if it.matchesItem(path): return true
 
 func matches*(ps: Pathspec, path: string): bool =
   ## An empty pathspec matches everything -- that is what makes `gittle add -A`
@@ -202,21 +200,19 @@ func mightMatchDir*(ps: Pathspec, dir: string): bool =
   ## Is it worth walking into this directory?
   ##
   ## Purely an optimisation, and it must never answer `false` for a directory
-  ## that could contain a match.  So: yes if the directory is itself matched,
-  ## yes if it is an ancestor of some item's literal prefix, and yes as soon as
-  ## a wildcard could reach into it.
+  ## that could contain a match.  A positive item says yes for any of four
+  ## reasons, in the order tested: it matches everything; the directory is the
+  ## root; the directory is itself matched; the directory is an ancestor of the
+  ## item's literal prefix (`add src/x` must still descend into `src`); or a
+  ## wildcard early enough in the item could reach anywhere below here, at
+  ## which point there is nothing left to prune on.
   if ps.isEmpty: return true
   for it in ps.items:
     if it.exclude: continue
-    if it.pattern.len == 0: return true
-    if dir.len == 0: return true
-    if it.matchesItem(dir): return true
-    # `dir` is above the item: `add src/x` must still descend into `src`.
-    if it.pattern.startsWith(dir & "/"): return true
-    # A wildcard before the end of the first component can reach anywhere
-    # below this directory, so there is nothing left to prune on.
-    if it.wildcardAt < it.pattern.len and
-       it.pattern[0 ..< it.wildcardAt].count('/') <= dir.count('/') + 1:
+    if it.pattern.len == 0 or dir.len == 0 or it.matchesItem(dir) or
+       it.pattern.startsWith(dir & "/") or
+       (it.wildcardAt < it.pattern.len and
+        it.pattern[0 ..< it.wildcardAt].count('/') <= dir.count('/') + 1):
       return true
   false
 
@@ -238,13 +234,7 @@ func firstUnmatched*(ps: Pathspec, paths: openArray[string]): string =
   ## It is asked per *item*, not per pathspec, because that is what the
   ## message quotes back.
   for it in ps.items:
-    if it.exclude: continue
-    var hit = false
-    for path in paths:
-      if it.matchesItem(path):
-        hit = true
-        break
-    if not hit: return it.raw
+    if not it.exclude and not it.matchesAny(paths): return it.raw
   ""
 
 func itemCount*(ps: Pathspec): int = ps.items.len

@@ -6,6 +6,10 @@
 ## project is unusable without it -- an ordinary working tree would drown in
 ## build output.
 ##
+## The matching itself is [glob.nim](glob.nim); this module is the adapter in
+## front of it, and what it adds is four things git's own `dir.c` adds:
+## negation, anchoring, the basename rule, and the precedence between files.
+##
 ## ## The sources, and how they are consulted
 ##
 ## For one path, in this order, and the **first list with any matching pattern
@@ -32,7 +36,7 @@
 ## | `pat/` | directories only |
 ## | a `/` anywhere but the end | anchored to this file's own directory |
 ## | no `/` at all | matches a **basename**, at any depth |
-## | `*` `?` `[…]` `**` | the phase-2 glob engine, in pathname mode |
+## | `*` `?` `[…]` `**` | `globMatch`, in pathname mode |
 ##
 ## The basename rule is the one the documentation hides.  gitignore(5) says a
 ## pattern is "checked against the pathname relative to the location of the
@@ -67,7 +71,9 @@ import glob, repository, util
 
 type
   Pattern = object
-    pat: string       ## with `!` and any trailing `/` already removed
+    ## One line, split into the parts the matcher and the reporter each want.
+    pat: string       ## `!`, a trailing `/` and an anchoring `/` already gone
+    raw: string       ## the line as written, which `check-ignore -v` prints
     negated: bool
     mustBeDir: bool
     noDir: bool       ## no `/` in it, so it matches a basename at any depth
@@ -96,7 +102,7 @@ type
     ignored*: bool
     src*: string      ## the pattern file
     lineNo*: int      ## 1-based, counting every line including blanks
-    text*: string     ## as written, `!` and trailing `/` restored
+    text*: string     ## as written, `!` and trailing `/` included
 
 # ---------------------------------------------------------------------------
 # Reading a pattern file
@@ -110,20 +116,24 @@ func trimTrailingSpaces(line: string): string =
   var lastSpace = -1
   var i = 0
   while i < line.len:
-    case line[i]
-    of ' ':
-      if lastSpace < 0: lastSpace = i
-    of '\\':
+    if line[i] == '\\':
       inc i
       if i >= line.len: return line
       lastSpace = -1
+    elif line[i] == ' ':
+      if lastSpace < 0: lastSpace = i
     else: lastSpace = -1
     inc i
   if lastSpace >= 0: line[0 ..< lastSpace] else: line
 
 proc parsePattern(raw: string): Pattern =
   ## One `.gitignore` line into a pattern: the `!`, the trailing `/`, the
-  ## anchoring slash, and the escapes.
+  ## anchoring slash, and which of the two matching rules the line asks for.
+  ##
+  ## Everything the matcher does not want is stripped here rather than on
+  ## every comparison, and the line as written is kept beside the result
+  ## because `check-ignore -v` has to quote it back.
+  result.raw = raw
   var p = raw
   if p.len > 0 and p[0] == '!':
     result.negated = true
@@ -132,8 +142,10 @@ proc parsePattern(raw: string): Pattern =
     result.mustBeDir = true
     p = p[0 ..< p.len - 1]
   # NODIR is decided *after* the trailing slash is removed, which is why `sub/`
-  # matches a directory called `sub` at any depth rather than only at the root.
+  # matches a directory called `sub` at any depth rather than only at the root,
+  # and *before* the anchoring one is, because `/sub` is anchored to the root.
   result.noDir = not p.contains('/')
+  if p.len > 0 and p[0] == '/': p = p[1 .. ^1]
   result.pat = p
 
 proc readPatternList(path, base, src: string): PatternList =
@@ -144,44 +156,42 @@ proc readPatternList(path, base, src: string): PatternList =
   if not fileExists(path): return
   var lineNo = 0
   for rawLine in readWholeFile(path).split('\n'):
-    var line = rawLine
     inc lineNo
+    var line = rawLine
     if line.endsWith("\r"): line.setLen(line.len - 1)
     if line.len == 0 or line[0] == '#': continue
     line = trimTrailingSpaces(line)
     if line.len == 0: continue
-    var p = parsePattern(line)
-    p.lineNo = lineNo
-    result.patterns.add p
+    result.patterns.add parsePattern(line)
+    result.patterns[^1].lineNo = lineNo
 
 # ---------------------------------------------------------------------------
 # Matching
 # ---------------------------------------------------------------------------
 
-func matchPathname(pat, path, base: string): bool =
-  ## An anchored pattern: `base` is implicitly in front of it, and `*` stops at
-  ## a `/` (`dir.c:match_pathname`).
-  var p = pat
-  if p.len > 0 and p[0] == '/': p = p[1 .. ^1]
-  if not path.startsWith(base): return false
-  let name = path[base.len .. ^1]
-  name.len > 0 and globMatch(p, name, {gfPathname})
-
 func lastMatchIn(pl: PatternList, path: string, isDir: bool): Decision =
   ## The last matching pattern in one list, scanned backwards so the first hit
-  ## is the last line -- which is how a later `!pat` overrides an earlier rule.
-  let slash = path.rfind('/')
-  let base = if slash < 0: path else: path[slash + 1 .. ^1]
+  ## found is the last line written -- which is how a later `!pat` overrides an
+  ## earlier rule.
+  ##
+  ## Two shapes of pattern, settled when the line was parsed:
+  ##
+  ## * no `/` in it -- match the path's **last component**, at any depth, with
+  ##   wildcards free to match anything (`dir.c:match_basename`);
+  ## * otherwise -- match the path **relative to this file's own directory**,
+  ##   with `*` stopping at a `/` (`dir.c:match_pathname`).
+  let base = path[path.rfind('/') + 1 .. ^1]
   for i in countdown(pl.patterns.high, 0):
     let p = pl.patterns[i]
-    if p.mustBeDir and not isDir: continue
-    let hit = if p.noDir: globMatch(p.pat, base, {})
-              else: matchPathname(p.pat, path, pl.base)
+    let hit =
+      if p.mustBeDir and not isDir: false
+      elif p.noDir: globMatch(p.pat, base, {})
+      elif path.len > pl.base.len and path.startsWith(pl.base):
+        globMatch(p.pat, path[pl.base.len .. ^1], {gfPathname})
+      else: false
     if hit:
-      return Decision(found: true, ignored: not p.negated,
-                      src: pl.src, lineNo: p.lineNo,
-                      text: (if p.negated: "!" else: "") & p.pat &
-                            (if p.mustBeDir: "/" else: ""))
+      return Decision(found: true, ignored: not p.negated, src: pl.src,
+                      lineNo: p.lineNo, text: p.raw)
 
 # ---------------------------------------------------------------------------
 # The stack
@@ -191,32 +201,30 @@ proc newIgnore*(repo: Repository): Ignore =
   ## The two whole-repository lists, read once.  The per-directory ones are
   ## read lazily and cached, because a query about `a/b/c` needs three of them
   ## and a walk of a large tree would otherwise reread each one per file.
-  result = Ignore(workTree: repo.workTree, dirLists: initTable[string, PatternList]())
+  result = Ignore(workTree: repo.workTree)
   var excludesFile = repo.cfg.get("core.excludesFile")
   if excludesFile.len == 0:
-    let xdg = getEnv("XDG_CONFIG_HOME")
-    excludesFile = if xdg.len > 0: xdg / "git" / "ignore"
-                   else: getEnv("HOME") / ".config" / "git" / "ignore"
+    excludesFile = getEnv("XDG_CONFIG_HOME", getEnv("HOME") / ".config") /
+                   "git" / "ignore"
   elif excludesFile.startsWith("~/"):
     excludesFile = getEnv("HOME") / excludesFile[2 .. ^1]
   # `check-ignore -v` prints the file a pattern came from, and git prints it
   # the way a command run at the top of the working tree would spell it --
   # `.git/info/exclude`, not the absolute path it opened.
-  var infoExclude = repo.commonDir / "info" / "exclude"
-  if repo.workTree.len > 0 and infoExclude.startsWith(repo.workTree & "/"):
-    infoExclude = infoExclude[repo.workTree.len + 1 .. ^1]
+  let info = repo.commonDir / "info" / "exclude"
+  var infoName = info
+  if repo.workTree.len > 0 and infoName.startsWith(repo.workTree & "/"):
+    infoName = infoName[repo.workTree.len + 1 .. ^1]
   # Order matters: scanned in reverse, so `info/exclude` is consulted before
   # the user's global file, which is the precedence plan.md §4 specifies.
   result.fileLists.add readPatternList(excludesFile, "", excludesFile)
-  result.fileLists.add readPatternList(repo.commonDir / "info" / "exclude", "",
-                                       infoExclude)
+  result.fileLists.add readPatternList(info, "", infoName)
 
 proc newEmptyIgnore*(repo: Repository): Ignore =
   ## An engine with no files behind it at all.  `clean -x` is the one caller:
   ## it says "there are no ignore rules", so the standard files are not read
   ## and only `-e` patterns remain.
-  Ignore(workTree: repo.workTree, noFiles: true,
-         dirLists: initTable[string, PatternList]())
+  Ignore(workTree: repo.workTree, noFiles: true)
 
 proc addCommandLinePatterns*(ig: Ignore, pats: openArray[string]) =
   ## `clean -e <pattern>`: the highest-precedence list, consulted before any
@@ -224,9 +232,8 @@ proc addCommandLinePatterns*(ig: Ignore, pats: openArray[string]) =
   ## v1 prints them, so they are numbered in order like everything else.
   ig.cmdline.src = "--exclude option"
   for i, raw in pats:
-    var p = parsePattern(raw)
-    p.lineNo = -(i + 1)
-    ig.cmdline.patterns.add p
+    ig.cmdline.patterns.add parsePattern(raw)
+    ig.cmdline.patterns[^1].lineNo = -(i + 1)
 
 proc listFor(ig: Ignore, dir: string): PatternList =
   ## The `.gitignore` sitting in `dir` (root-relative, "" or ending in `/`).
