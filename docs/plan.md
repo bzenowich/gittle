@@ -13,7 +13,10 @@ selections live in `01`–`15`; this file explains *why* they are what they are.
 
 1. **Cover typical usage — for both humans and agents.** Not a teaching toy, not
    a subset chosen for implementation convenience. The daily loop has to work.
-2. **Stay under ~10 kloc of Nim.** The scope must fit in one person's head.
+2. **Small enough to read in an afternoon.** ~10 kloc of Nim was the original
+   target and is still the shape being aimed at, but it is a *measurement*, not
+   a cap — see §5. The scope has to fit in one person's head; the line count is
+   how that is checked, not what it is checked against.
 3. **Full on-disk compatibility.** A gittle repository *is* a git repository.
    Real git and gittle must be able to operate on the same working tree, in any
    order, without either noticing.
@@ -23,10 +26,15 @@ selections live in `01`–`15`; this file explains *why* they are what they are.
 
 ### Non-goals
 
-Rewriting history beyond `rebase`/`revert`, email
-workflows, foreign SCM interop, GUIs, partial/shallow clone, submodules,
-signing, and every accelerator git maintains for repositories far larger than
-the ones gittle targets.
+**Serving repositories.** gittle is a transport *client*: it clones from,
+fetches from and pushes to an ordinary git server, and it does not host one.
+`upload-pack`, `receive-pack` and `git-shell` were in v1 until the end of
+phase 6 and were cut then — see §6 decision 2 for the reasoning.
+
+Also out: rewriting history beyond `rebase`/`revert`, email workflows, foreign
+SCM interop, GUIs, partial/shallow clone, submodules, signing, and every
+accelerator git maintains for repositories far larger than the ones gittle
+targets.
 
 ---
 
@@ -213,14 +221,14 @@ time is optimally deltified; rewriting it is the one action that would turn a
 304 MiB repository into a 3 GiB one. Real `git gc`, if ever run in the same
 repository, restores full optimality — gittle must never undo it.
 
-**R2b — serving a full clone should reuse whole packs.** When `upload-pack` is
-asked for everything a pack contains, stream that pack's bytes rather than
-re-emitting objects. This is what git's `pack.allowPackReuse` does, and without
-it a clone from a gittle host costs 10x.
+**R2b — ~~serving a full clone should reuse whole packs~~.** Withdrawn with the
+server (§6 decision 2): whole-pack reuse only ever mattered for `upload-pack`,
+which gittle no longer ships. As a client, gittle sends a pack only on `push`,
+and the sizes that costs are measured in §3.1's second table.
 
 ## 4. Recommended v1 scope
 
-**56 of 161 commands; 450 of 2,341 option entries (19%).** The option figure
+**53 of 161 commands; 447 of 2,341 option entries (19%).** The option figure
 includes positional arguments (`<pathspec>`, `<commit>`), so the true "flag"
 fraction is nearer 12%.
 
@@ -234,7 +242,6 @@ fraction is nearer 12%.
 | Commit | `commit` `tag` `stash` |
 | Branch | `branch` `checkout` `switch` `merge` `cherry-pick` `revert` `rebase` `worktree` |
 | Remote (client) | `fetch` `push` `pull` `remote` `ls-remote` |
-| Remote (server) | `upload-pack` `receive-pack` `shell` |
 | Config/admin | `config` `gc` `reflog` `help` `version` |
 | Plumbing (read) | `cat-file` `ls-files` `ls-tree` `rev-parse` `rev-list` `merge-base` `for-each-ref` `check-ignore` |
 | Plumbing (write) | `hash-object` `update-ref` `symbolic-ref` `update-index` `read-tree` `write-tree` `commit-tree` `merge-file` `index-pack` `pack-objects` |
@@ -327,7 +334,12 @@ shares the same matcher.
 
 ## 5. Budget
 
-A sketch, not an estimate. Each figure is Nim, simplified per §3.
+A sketch, not an estimate, and — since the end of phase 6 — **a measurement
+rather than a limit**. The figures below are what the work was expected to
+cost; §5.1 is what it actually cost. The discipline that matters is recording
+the number at the end of every phase and explaining the over-runs, not hitting
+it: a smaller number bought by cramming is not the goal, and an optimisation
+and refactoring pass is planned once v1 is feature-complete.
 
 ```
 object store: loose r/w, pack + idx read, delta apply         800
@@ -346,27 +358,55 @@ regex engine (ERE subset)                                     500
 command dispatch, arg parsing, 53 commands                  2,000
 support: sha1, zlib glue, paths, errors, tempfiles            400
 hooks: pre-commit + commit-msg                                 60
-serving: upload-pack + receive-pack                           400
-git-shell + argv[0] dispatch                                   80
+argv[0] dispatch                                               30
 index v4 read                                                  30
 repository extension gate + worktree config                    60
                                                           -------
-                                                            9,130
+                                                            8,680
 ```
 
-The line that will blow the budget is the second-to-last. Every algorithm above
-it is bounded; the command layer scales with how many option combinations are
-accepted, which is why it is 28% of git. **Guard that number above all others.**
+The line that will move most is the second-to-last. Every algorithm above it is
+bounded; the command layer scales with how many option combinations are
+accepted, which is why it is 28% of git. Watch it, and say what it did.
 
-**Superseded by measurement at the end of phase 6.** The whole ~9,000 was
-spent with four phases still to build: 8,959 lines of code for phases 1–6,
-of which the command layer is 3,186 for 30 of 56 commands. The layer does not
-scale with commands and it does not scale with option surface either — it
-scales with *shared* option surface not yet spent, and docs/03 and docs/04,
-the two large groups, are now both paid for. [`phase-6.md`](phase-6.md)
-revises the remaining figure to about 3,700, putting v1 near **12,700**, and
-names the cheapest cut if that is not acceptable (phase 9, serving). Decide
-before phase 7 starts.
+### 5.1 What it actually costs, measured
+
+Recorded at the end of phase 6, with phases 7, 8 and 10 still to build. The
+comparison that needs no arguing about which budget line belongs to which
+phase: the sketch above is **8,680 for the whole of v1**, and six of its nine
+phases have already cost **8,960**.
+
+| | budgeted | actual, after phase 6 |
+|---|---:|---:|
+| everything | 8,680 for all of v1 | **8,960** for phases 1–6 |
+| the command layer | 2,000 for 53 commands | 3,186 for 30 of them |
+| shared output formatting | — | 1,418 (`pretty`, `diffcore`, `status`, `reffilter`) |
+| the revision grammar | — | 395 (unbudgeted; it belongs to no one command) |
+
+The command layer does not scale with commands and it does not scale with
+option surface either. It scales with **shared option surface not yet spent**,
+and docs/03 (diff options) and docs/04 (revision options) — the two large
+groups — are now both paid for. Extrapolating from the last two phases
+over-predicts; extrapolating from what is left gives roughly 1,200 more.
+
+Revised estimate for phases 7, 8 and 10:
+
+```
+merge: file 3-way + structural tree merge                     600
+wire protocol v2 over ssh: ls-refs, fetch, push               700
+pack write + delta reuse                                      500
+argument parsing, the remaining 23 commands                 1,200
+gc, worktree, clean, check-ignore                             300
+                                                          -------
+                                                            3,300
+```
+
+which puts v1 near **12,300 lines of code**. That is 42% over the original
+sketch, and it is accepted rather than cut against: cutting the server (§6
+decision 2) removed the one phase that was not load-bearing, and further
+squeezing would come out of behavior the daily loop needs. The number is
+recorded here so that the *next* revision has evidence to argue with, and so
+the refactoring pass has a baseline.
 
 ---
 
@@ -377,37 +417,47 @@ All resolved (2026-09-01). Nothing in the scope is still open.
 | # | Question | Decision |
 |---|---|---|
 | 1 | Hooks | **Run `pre-commit` and `commit-msg`.** ~60 lines of fork/exec; `commit --no-verify` bypasses. No other hook fires. |
-| 2 | Serving repositories | **In scope for v1.** Ship `upload-pack` and `receive-pack`. |
+| 2 | Serving repositories | ~~In scope for v1.~~ **Cut (2026-09-01), after phase 6.** gittle is a transport client only. |
 | 3 | Regex engine | ~~Vendor a ~500-line ERE engine.~~ **Superseded at phase 5: bind libc's POSIX `regcomp`/`regexec`, as git itself does.** 45 lines, no new dependency, identical error text, static linking intact. No PCRE; `grep -P` and `log -P` stay cut, and `-G`/BRE with them. See §6.4. |
 | 4 | zlib | **Link the system zlib.** The one external dependency. |
 | 5 | SHA-1 | **Plain SHA-1**, ~150 lines. Not sha1dc — see the risk note below. |
 | 6 | CRLF / gitattributes | **Linux only.** No `core.autocrlf`, no `text=auto`, no filters. |
 | 7 | reftable | **Refuse with a clear message.** Detected through a general repository-extension gate — see §6.1. |
 | 8 | `index.version=4` | **Read support in v1.** ~30 lines, reusing the ofs-delta varint. Writing stays v2/v3. |
-| 9 | Binary dispatch | **`argv[0]` dispatch**, busybox-style, with `git-*` symlinks. |
-| 10 | `git-shell` | **In scope for v1.** Restricted login shell permitting only `upload-pack` and `receive-pack`. |
+| 9 | Binary dispatch | **`argv[0]` dispatch**, busybox-style. Kept after decision 2 changed, but now only for the optional `git` symlink — see §6.3. |
+| 10 | `git-shell` | ~~In scope for v1.~~ **Cut with decision 2**: it exists to guard a server gittle no longer is. |
 
 ### Consequences worth stating
 
-**Serving.** The client sends the literal command `git-upload-pack '<path>'` over
-ssh, so the serving host needs binaries by those names on `PATH`. gittle should
-dispatch on `argv[0]` and install `git-upload-pack` and `git-receive-pack` as
-symlinks, busybox-style. Two follow-ons worth deciding:
+**Not serving (decision 2, revised).** The original argument for shipping a
+server was that a device running only gittle should be cloneable. The argument
+against, which won once phases 1–6 had been measured, is that it is the one
+whole phase in the build order that nothing else needs:
 
-* `git-shell` ships. Set it as the git user's login shell; it permits exactly
-  `git-upload-pack` and `git-receive-pack` and rejects everything else,
-  including interactive login. gittle's whitelist is shorter than git's, which
-  also permits `git-upload-archive` — `archive` is cut, so that verb is refused.
-* `receive-pack` is the one place gittle accepts a packfile from an untrusted
-  peer. `index-pack` must validate the pack checksum, every object's own hash,
-  and connectivity of the resulting refs before any ref is updated. This is the
-  main security surface of the project.
+* it is the only phase with **no client-side benefit at all** — every other
+  phase makes the daily loop work better, and this one makes somebody else's
+  daily loop work;
+* it is the one place gittle would accept a packfile from an **untrusted
+  peer**, and therefore the only place where "plain SHA-1, not sha1dc" and
+  "no resource limits" would be a security posture rather than a footnote;
+* `upload-pack` done naively costs ~10x on a full clone (the withdrawn R2b),
+  so doing it *well* is more than the 400 lines it was budgeted at.
+
+Cutting it removes `upload-pack`, `receive-pack` and `git-shell` from the
+command set, and phase 9 from the build order.
+
+**What it does not remove.** `index-pack` still has to validate the pack
+checksum, every object's own hash, and the connectivity of what it received
+before any ref is updated — a *fetch* takes a packfile from the other end too,
+and a hostile server is as real as a hostile client. That validation stays in
+phase 8, and it remains the main security surface of the project.
 
 **Plain SHA-1.** Sufficient for compatibility: object IDs will match git's for
 identical content. The loss is git's sha1dc hardening, which detects the
 known collision-attack patterns and refuses. gittle will happily store a
-collision pair that git rejects. Acceptable for a local tool; note it if gittle
-ever serves untrusted pushes on a public network.
+collision pair that git rejects. That was noted as a risk to revisit if gittle
+ever served untrusted pushes; with the server cut, it no longer needs
+revisiting.
 
 **No gitattributes.** Beyond CRLF, this also means no `export-ignore`, no
 `diff=<driver>`, no `merge=<driver>`, and no `binary` marking — binary detection
@@ -504,21 +554,21 @@ a subcommand normally.
 
 ```
 gittle                     the real binary
-git-upload-pack   -> gittle    required: ssh clients send this exact command
-git-receive-pack  -> gittle    required: ssh clients send this exact command
-git-shell         -> gittle    optional: set as the git user's login shell
 git               -> gittle    optional: drop-in replacement on PATH
+git-<verb>        -> gittle    optional: the historical one-binary-per-command layout
 ```
 
-The first two are not a convenience. A git client connecting over ssh runs the
-literal command `git-upload-pack '<path>'` on the remote host, so those names
-must resolve on the serving host's `PATH` or nothing can clone from gittle. The
-`git` symlink is the opt-in that makes gittle a drop-in; without it, gittle
-never shadows a real git that may also be installed.
+**This was load-bearing until decision 2 changed.** A git client connecting
+over ssh runs the literal command `git-upload-pack '<path>'` on the remote
+host, so `git-upload-pack` and `git-receive-pack` had to resolve on the serving
+host's `PATH` or nothing could clone from gittle. With the server cut, nothing
+*requires* `argv[0]` dispatch any more.
 
-Dispatch costs roughly 30 lines and removes the need for any separate
-executables, which is what makes the single-static-binary goal survive contact
-with the transport protocol.
+It stays anyway, for two reasons that are worth being explicit about rather
+than leaving as inertia: it is twelve lines and already written and tested, and
+the `git` symlink is what makes gittle a drop-in — the opt-in that lets a
+system have both, with gittle never shadowing a real git unless somebody asks
+for it.
 
 ### 6.4 The regex engine — reopen at phase 5
 
@@ -643,10 +693,15 @@ create state with one tool, verify with the other, in both directions.
    `cherry-pick`, `revert`, `rebase`, `stash`.
 8. **Transport.** pkt-line, protocol v2 `ls-refs` and `fetch`, `index-pack`,
    then `clone`/`fetch`/`pull`; then `pack-objects` and `push`.
-9. **Serving.** `argv[0]` dispatch and the `git-*` symlinks, then `upload-pack`,
-   `receive-pack`, and `git-shell`. *Oracle: real `git clone ssh://…` and
-   `git push` against a gittle host, with `git-shell` as the login shell.*
+9. ~~**Serving.**~~ **Cut (2026-09-01)**, with decision 2. It was `argv[0]`
+   dispatch and the `git-*` symlinks, then `upload-pack`, `receive-pack` and
+   `git-shell`.
 10. **Housekeeping.** `gc`, `worktree`, `clean`, `check-ignore`.
+
+The numbering is not renumbered, and deliberately so: "phase 10" names the
+housekeeping phase in six other documents, in the test suite and in a source
+comment, and the numbers are identifiers rather than a count. Nine is simply
+empty.
 
 Phases 1–4 are the risky ones: everything after depends on the on-disk formats
 being exactly right, and format bugs found late are expensive.
@@ -656,3 +711,7 @@ being exactly right, and format bugs found late are expensive.
 In the order I would restore them: `apply` (unlocks patch workflows and
 `am`), `blame`, `log --graph`, `bisect`, `add -p`, rename detection,
 `describe`, `shortlog`, reftable read support.
+
+And, from v1's own scope, **serving** — `upload-pack`, `receive-pack` and
+`git-shell`, with whole-pack reuse (the withdrawn R2b) so that a full clone
+from a gittle host is not 10x. It comes back as a piece, or not at all.

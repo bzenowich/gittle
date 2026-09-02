@@ -195,10 +195,10 @@ Counts: 161 commands + 32 non-command manual pages (see `15-non-command-docs.md`
 
 - [ ] **http-fetch** — Fetch objects over dumb HTTP.
 - [ ] **http-push** — Push objects over HTTP/DAV.
-- [x] **receive-pack** — Server half of push: accept ref updates and a packfile from `send-pack`.
-- [x] **shell** — Restricted login shell that only permits git transport commands over ssh.
+- [ ] **receive-pack** — Server half of push: accept ref updates and a packfile from `send-pack`.  *(was in scope; cut with the server, plan.md §6 decision 2)*
+- [ ] **shell** — Restricted login shell that only permits git transport commands over ssh.  *(was in scope; cut with the server)*
 - [ ] **upload-archive** — Server half of `git archive --remote`, streaming an archive back to the client.
-- [x] **upload-pack** — Server half of fetch: advertise refs and send the requested packfile.
+- [ ] **upload-pack** — Server half of fetch: advertise refs and send the requested packfile.  *(was in scope; cut with the server)*
 
 ---
 

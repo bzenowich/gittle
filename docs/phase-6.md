@@ -346,6 +346,13 @@ work and buys nothing for a client-only tool. That is a decision for the plan,
 not for this document, but it is the one worth taking before phase 7 starts
 rather than after.
 
+**Resolved (2026-09-01), both ways.** The server is cut — `upload-pack`,
+`receive-pack` and `git-shell` are out and phase 9 is empty — and the line
+budget is now a measurement rather than a limit, with an optimisation and
+refactoring pass planned once v1 is feature-complete. `plan.md` §5.1 carries
+the running figure (~12,300 for v1 with the server gone) and §6 decision 2 the
+reasoning. `argv[0]` dispatch stays, no longer because anything requires it.
+
 ## What was left undone, and where it belongs
 
 | | |
@@ -358,3 +365,4 @@ rather than after.
 | a custom fetch refspec — `upstreamRef` assumes `+refs/heads/*:refs/remotes/<remote>/*` | phase 8, which is where a refspec is parsed at all |
 | `rev-list --objects-edge`, `--filter` | phase 8 if `pack-objects` turns out to want them; cut otherwise |
 | `worktree`, `gc`, `clean`, `check-ignore` | phase 10 |
+| `upload-pack`, `receive-pack`, `git-shell` | **cut, not deferred** — v2 backlog, as a piece |

@@ -1,14 +1,21 @@
 ## gittle -- a minimal git.
 ##
-## One binary, busybox-style (plan.md 6.3).  `main` looks at `basename(argv[0])`
-## first: a client connecting over ssh runs the literal command
-## `git-upload-pack '<path>'`, so those names must dispatch without a `git`
-## wrapper in front of them.
+## One binary, busybox-style (plan.md 6.3).  `main` looks at
+## `basename(argv[0])` first: a `git-<verb>` name dispatches straight to that
+## verb, and a `git` symlink makes gittle a drop-in on `PATH`.
+##
+## This used to be load-bearing rather than a convenience -- a client
+## connecting over ssh runs the literal command `git-upload-pack '<path>'`, so
+## a serving host had to have that name resolve.  The server was cut after
+## phase 6 (plan.md 6 decision 2) and nothing requires the dispatch now; it
+## stays because it is twelve lines, already tested, and the `git` symlink is
+## what lets a system have both without gittle shadowing a real one.
 
 import std/[os, strutils]
 import cli, config, util
 import cmd/hashobject, cmd/catfile
-import cmd/updateref, cmd/symbolicref, cmd/foreachref, cmd/revparse, cmd/revlist, cmd/mergebase
+import cmd/updateref, cmd/symbolicref, cmd/foreachref
+import cmd/revparse, cmd/revlist, cmd/mergebase
 import cmd/lstree, cmd/writetree, cmd/readtree, cmd/updateindex, cmd/lsfiles
 import cmd/config as cmdconfig
 import cmd/init, cmd/committree, cmd/add, cmd/log, cmd/commit, cmd/show

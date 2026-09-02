@@ -36,7 +36,7 @@ can be marked up in place.
 | `` `[log]` `` | Seen in the agent tool-call logs; 177 entries, 169 of them kept |
 | **CUT from v1** | Section banner: every option below it is out of scope, reason inline |
 
-Current recommendation: **56 of 161 commands, 450 of 2,341 option entries.**
+Current recommendation: **53 of 161 commands, 447 of 2,341 option entries.**
 The reasoning, the design rules behind it, the budget, and eight open questions
 are in **[plan.md](plan.md)** — read that before revising the marks. All ten open questions
 are now decided; §6 is a decision record.
@@ -68,7 +68,7 @@ implementing anything.
 | `09-plumbing-interrogators.md` | Read-only plumbing (`cat-file`, `rev-parse`, `ls-*`, …). |
 | `10-plumbing-manipulators.md` | Mutating plumbing (`update-index`, `pack-objects`, `apply`, …). |
 | `11-ancillary-options.md` | Ancillary interrogators and manipulators (`config`, `fsck`, `repack`, …). |
-| `12-transport-and-server.md` | Transport endpoints and server-side helpers (`upload-pack`, `receive-pack`, …). |
+| `12-transport-and-server.md` | Transport endpoints, and the server-side helpers that were cut with the server. |
 | `13-pure-helpers.md` | Pure helpers (`mailinfo`, `check-attr`, `hook`, …). |
 | `14-foreign-scm.md` | Foreign SCM bridges (`svn`, `p4`, `cvs*`, `send-email`, …). |
 | `15-non-command-docs.md` | Guides, file formats, and user interfaces that are documentation, not commands. |

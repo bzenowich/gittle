@@ -1,13 +1,17 @@
 # 12 — Transport endpoints and server-side helpers
 
-> **PARTIALLY IN SCOPE.** gittle v1 is a transport client *and* a server.
-> As a client, `clone`/`fetch`/`push` speak protocol v2 over ssh, spawning
+> **PARTIALLY IN SCOPE.** gittle v1 is a transport **client only**.
+> `clone`/`fetch`/`push` speak protocol v2 over ssh, spawning
 > `git-upload-pack` / `git-receive-pack` on the far side, and use a direct
-> object-store copy for local paths. As a server, gittle ships `upload-pack` and
-> `receive-pack` so a device running only gittle can be cloned from and pushed
-> to, plus `git-shell` as the restricted login shell. Dispatch is by `argv[0]`,
-> so the `git-*` names are symlinks into the one binary. The HTTP and `git://`
-> transports remain cut.
+> object-store copy for local paths.
+>
+> The **server halves are cut** (2026-09-01, plan.md §6 decision 2):
+> `upload-pack`, `receive-pack` and `git-shell` were in scope until the end of
+> phase 6 and are not any more. They are the one part of the build order with
+> no client-side benefit, the only place gittle would take a packfile from an
+> untrusted peer, and — done well enough not to cost 10x on a full clone —
+> more than the 400 lines they were budgeted at. They are in the v2 backlog as
+> a piece. The HTTP and `git://` transports remain cut.
 
 > **Marks** — `[x]` in scope for gittle v1 · `[ ]` out of scope · `` `[log]` `` seen in the
 > agent tool-call logs (`git-tool-calls-*.md`). A section headed **CUT from v1** has every
@@ -51,9 +55,11 @@ in `gitprotocol-pack`, `gitprotocol-v2`, `gitprotocol-common`, and
 
 ## `upload-pack` — server half of fetch
 
-- [x] `<directory>` — *(core)* Repository to serve.
-- [x] `--strict` / `--no-strict` — Refuse (or allow) falling back to `<directory>/.git`.
-- [x] `--timeout=<n>` — Abort after `<n>` seconds of inactivity.
+> **CUT from v1** — with the rest of the server; see the banner above.
+
+- [ ] `<directory>` — Repository to serve.
+- [ ] `--strict` / `--no-strict` — Refuse (or allow) falling back to `<directory>/.git`.
+- [ ] `--timeout=<n>` — Abort after `<n>` seconds of inactivity.
 - [ ] `--stateless-rpc` — Do one request/response cycle, as HTTP requires.
 - [ ] `--http-backend-info-refs` — Serve the HTTP `info/refs` advertisement form.
 
@@ -75,7 +81,9 @@ in `gitprotocol-pack`, `gitprotocol-v2`, `gitprotocol-common`, and
 
 ## `receive-pack` — server half of push
 
-- [x] `<git-dir>` — *(core)* Repository to receive into.
+> **CUT from v1** — with the rest of the server; see the banner above.
+
+- [ ] `<git-dir>` — Repository to receive into.
 - [ ] `--http-backend-info-refs` — Serve the HTTP `info/refs` advertisement form.
 - [ ] `--skip-connectivity-check` — Skip verifying that the pushed objects' closure is present.
 
@@ -84,14 +92,11 @@ Its real interface is the hook set it runs: `pre-receive`, `update`,
 
 ## `shell` — restricted ssh login shell
 
-- [x] `git receive-pack <argument>` / `git upload-pack <argument>` — The only commands permitted. gittle drops `git upload-archive` from the whitelist because `archive` is cut.
-- [ ] `cvs server` — Additionally permitted when CVS emulation is enabled.
-- [x] `-c <command> <argument>` — The form ssh uses to pass the requested command.
+> **CUT from v1** — it exists to guard a server gittle no longer is.
 
-In scope for v1. An ssh-only server side is exactly `git-shell` plus
-`upload-pack`/`receive-pack`, and nothing else. Set it as the login shell of the
-git user; it permits only the two transport commands and rejects everything
-else, including an interactive login.
+- [ ] `git receive-pack <argument>` / `git upload-pack <argument>` — The only commands permitted.
+- [ ] `cvs server` — Additionally permitted when CVS emulation is enabled.
+- [ ] `-c <command> <argument>` — The form ssh uses to pass the requested command.
 
 ## `upload-archive` — server half of `archive --remote`
 

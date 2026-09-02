@@ -43,7 +43,7 @@ first, by anyone, in every phase:
 
 ## Documentation
 
-Comments do not count against the ~9 kloc budget, and a goal of the project is
+Comments do not count against the line budget, and a goal of the project is
 that the result is *readable* — a minimal git someone can learn from. So:
 
 - Every module opens with what the thing **is**, what its on-disk or on-wire
@@ -67,12 +67,16 @@ None of these is optional; `plan.md` §7 has the detail.
 
 ## Watch this number
 
-`plan.md` §5 budgeted **2,000 lines for the whole command layer** and ~9,000
-for the project. **Both are spent.** At the end of phase 6 the total is 8,960
-lines of code with four phases still to build, and the command layer is 3,186
-for 30 of 56 commands.
+`plan.md` §5 is **a measurement, not a limit** — that was settled after phase 6,
+along with cutting the server. Do not cram to hit a figure, and do not let it
+drift unremarked either: record the line count at the end of every phase and
+explain the over-runs. §5.1 has the running total (8,960 after phase 6, ~12,300
+projected for v1) and the reason the command layer costs what it does.
 
-`docs/phase-6.md` has the measurement and a revised estimate (~12,700 for v1),
-along with the cheapest available cut. Read it before adding anything, and
-record the number again at the end of every phase — the point of the budget is
-that it is checked, not that it is met.
+An optimisation and refactoring pass is planned once v1 is feature-complete, so
+prefer the clear version now over the clever one.
+
+**The server is cut** (plan.md §6 decision 2): no `upload-pack`, no
+`receive-pack`, no `git-shell`, and phase 9 is empty. gittle is a transport
+client. `index-pack`'s validation still matters — a *fetch* takes a packfile
+from the other end too.

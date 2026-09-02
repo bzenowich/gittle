@@ -6,10 +6,11 @@ share a repository with real git, and plausible in a busybox-class environment.
 - **On-disk compatible.** A gittle repository *is* a git repository. Real git and
   gittle can operate on the same working tree, in any order.
 - **ssh-only remotes**, speaking protocol v2 against an ordinary git server.
-- **Client and server.** Ships `upload-pack`, `receive-pack`, and `git-shell`.
+- **A transport client**, not a server: gittle clones from, fetches from and
+  pushes to a git host, and does not host one.
 - **One static binary**, busybox-style `argv[0]` dispatch. Only external
   dependency is the system zlib.
-- **Target: ~9 kloc.**
+- **Small enough to read in an afternoon** — around 10 kloc of Nim.
 
 ## Status
 
@@ -39,9 +40,11 @@ either tool wrote.
 `grep` and `log --grep` use libc's POSIX regex rather than a vendored engine —
 which is what git itself does, and what turned a 500-line budget line into 45.
 
-8,960 lines of the ~9,000 budgeted — which is the whole budget with four
-phases to go. [`docs/phase-6.md`](docs/phase-6.md) has the numbers and a
-revised estimate.
+8,960 lines of code so far, against an original sketch of ~9,000 for the whole
+of v1. That sketch is now a measurement rather than a limit: the server was cut
+(it is the one phase with no client-side benefit), the rest is accepted at an
+estimated ~12,300, and an optimisation and refactoring pass comes once v1 is
+feature-complete. [`docs/plan.md`](docs/plan.md) §5.1 has the numbers.
 
 - [`docs/plan.md`](docs/plan.md) — goals, the eight design rules, scope,
   budget, the ten decisions, build order. **Read this first.**
