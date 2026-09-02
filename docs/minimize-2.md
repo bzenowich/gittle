@@ -649,3 +649,104 @@ asserted nothing since they were written.
 `gittle checkout :/one` reported a pathspec that matched nothing, naming a
 mistake the user had not made. A cut syntax must fail loudly and never resolve
 to something else.
+
+---
+
+## 13. Round two: A1, A2, B4 (2026-09-02)
+
+Five lanes this time, partitioned by **subsystem** rather than by task, because
+A1 (folds) and A2 (prose) are cross-cutting rules rather than places: each lane
+applied all three items to the files it owned.
+
+| lane | landed | of which |
+|---|---:|---|
+| P2 diff & display | **−85** | B4 −83, A2 −2 |
+| P4 working-tree commands | **−71** | B4 and the `cmdCommit` break-up |
+| P1 refs & naming | **−33** | A1 −13, B4 −16, A2 −4 |
+| P3 objects, index, walk | **−13** | A1; B4 **−0**, with evidence |
+| P5 transport commands | **−11** | B4 −11 |
+| cross-lane folds | **−27** | the halves that crossed a boundary |
+| **round total** | **−240** | **11,301 → 11,061** |
+
+Package A to date: **11,724 → 11,061, −663** of an estimated −1,510.
+
+### The estimates were wrong the same way again, and now we know why
+
+§12 diagnosed it as "priced the subsystem, not the duplication". Round two
+sharpens that: **the option *rows* were never the cost.** B4 was priced at
+−250 across 328 `opt` rows; what actually paid was the branching *inside the
+writers* that an option implied. `--color` alone was half of P2's −85 — five
+escape constants, a template, a three-shape coloured hunk block and a coloured
+bar — and its table row was one line. A cut that removes a row and no branches
+is worth nothing.
+
+The corollary, which is the useful part: **the remaining option surface is
+mostly free to keep.** 328 rows minus what came out is still ~290 rows, and
+they cost about a line each.
+
+### Condition (b) turned out to be the binding constraint, not the logs
+
+Every lane was told to cut only what has zero uses in the tool-call logs
+**and** nothing in the oracle depending on it. §B4 assumed the log measurement
+would bind. It did not:
+
+- **P3: −0 in six commands.** Every option of `ls-files`, `ls-tree`,
+  `cat-file`, `hash-object`, `merge-base` and `write-tree` is enumerated by the
+  oracle for a machine-readable comparison. Cutting one means deleting a check
+  first, which is a scope decision and not a B4 one.
+- **P5: 15 of 19 transport options blocked.** `p8mut` keeps two servers as well
+  as two clients, so options no log types — `fetch --prune`, `push --force`,
+  `clone --bare` — are the only way the suite reaches a far-side state it then
+  compares. §B4's nomination of "`fetch`'s prune and tag variants" is simply
+  not available.
+- **P4: whole commands blocked.** `rebase`'s seven options, `clean`'s five,
+  `mv -f` — zero log uses, full `p6mut` coverage.
+
+The logs say what an agent *types*; the oracle says what the tool must still
+*do*. For a command that writes, the second is the real constraint.
+
+### Two of §B4's own nominations were wrong on the evidence
+
+P2 re-read the logs with each hit's context checked rather than grepped:
+`-w`/`--ignore-all-space` **is** used (p4gui:2026) and `--ignore-cr-at-eol` is
+used twice in one call (p4gui:1383). §B4 nominated the whole whitespace family;
+half of it survives. `-S` has thirteen uses and was never a candidate.
+
+### A2 is smaller than 340 lines, for a reason worth keeping
+
+The 340 string-continuation lines are real, but a large share of them are in
+`checkout.detachedAdvice` (16 lines), `rebase`'s conflict instructions,
+`rm.refusalText` (12) and `revision.failAmbiguous` — **exactly the messages the
+oracle compares against git byte for byte**. `p6norm` even carries a rule
+written for one of them. One lane shortened `failAmbiguous`, broke seven
+comparisons in two sections, and reverted it.
+
+So A2's real ceiling is the prose git does *not* define, which is perhaps a
+third of the 340. The rest is compatibility surface wearing prose's clothes.
+
+### Three bugs, all found by folding rather than by testing
+
+1. **`remotes.buildRefMap` expanded a `revParseRules` rule by concatenation**
+   (`rule & src`), producing `refs/remotes/@/HEADmain` — a pattern that can
+   match no advertisement. git substitutes into every rule
+   (`remote.c:find_ref_by_name_abbrev`). Four copies of a thing is how one of
+   them stays wrong.
+2. **`rev-parse --abbrev-ref` defaulted to loose**; git's default is strict
+   (`abbrev_ref_strict` ← `warn_ambiguous_refs`). With a branch and a tag both
+   named `dup` it answered `dup`, a name that resolves to the *other* ref.
+   Invisible to the suite because nothing in the fixture had two refs with one
+   name; it now has its own repository and seven checks.
+3. **`gittle merge -s ort` signed the merge off and swallowed `ort`** as the
+   commit to merge — git spells `--strategy` as `-s`. A wrong repository with
+   no message, which is the worst outcome this project has. It refuses now.
+
+And one option that did nothing at all: `clone -v` set a field that
+`remotes.nim` only reads under `opt.report`, which a clone sets false.
+
+### The suite grew four "trims" blocks and two checks
+
+175 checks, up from 172. A cut option must now be *asserted* to refuse and to
+name itself — `branch trims` (10), `tag trims` (10), `commit/merge/pick trims`
+(21), `transport trims` (8), and `log deferrals` (34, which now also checks the
+message names the option). The transport commands had no such block, which is
+how `clone -v` survived.
