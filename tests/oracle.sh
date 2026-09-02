@@ -1085,13 +1085,22 @@ done
 # Path limiting is history simplification, not a filter: a commit whose tree is
 # unchanged under the pathspec is skipped and only that parent is followed.
 path_ok=1; npath=0
+# The depth is what costs: a rarely-touched path walks most of the history to
+# find its 60 commits.  20 still crosses merges whose parents differ under the
+# pathspec, which is what simplification has to get right.
+LP=20; [ $FULL = 1 ] && LP=60
+lp_one(){  # one pathspec, both tools; prints only when they disagree
+  [ "$(git -C "$REFREPO" log --oneline -$LP $NOMAILMAP -- "$1")" \
+  = "$("$GITTLE" -C "$REFREPO" log --oneline -$LP -- "$1")" ] \
+    || echo "  log -- $1 differs"
+}
+fanstart
 for p in Makefile diff.c Documentation t/t0000-basic.sh compat builtin/log.c \
          contrib po "*.h" "Documentation/git-log.adoc"; do
   npath=$((npath+1))
-  a=$(git -C "$REFREPO" log --oneline -60 $NOMAILMAP -- "$p")
-  b=$("$GITTLE" -C "$REFREPO" log --oneline -60 -- "$p")
-  [ "$a" = "$b" ] || { path_ok=0; echo "  log -- $p differs"; }
+  fanjob lp_one "$p"
 done
+p6ok=1; fanwait; [ $p6ok = 1 ] || path_ok=0
 # Without `--`, and from a subdirectory.
 npath=$((npath+1))
 [ "$(git -C "$REFREPO" log --oneline -30 $NOMAILMAP Makefile)" \
@@ -1317,17 +1326,24 @@ done
 # git rather than read off the manual: different kinds AND, repeats of one
 # kind OR, and --all-match turns the message group into an AND too.
 lim_ok=1; nlim=0
-LIMN=3000
+# The AND/OR/--all-match/-i/-F semantics are settled within the first
+# thousand commit messages; the depth only multiplies the walk.
+LIMN=1000
 [ $FULL = 1 ] && LIMN=20000
+lim_one(){  # one pattern combination, both tools
+  [ "$(git -C "$REFREPO" log $NOMAILMAP -n$LIMN --format=%H -E "$@" 2>&1 | md5sum)" \
+  = "$("$GITTLE" -C "$REFREPO" log -n$LIMN --format=%H "$@" 2>&1 | md5sum)" ] \
+    || echo "  log $* differs"
+}
+fanstart
 for f in "--grep=pack" "--grep=pack --grep=ref" "--grep=pack --grep=ref --all-match" \
          "--grep=pack --invert-grep" "--author=Junio" "--committer=Junio" \
          "--author=Junio --grep=pack" "--author=Junio --committer=Taylor" \
          "--grep=PACK -i" "--grep=pack -F" "--grep=p.ck" "--author=gitster@pobox.com"; do
   nlim=$((nlim+1))
-  a=$(git -C "$REFREPO" log $NOMAILMAP -n$LIMN --format=%H -E $f 2>&1 | md5sum)
-  b=$("$GITTLE" -C "$REFREPO" log -n$LIMN --format=%H $f 2>&1 | md5sum)
-  [ "$a" = "$b" ] || { lim_ok=0; echo "  log $f differs"; }
+  fanjob lim_one $f
 done
+p6ok=1; fanwait; [ $p6ok = 1 ] || lim_ok=0
 [ $lim_ok = 1 ] && { ok; report "log --grep/--author" "$nlim pattern combinations"; } \
                 || bad "log --grep/--author"
 
@@ -1483,8 +1499,8 @@ fi
 # `-E` throughout, because git's default is BRE and gittle's patterns are ERE
 # always -- a divergence docs/07 chose and phase-5.md records.
 grep_ok=1; ngrep=0
-GREPPAT="static xdl_ TODO the Signed-off-by"
-[ $FULL = 1 ] && GREPPAT="$GREPPAT ^int [a-z]+_oid struct"
+GREPPAT="static the"
+[ $FULL = 1 ] && GREPPAT="static xdl_ TODO the Signed-off-by ^int [a-z]+_oid struct"
 for pat in $GREPPAT; do
   for f in "-n" "-l" "" "-i -n" "-L" "-v -l" "-v -n" "--cached -n"; do
     ngrep=$((ngrep+1))
@@ -1560,24 +1576,59 @@ p6norm(){ sed -e '/^hint:/d' -e 's/^fatal: //' -e 's/^gittle: //' -e "s/'git /'g
               -e 's/known to git$/known to gittle/' \
               -e 's/^hint:   git /hint:   gittle /'; }
 
-# p6ro <expected-name> <args...> -- a read-only command, both tools, one repo.
+# ro1 <expected-name> <args...> -- one read-only comparison, both tools, one
+# repository.  It prints *nothing* when they agree and the failure report when
+# they do not, which is what lets the same function be called directly (`p6ro`,
+# below) or on another core (`fanjob`).
 p6dir=""
-p6ro(){
-  local ao as ae bo bs be
-  ao=$( cd "$p6dir" && git "$@" 2>"$WORK/p6.ea" ); as=$?
-  ae=$(p6norm < "$WORK/p6.ea")
-  bo=$( cd "$p6dir" && "$GITTLE" "$@" 2>"$WORK/p6.eb" ); bs=$?
-  be=$(p6norm < "$WORK/p6.eb")
-  p6n=$((p6n+1))
+ro1(){
+  local ao as ae bo bs be t="$WORK/ro.$BASHPID"
+  ao=$( cd "$p6dir" && git "$@" 2>"$t.ea" ); as=$?
+  ae=$(p6norm < "$t.ea")
+  bo=$( cd "$p6dir" && "$GITTLE" "$@" 2>"$t.eb" ); bs=$?
+  be=$(p6norm < "$t.eb")
+  rm -f "$t.ea" "$t.eb"
   # P6ERR=0 compares the exit status but not the text of a refusal: git's
   # near-miss diagnostics for `:<path>` are cut (docs/minimize.md §3).
   if [ "$ao" != "$bo" ] || [ "$as" != "$bs" ] || \
      { [ "${P6ERR:-1}" = 1 ] && [ "$ae" != "$be" ]; }; then
-    p6ok=0
     printf '  %s %s  [git %d / gittle %d]\n' "${p6what:-}" "$*" "$as" "$bs"
     diff <(printf '%s\n' "$ao") <(printf '%s\n' "$bo") | head -4
     [ "$ae" = "$be" ] || printf '    err: %s | %s\n' "$ae" "$be"
   fi
+}
+p6ro(){
+  local out
+  p6n=$((p6n+1))
+  out=$(ro1 "$@")
+  [ -z "$out" ] || { p6ok=0; printf '%s\n' "$out"; }
+}
+
+# ---------------------------------------------------------------- fan-out
+# The comparisons over the reference repository are the bulk of the suite's
+# running time, and every one of them only *reads* one repository: they share
+# nothing, so they are the part that can use the other seven cores.  A
+# background subshell cannot raise `p6ok` in the parent, so each job writes
+# what it printed to a file and `fanwait` collects them.
+#
+# The forms still run in the order they were queued as far as the report is
+# concerned, so a failure reads the same as it did serially.
+JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+fann=0; fandir=""
+fanstart(){ fandir="$WORK/fan"; rm -rf "$fandir"; mkdir -p "$fandir"; fann=0; }
+fanjob(){  # fanjob <fn> <args...> -- one comparison, on another core
+  fann=$((fann+1)); p6n=$((p6n+1))
+  ( "$@" >"$fandir/$(printf %05d $fann).out" 2>&1 ) &
+  while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
+}
+fanwait(){
+  wait
+  local f
+  for f in "$fandir"/*.out; do
+    [ -s "$f" ] || continue
+    p6ok=0; cat "$f"
+  done
+  rm -rf "$fandir"
 }
 
 # Everything a command could have written, as text.  Works on a bare
@@ -1746,21 +1797,24 @@ p6dir="$P6/fix"
 # Over the reference repository, because a merge base is only interesting on
 # history with real criss-crosses in it.
 p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="merge-base"
-p6ro merge-base HEAD HEAD~5
-p6ro merge-base --is-ancestor HEAD~5 HEAD
-p6ro merge-base --is-ancestor HEAD HEAD~5
-p6ro merge-base --is-ancestor HEAD HEAD
-for t in v2.10.0 v2.20.0 v2.30.0 v2.40.0; do
-  p6ro merge-base HEAD $t; p6ro merge-base --all $t v2.28.0
+fanstart
+fanjob ro1 merge-base HEAD HEAD~5
+fanjob ro1 merge-base --is-ancestor HEAD~5 HEAD
+fanjob ro1 merge-base --is-ancestor HEAD HEAD~5
+fanjob ro1 merge-base --is-ancestor HEAD HEAD
+MBT="v2.20.0 v2.40.0"; [ $FULL = 1 ] && MBT="v2.10.0 v2.20.0 v2.30.0 v2.40.0"
+for t in $MBT; do
+  fanjob ro1 merge-base HEAD $t; fanjob ro1 merge-base --all $t v2.28.0
 done
-p6ro merge-base --all v2.20.0 v2.35.0 v2.30.0
+fanjob ro1 merge-base --all v2.20.0 v2.35.0 v2.30.0
 # Random pairs, which is the only way to reach a criss-cross on purpose.
-NPAIR=40; [ $FULL = 1 ] && NPAIR=400
+NPAIR=20; [ $FULL = 1 ] && NPAIR=400
 mapfile -t P6C < <(git -C "$REFREPO" rev-list -n 4000 HEAD |
                    shuf -n $NPAIR --random-source=<(yes))
 for ((i = 0; i + 1 < ${#P6C[@]}; i += 2)); do
-  p6ro merge-base --all "${P6C[$i]}" "${P6C[$((i+1))]}"
+  fanjob ro1 merge-base --all "${P6C[$i]}" "${P6C[$((i+1))]}"
 done
+fanwait
 [ $p6ok = 1 ] && { ok; report "merge-base" "$p6n forms, $((NPAIR/2)) random commit pairs"; } \
               || bad "merge-base"
 
@@ -1770,6 +1824,14 @@ done
 # with git means reproducing the choice.
 p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="rev-list"
 RN=200; [ $FULL = 1 ] && RN=4000
+# A pathspec walk diffs a tree per commit, and `-- t/` from HEAD has to walk
+# most of 82,000 commits to find its 60: the two forms below were 45 of the
+# sampled run's 340 seconds between them, a seventh of the suite for two
+# lines.  Bounded to a real tag range they exercise the same three things --
+# the tree diff, the topological order, parent rewriting -- over real merges,
+# and --full still walks from HEAD.
+RP="v2.30.0..v2.31.0"; [ $FULL = 1 ] && RP=HEAD
+fanstart
 for a in "-n $RN HEAD" "-n $RN --topo-order HEAD" "-n $RN --date-order HEAD" \
          "-n $RN --first-parent HEAD" "-n $RN --merges HEAD" \
          "-n $RN --no-merges HEAD" "-n 50 --parents HEAD" \
@@ -1777,18 +1839,19 @@ for a in "-n $RN HEAD" "-n $RN --topo-order HEAD" "-n $RN --date-order HEAD" \
          "HEAD~50...HEAD~20" "--left-right HEAD~50...HEAD~20" \
          "-n 100 --reverse HEAD" "--no-walk HEAD HEAD~5 HEAD~2" \
          "--no-walk=unsorted HEAD HEAD~5 HEAD~2" "-n 100 HEAD -- Makefile" \
-         "-n 100 --parents HEAD -- Makefile" "-n 30 --topo-order HEAD -- diff.c" \
-         "-n 30 --date-order HEAD -- diff.c" \
-         "-n 30 --topo-order --parents HEAD -- diff.c" "-n 20 --skip=5 HEAD" \
+         "-n 100 --parents HEAD -- Makefile" "-n 30 --topo-order $RP -- diff.c" \
+         "-n 30 --date-order $RP -- diff.c" \
+         "-n 30 --topo-order --parents $RP -- diff.c" "-n 20 --skip=5 HEAD" \
          "HEAD~3^!" "HEAD~3^@" "-n 5 --oneline HEAD" "-n 3 --pretty=medium HEAD" \
          "-n 3 --pretty=raw HEAD" "-n 3 --pretty=fuller HEAD" \
          "-n 3 --pretty=oneline HEAD" "-n 5 --format=%h HEAD" \
          "-n 5 --format=%h --abbrev-commit HEAD" "--count v2.30.0..v2.31.0" \
          "--left-right --count v2.30.0...v2.31.0" \
          "-n 200 --since=2024-01-01 HEAD" "-n 200 --until=2020-01-01 HEAD" \
-         "-n 60 --topo-order HEAD -- t/" "--count --all"; do
-  p6ro rev-list $a
+         "-n 60 --topo-order $RP -- t/" "--count --all"; do
+  fanjob ro1 rev-list $a
 done
+fanwait
 # `--objects` is the question a fetch asks, so both halves of a range matter.
 p6dir="$P6/fix"
 for a in "--objects HEAD" "--objects --all" "--objects main ^side" \
@@ -1803,6 +1866,16 @@ done
 
 # `log` shares the same parser, so what is tested here is that it *does*.
 p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="log"
+log_one(){
+  # git applies .mailmap by default and gittle does not; see the note at the
+  # top of this file.
+  local ao as bo bs
+  ao=$(git -C "$REFREPO" log "$@" $NOMAILMAP 2>&1); as=$?
+  bo=$("$GITTLE" -C "$REFREPO" log "$@" 2>&1); bs=$?
+  { [ "$ao" = "$bo" ] && [ "$as" = "$bs" ]; } \
+    || { echo "  log $* differs"; diff <(echo "$ao") <(echo "$bo")|head -4; }
+}
+fanstart
 for a in "-n 20 --oneline --topo-order" "-n 20 --oneline --date-order" \
          "-n 20 --oneline --all" "-n 10 --oneline HEAD~30..HEAD" \
          "-n 10 --left-right HEAD~30...HEAD~10" \
@@ -1812,36 +1885,36 @@ for a in "-n 20 --oneline --topo-order" "-n 20 --oneline --date-order" \
          "-n 5 --parents" "-n 20 --oneline --parents -- Makefile" \
          "--no-walk --oneline HEAD HEAD~3" "-n 8 --oneline --first-parent" \
          "-n 5 --oneline --branches" "-n 5 --oneline --tags"; do
-  # git applies .mailmap by default and gittle does not; see the note at the
-  # top of this file.
-  ao=$(git -C "$REFREPO" log $a $NOMAILMAP 2>&1); as=$?
-  bo=$("$GITTLE" -C "$REFREPO" log $a 2>&1); bs=$?
-  p6n=$((p6n+1))
-  { [ "$ao" = "$bo" ] && [ "$as" = "$bs" ]; } \
-    || { p6ok=0; echo "  log $a differs"; diff <(echo "$ao") <(echo "$bo")|head -4; }
+  fanjob log_one $a
 done
+fanwait
 [ $p6ok = 1 ] && { ok; report "log, shared surface" "$p6n forms through the same parser"; } \
               || bad "log, shared surface"
 
 # ---------------------------------------------------------- for-each-ref
 p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="for-each-ref"
+fanstart
 for f in '%(refname)' '%(refname:short)' '%(objectname)' '%(objectname:short)' \
          '%(objectname:short=12)' '%(objecttype)' '%(subject)' '%(contents)' \
          '%(contents:subject)' '%(contents:body)' '%(contents:lines=1)' \
          '%(contents:lines=3)' '%(*objectname)' '%(HEAD)%(refname)' \
          '%(upstream) %(upstream:short)'; do
-  p6ro for-each-ref --format="$f" refs/tags
+  fanjob ro1 for-each-ref --format="$f" refs/tags
 done
-p6ro for-each-ref refs/heads
-p6ro for-each-ref 'refs/tags/v2.3*'
-p6ro for-each-ref --count=5
-p6ro for-each-ref --sort=objectname
-p6ro for-each-ref --sort=-refname
-p6ro for-each-ref --contains v2.30.0 refs/tags
-p6ro for-each-ref --no-contains v2.30.0 refs/tags
-p6ro for-each-ref --merged v2.31.0 refs/tags
-p6ro for-each-ref --no-merged v2.31.0 refs/tags
-p6ro for-each-ref --points-at HEAD
+fanjob ro1 for-each-ref refs/heads
+fanjob ro1 for-each-ref 'refs/tags/v2.3*'
+fanjob ro1 for-each-ref --count=5
+fanjob ro1 for-each-ref --sort=objectname
+fanjob ro1 for-each-ref --sort=-refname
+# The four ancestry filters ask one reachability question per ref, and there
+# are 800 tags: over a glob they ask 30 and test the same four answers.
+FT=refs/tags/v2.3; [ $FULL = 1 ] && FT=refs/tags
+fanjob ro1 for-each-ref --contains v2.30.0 "$FT"
+fanjob ro1 for-each-ref --no-contains v2.30.0 "$FT"
+fanjob ro1 for-each-ref --merged v2.31.0 "$FT"
+fanjob ro1 for-each-ref --no-merged v2.31.0 "$FT"
+fanjob ro1 for-each-ref --points-at HEAD
+fanwait
 [ $p6ok = 1 ] && { ok; report "for-each-ref" "$p6n atoms and filters over 1,000 refs"; } \
               || bad "for-each-ref"
 
