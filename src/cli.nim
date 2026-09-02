@@ -13,6 +13,7 @@
 ## one.  A command that genuinely needs a repository simply touches `c.repo`
 ## and gets the error for free.
 
+import std/strutils
 import config, repository, util
 
 type
@@ -53,3 +54,25 @@ proc expandShortOptions*(args: openArray[string], withValue: set[char]): seq[str
       if a[k] in withValue:
         if k + 1 < a.len: result.add a[k + 1 .. ^1]
         break
+
+template optionValue*(argv, idx: untyped): untyped =
+  ## Define `valueFor`, the option-argument reader every command needs.
+  ##
+  ## git accepts three spellings and a command has to take all of them:
+  ## `--opt=value`, `--opt value`, and -- for an option whose argument is
+  ## *optional* -- nothing at all, in which case a default applies and the
+  ## next argument must be left alone because it is another option.  That
+  ## last rule is why `branch --contains` and `branch --contains v1` both
+  ## work, and it is easy to write nine slightly different ways.
+  ##
+  ## A template, because it has to advance the caller's own index: the value
+  ## and the loop position are the same state, and separating them is exactly
+  ## how a parser comes to consume one argument twice.
+  proc valueFor(a: string, dflt = ""): string {.used.} =
+    let eq = a.find('=')
+    if eq > 0: return a[eq + 1 .. ^1]
+    if idx + 1 < argv.len and (dflt.len == 0 or argv[idx + 1][0] != '-'):
+      inc idx
+      return argv[idx]
+    failIf(dflt.len == 0, "option '" & a & "' requires a value")
+    dflt

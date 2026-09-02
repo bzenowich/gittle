@@ -35,13 +35,22 @@ proc cmdStatus*(c: Ctx, args: seq[string]): int =
   var specs: seq[string]
   var i = 0
   var seenDashDash = false
+  # `-sb` is a bundle of two flags; `-uno` is one option with its value stuck
+  # to it, and splitting that would leave `no` looking like a pathspec.  So
+  # only clusters made entirely of the flags that take no value are split.
+  var args = block:
+    var expanded: seq[string]
+    var done = false
+    for a in args:
+      if done or a.len < 3 or a[0] != '-' or a[1] == '-' or
+         not a[1 .. ^1].allCharsInSet({'s', 'b', 'z'}):
+        expanded.add a
+        if a == "--": done = true
+      else:
+        for k in 1 ..< a.len: expanded.add "-" & a[k]
+    expanded
 
-  proc valueFor(a: string): string =
-    let eq = a.find('=')
-    if eq > 0: return a[eq + 1 .. ^1]
-    inc i
-    failIf(i >= args.len, "option '" & a & "' requires a value")
-    args[i]
+  optionValue(args, i)
 
   proc setUntracked(mode: string) =
     untracked = case mode

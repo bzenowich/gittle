@@ -293,6 +293,30 @@ proc refs*(r: Repository): RefStore =
         try: r.objectInfo(o).kind except GittleError: otBad)
   r.refStoreCache
 
+proc upstreamRef*(r: Repository, refname: string): string =
+  ## The remote-tracking ref a branch follows: `refs/heads/main` ->
+  ## `refs/remotes/origin/main`.
+  ##
+  ## Three things have to line up, and git checks all three
+  ## (`remote.c:branch_get_upstream`): `branch.<name>.merge` names the branch
+  ## **on the remote**, `branch.<name>.remote` names the remote, and the
+  ## remote's own fetch refspec says where its branches are kept locally.
+  ## Without the refspec there is no upstream at all -- a `remote.<name>.url`
+  ## on its own is not enough -- which is why a repository configured half way
+  ## shows no tracking information rather than the wrong tracking information.
+  ##
+  ## gittle writes and reads only the default refspec
+  ## (`+refs/heads/*:refs/remotes/<remote>/*`); a custom one is phase 8.
+  if not refname.startsWith("refs/heads/"): return ""
+  let branch = refname["refs/heads/".len .. ^1]
+  let merge = r.cfg.get("branch." & branch & ".merge")
+  let remote = r.cfg.get("branch." & branch & ".remote")
+  if merge.len == 0 or remote.len == 0: return ""
+  if remote == ".": return merge      # an upstream in this same repository
+  if r.cfg.get("remote." & remote & ".fetch").len == 0: return ""
+  if not merge.startsWith("refs/heads/"): return ""
+  "refs/remotes/" & remote & "/" & merge["refs/heads/".len .. ^1]
+
 proc headerField*(data, name: string): string =
   ## The value of a leading `<name> <value>` line in a commit or a tag.  Both
   ## put their structural headers first and end them with a blank line, so this
@@ -373,42 +397,6 @@ proc objectsMatching*(r: Repository, pre: OidPrefix): seq[Oid] =
   for p in r.packs:
     for o in p.matching(pre):
       if o notin result: result.add o
-
-proc resolveOid*(r: Repository, name: string): Oid =
-  ## Turn a name into an object ID, in git's order of preference:
-  ##
-  ## 1. a full 40-digit object name, which always wins -- it is unambiguous by
-  ##    construction, and something that long is never meant as a ref;
-  ## 2. a reference, through the DWIM rules in `refs.nim` (`HEAD`, `main`,
-  ##    `v1.0`, `origin/main`, or any full ref name);
-  ## 3. an unambiguous abbreviated object name of at least four digits.
-  ##
-  ## The `^`, `~`, `@{…}` and `<tree-ish>:<path>` operators need the revision
-  ## walk and arrive in phase 6.
-  if tryParseOid(name, result):
-    return
-
-  let d = r.refs.dwimRef(name)
-  if d.found:
-    return d.oid
-
-  var pre: OidPrefix
-  failIf(not tryParsePrefix(name, pre) or pre.nybbles < 4,
-         "not a valid object name: " & name)
-
-  var found = r.objectsMatching(pre)
-
-  if found.len == 0: fail("not a valid object name: " & name)
-  if found.len > 1:
-    var msg = "short object ID " & name & " is ambiguous; candidates are:"
-    sort(found, cmp)
-    for o in found: msg.add "\n  " & $o
-    fail(msg)
-  found[0]
-
-proc resolveTree*(r: Repository, name: string): Oid =
-  ## A `<tree-ish>` argument: resolve the name, then peel to the tree it names.
-  r.peelTo(r.resolveOid(name), otTree).oid
 
 # ---------------------------------------------------------------------------
 # Abbreviated object names

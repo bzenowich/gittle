@@ -22,7 +22,7 @@
 
 import std/[strutils, times]
 import ../cli, ../commitobj, ../diffcore, ../ident, ../pathspec, ../pretty,
-       ../repository, ../util
+       ../repository, ../revision, ../util
 
 const usageText = """usage: gittle show [<options>] [<object>…]
 
@@ -66,12 +66,7 @@ proc cmdShow*(c: Ctx, args: seq[string]): int =
   var names: seq[string]
   var i = 0
 
-  proc valueFor(a: string): string =
-    let eq = a.find('=')
-    if eq > 0: return a[eq + 1 .. ^1]
-    inc i
-    failIf(i >= args.len, "option '" & a & "' requires a value")
-    args[i]
+  optionValue(args, i)
 
   while i < args.len:
     let a = args[i]
@@ -130,7 +125,7 @@ proc cmdShow*(c: Ctx, args: seq[string]): int =
     # A tag is a pointer, so showing one shows what it points at -- and a tag
     # of a tag (`v1.0rc1` in the repository next door) unwraps all the way
     # down, which is why this is a loop rather than one extra step.
-    var o = repo.resolveOid(name)
+    var o = repo.resolveRevish(name)
     var label = name
     while true:
       let obj = repo.readObject(o)

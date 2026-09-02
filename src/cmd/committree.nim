@@ -9,7 +9,7 @@
 ## anything the two tools disagree about is the format itself and not the
 ## pipeline in front of it.
 
-import ../cli, ../commitobj, ../ident, ../repository, ../util
+import ../cli, ../commitobj, ../ident, ../repository, ../revision, ../util
 
 const usageText = """usage: gittle commit-tree [(-p <parent>)…] [(-m <message>)…]
                           [(-F <file>)…] <tree>"""
@@ -20,10 +20,7 @@ proc cmdCommitTree*(c: Ctx, args: seq[string]): int =
   var treeArg = ""
   var i = 0
 
-  proc valueFor(flag: string): string =
-    inc i
-    failIf(i >= args.len, "option '" & flag & "' requires a value")
-    args[i]
+  optionValue(args, i)
 
   while i < args.len:
     let a = args[i]
@@ -44,12 +41,12 @@ proc cmdCommitTree*(c: Ctx, args: seq[string]): int =
 
   failIf(treeArg.len == 0, "must give exactly one tree")
   let repo = c.repo
-  let tree = repo.resolveOid(treeArg)
+  let tree = repo.resolveRevish(treeArg)
   failIf(repo.objectInfo(tree).kind != otTree, "not a valid object name " & treeArg)
 
   var parentOids: seq[Oid]
   for p in parents:
-    let o = repo.resolveOid(p)
+    let o = repo.resolveRevish(p)
     failIf(repo.objectInfo(o).kind != otCommit, "not a valid object name " & p)
     # git reports a duplicate and drops it rather than refusing the command
     # (`builtin/commit-tree.c:new_parent`), because a merge of a branch with

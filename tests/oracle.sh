@@ -1241,20 +1241,21 @@ npath=$((npath+1))
 [ $path_ok = 1 ] && { ok; report "log path limiting" "$npath pathspecs, simplification included"; } \
                  || bad "log path limiting"
 
-# Options that belong to a later phase must refuse by name rather than be
-# ignored -- a `log` that silently dropped `--grep` would answer a different
-# question and look like it had answered.
-# `-p`, `--stat`, `--grep` and `--author` were on this list until phase 5 and
-# are now implemented; what is left belongs to phase 6 or is cut outright.
+# Options that are out of scope must refuse by name rather than be ignored --
+# a `log` that silently dropped `--grep` would answer a different question and
+# look like it had answered.
+# `-p`, `--stat`, `--grep` and `--author` came off this list at phase 5, and
+# the whole revision-walking group at phase 6; what is left is cut outright.
 def_ok=1
 ndef=0
-for o in --all --branches --tags --topo-order --date-order --since=2020-01-01 \
-         --until=2020-01-01 --merges --no-merges --graph --follow --full-diff \
-         --count --stdin -M -C --patience --histogram --word-diff --summary; do
+for o in --graph --follow --full-diff --min-parents=1 --max-parents=1 \
+         --ancestry-path --cherry-pick --boundary --simplify-merges --objects \
+         --walk-reflogs --children --source \
+         -M -C --patience --histogram --word-diff --summary; do
   ndef=$((ndef+1))
   "$GITTLE" -C "$REFREPO" log -1 "$o" >/dev/null 2>&1 && { def_ok=0; echo "  $o was accepted"; }
 done
-[ $def_ok = 1 ] && { ok; report "log deferrals" "$ndef later-phase options refuse by name"; } \
+[ $def_ok = 1 ] && { ok; report "log deferrals" "$ndef out-of-scope options refuse by name"; } \
                || bad "log deferrals"
 
 # --------------------------------------------------------------------- show
@@ -1498,18 +1499,16 @@ status_all "ignore rules"
 # out on git's side -- they need a remote (phase 8) and a range count
 # (phase 6) -- and everything else must agree byte for byte.
 ref_ok=1
-# The upstream report is a *block*: the "Your branch ..." line and the blank
-# line under it.  Dropping only the line leaves a blank that gittle -- which
-# prints no upstream at all -- correctly does not have, so both go.
-diff <(git -C "$REFREPO" status \
-         | awk '/^Your branch /{skip=1; next} skip && $0==""{skip=0; next} {skip=0; print}') \
-     <("$GITTLE" -C "$REFREPO" status) >/dev/null \
+# The upstream report used to be filtered out of this comparison, because
+# phase 5 had neither a range count nor a remote-tracking ref and printed
+# none of it.  Phase 6 has both, so it is compared like everything else.
+diff <(git -C "$REFREPO" status) <("$GITTLE" -C "$REFREPO" status) >/dev/null \
   || { ref_ok=0; echo "  status --long on the reference repository differs"; }
 diff <(git -C "$REFREPO" status -s) <("$GITTLE" -C "$REFREPO" status -s) >/dev/null \
   || { ref_ok=0; echo "  status -s on the reference repository differs"; }
 diff <(git -C "$REFREPO" status -s -uall) <("$GITTLE" -C "$REFREPO" status -s -uall) >/dev/null \
   || { ref_ok=0; echo "  status -s -uall on the reference repository differs"; }
-diff <(git -C "$REFREPO" status --porcelain=v2 -b | grep -v "^# branch.upstream\|^# branch.ab") \
+diff <(git -C "$REFREPO" status --porcelain=v2 -b) \
      <("$GITTLE" -C "$REFREPO" status --porcelain=v2 -b) >/dev/null \
   || { ref_ok=0; echo "  status --porcelain=v2 on the reference repository differs"; }
 # A nested repository is one untracked directory, and a gitlink is not a
@@ -1519,7 +1518,7 @@ diff <(git -C "$REFREPO" ls-files -o --exclude-standard) \
   || { ref_ok=0; echo "  ls-files -o on the reference repository differs"; }
 diff <(git -C "$REFREPO" diff --raw) <("$GITTLE" -C "$REFREPO" diff --raw) >/dev/null \
   || { ref_ok=0; echo "  diff --raw on the reference repository differs"; }
-[ $ref_ok = 1 ] && { ok; report "status, real repository" "nested repos, a gitlink, an upstream"; } \
+[ $ref_ok = 1 ] && { ok; report "status, real repository" "nested repos, a gitlink, an upstream reported"; } \
                 || bad "status, real repository"
 
 # ------------------------------------------- from inside a subdirectory
@@ -1661,6 +1660,392 @@ for pat in 'a+b' 'a?' '\(x\)' '[[:alpha:]]+' 'a{2,3}' ')' 'a|' '(|x)b' '^ab$' \
 done
 [ $re_ok = 1 ] && { ok; report "ERE engine" "$nre patterns, errors included"; } \
                || bad "ERE engine"
+
+
+# =========================================================================
+# Phase 6 -- history
+# =========================================================================
+#
+# Two shapes of check, and the difference matters.  Read-only commands are
+# compared on stdout, stderr and exit status.  Commands that *change* a
+# repository are run twice, in two identical copies, and every byte either
+# tool could have written is compared afterwards: refs, HEAD, config, every
+# reflog, every working-tree file and the index.  A checkout that prints the
+# right thing and leaves the wrong index is the failure worth catching.
+
+P6="$WORK/p6"; mkdir -p "$P6"
+
+# gittle names itself where git names itself; that is a deliberate difference
+# and not one to test.
+p6norm(){ sed -e 's/^fatal: //' -e 's/^gittle: //' -e "s/'git /'gittle /" \
+              -e 's/^  git /  gittle /' -e 's/"git /"gittle /g' \
+              -e 's/known to git$/known to gittle/'; }
+
+# p6ro <expected-name> <args...> -- a read-only command, both tools, one repo.
+p6dir=""
+p6ro(){
+  local ao as ae bo bs be
+  ao=$( cd "$p6dir" && git "$@" 2>"$WORK/p6.ea" ); as=$?
+  ae=$(p6norm < "$WORK/p6.ea")
+  bo=$( cd "$p6dir" && "$GITTLE" "$@" 2>"$WORK/p6.eb" ); bs=$?
+  be=$(p6norm < "$WORK/p6.eb")
+  p6n=$((p6n+1))
+  if [ "$ao" != "$bo" ] || [ "$as" != "$bs" ] || [ "$ae" != "$be" ]; then
+    p6ok=0
+    printf '  %s %s  [git %d / gittle %d]\n' "${p6what:-}" "$*" "$as" "$bs"
+    diff <(printf '%s\n' "$ao") <(printf '%s\n' "$bo") | head -4
+    [ "$ae" = "$be" ] || printf '    err: %s | %s\n' "$ae" "$be"
+  fi
+}
+
+# Everything a command could have written, as text.
+p6state(){
+  ( cd "$1" || return
+    git for-each-ref --format='%(refname) %(objectname) %(symref)'
+    git symbolic-ref -q HEAD || git rev-parse HEAD
+    sed -e 's/[ \t]*$//' .git/config
+    ( cd .git/logs 2>/dev/null && find . -type f | sort |
+      while read -r f; do echo "== $f"; cat "$f"; done )
+    # `-type f` alone would follow a symlink and hash what it points at, and
+    # a checkout that wrote a regular file instead of a link would pass.
+    find . -path ./.git -prune -o \( -type f -o -type l \) -print | sort |
+      while read -r f; do
+        if [ -L "$f" ]; then printf '%s -> %s\n' "$f" "$(readlink "$f")"
+        else printf '%s %s %s\n' "$f" \
+             "$(sha1sum <"$f" | cut -d' ' -f1)" "$([ -x "$f" ] && echo x || echo -)"
+        fi
+      done
+    git ls-files -s )
+}
+
+# p6mut <args...> -- a mutating command, run in two copies of $P6/fix.
+# $PREP, if set, is run in each copy first to build a dirty starting state.
+p6mut(){
+  local ao as bo bs sa sb this
+  rm -rf "$P6/a" "$P6/b"; cp -a "$P6/fix" "$P6/a"; cp -a "$P6/fix" "$P6/b"
+  ( cd "$P6/a" && eval "${PREP:-true}" ) >/dev/null 2>&1
+  ( cd "$P6/b" && eval "${PREP:-true}" ) >/dev/null 2>&1
+  ao=$( cd "$P6/a" && git "$@" 2>&1 ); as=$?
+  bo=$( cd "$P6/b" && "$GITTLE" "$@" 2>&1 ); bs=$?
+  p6n=$((p6n+1)); this=1
+  # The two copies live at different paths, and a message that names the
+  # working tree would differ for that reason alone.
+  [ "$(printf '%s\n' "$ao" | p6norm | sed "s|$P6/[ab]|REPO|g")" \
+  = "$(printf '%s\n' "$bo" | p6norm | sed "s|$P6/[ab]|REPO|g")" ] || this=0
+  [ "$as" = "$bs" ] || this=0
+  sa=$(p6state "$P6/a"); sb=$(p6state "$P6/b")
+  [ "$sa" = "$sb" ] || this=0
+  if [ $this = 0 ]; then
+    p6ok=0
+    printf '  %s%s  [git %d / gittle %d]\n' \
+      "${PREP:+($PREP) }" "$*" "$as" "$bs"
+    diff <(printf '%s\n' "$ao" | p6norm) <(printf '%s\n' "$bo" | p6norm) | head -5
+    diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -6
+  fi
+}
+
+# ------------------------------------------------------------ the fixture
+# Small, but with one of everything the phase touches: a merge, a side
+# branch, an annotated tag and a lightweight one, a subdirectory, a
+# remote-tracking ref and a configured upstream.
+#
+# And an executable and a symlink, on the side branch only, so that switching
+# has to create and remove both.  A checkout that writes a symlink's target as
+# a regular file looks right in every listing that prints a name.
+rm -rf "$P6/fix"; mkdir -p "$P6/fix"
+( cd "$P6/fix"
+  git init -q -b main .
+  echo a > a.txt; mkdir -p sub; echo s > sub/s.txt
+  git add .; git commit -qm one
+  echo b >> a.txt; git commit -qam two
+  git tag -a v1 -m "tag one"
+  git tag light HEAD~1
+  git checkout -qb side HEAD~1
+  echo c > c.txt
+  printf '#!/bin/sh\necho hi\n' > run.sh; chmod +x run.sh
+  ln -s a.txt link
+  git add c.txt run.sh link; git commit -qm three
+  git checkout -q main
+  git merge -q --no-ff side -m merge
+  git branch stale HEAD~1
+  git update-ref refs/remotes/origin/main main
+  git config remote.origin.url .
+  git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+  git config branch.main.remote origin
+  git config branch.main.merge refs/heads/main ) >/dev/null 2>&1
+
+# ---------------------------------------------------- the revision grammar
+# Every suffix operator, every range spelling, and the forms that must *not*
+# resolve -- because "HEAD^3 is an error" is as much a behavior as "HEAD^2 is
+# the second parent", and only one of the two is in the manual.
+p6ok=1; p6n=0; p6dir="$P6/fix"; p6what="rev-parse"
+for x in HEAD HEAD^ HEAD~ HEAD~1 HEAD~2 HEAD^2 HEAD^^ 'HEAD^{}' 'HEAD^{tree}' \
+         'HEAD^{commit}' 'HEAD^{object}' v1 'v1^{}' 'v1^{commit}' 'v1^{tag}' \
+         'v1^{tree}' @ 'HEAD@{0}' 'HEAD@{1}' '@{-1}' ':a.txt' ':0:a.txt' \
+         ':1:a.txt' 'HEAD:a.txt' 'HEAD^:a.txt' 'HEAD:sub/s.txt' 'HEAD:' \
+         'HEAD:nosuch' 'main..side' 'main...side' 'side..main' 'side...main' \
+         '..side' 'main..' 'v1..main' 'HEAD^!' 'HEAD^@' 'HEAD^-1' 'HEAD^-9' \
+         '^main' main side light nosuch a.txt 'HEAD~0' 'HEAD^0' 'HEAD^3' \
+         'HEAD~9' '@{5}' '@{-5}' 'side@{0}' 'HEAD^{tree}..HEAD' 'HEAD^!x'; do
+  p6ro rev-parse "$x"
+done
+for f in --verify --short --symbolic-full-name --abbrev-ref; do
+  p6ro rev-parse $f HEAD
+done
+p6ro rev-parse -q --verify nosuch;      p6ro rev-parse --verify nosuch
+p6ro rev-parse --verify HEAD HEAD;      p6ro rev-parse --short=12 HEAD
+p6ro rev-parse --short=2 HEAD;          p6ro rev-parse --short=99 HEAD
+p6ro rev-parse --symbolic-full-name HEAD main v1
+p6ro rev-parse --abbrev-ref HEAD main v1
+p6ro rev-parse --abbrev-ref=strict main
+p6ro rev-parse --symbolic-full-name main..side
+p6ro rev-parse -- a.txt;                p6ro rev-parse HEAD a.txt
+p6ro rev-parse --foo;                   p6ro rev-parse --short main..side
+for f in --git-dir --show-toplevel --show-cdup --show-prefix \
+         --is-inside-git-dir --is-inside-work-tree --is-bare-repository; do
+  p6ro rev-parse $f
+done
+# From a subdirectory: `:path` is root-relative and `:./path` is not, and the
+# layout queries all answer differently.
+p6dir="$P6/fix/sub"
+for f in --git-dir --show-toplevel --show-cdup --show-prefix \
+         --is-inside-work-tree; do
+  p6ro rev-parse $f
+done
+p6ro rev-parse ':s.txt'; p6ro rev-parse ':./s.txt'; p6ro rev-parse 'HEAD:./s.txt'
+p6dir="$P6/fix"
+[ $p6ok = 1 ] && { ok; report "revision grammar" "$p6n expressions and rev-parse forms"; } \
+              || bad "revision grammar"
+
+# ------------------------------------------------------------- merge-base
+# Over the reference repository, because a merge base is only interesting on
+# history with real criss-crosses in it.
+p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="merge-base"
+p6ro merge-base HEAD HEAD~5
+p6ro merge-base --is-ancestor HEAD~5 HEAD
+p6ro merge-base --is-ancestor HEAD HEAD~5
+p6ro merge-base --is-ancestor HEAD HEAD
+for t in v2.10.0 v2.20.0 v2.30.0 v2.40.0; do
+  p6ro merge-base HEAD $t; p6ro merge-base --all $t v2.28.0
+done
+p6ro merge-base --all v2.20.0 v2.35.0 v2.30.0
+# Random pairs, which is the only way to reach a criss-cross on purpose.
+NPAIR=40; [ $FULL = 1 ] && NPAIR=400
+mapfile -t P6C < <(git -C "$REFREPO" rev-list -n 4000 HEAD |
+                   shuf -n $NPAIR --random-source=<(yes))
+for ((i = 0; i + 1 < ${#P6C[@]}; i += 2)); do
+  p6ro merge-base --all "${P6C[$i]}" "${P6C[$((i+1))]}"
+done
+[ $p6ok = 1 ] && { ok; report "merge-base" "$p6n forms, $((NPAIR/2)) random commit pairs"; } \
+              || bad "merge-base"
+
+# --------------------------------------------------------------- rev-list
+# The whole of docs/04 against real history: the orderings especially, since
+# `--topo-order` is a *choice* among valid topological orders and agreeing
+# with git means reproducing the choice.
+p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="rev-list"
+RN=200; [ $FULL = 1 ] && RN=4000
+for a in "-n $RN HEAD" "-n $RN --topo-order HEAD" "-n $RN --date-order HEAD" \
+         "-n $RN --first-parent HEAD" "-n $RN --merges HEAD" \
+         "-n $RN --no-merges HEAD" "-n 50 --parents HEAD" \
+         "-n 50 --parents --abbrev-commit HEAD" "HEAD~50..HEAD" \
+         "HEAD~50...HEAD~20" "--left-right HEAD~50...HEAD~20" \
+         "-n 100 --reverse HEAD" "--no-walk HEAD HEAD~5 HEAD~2" \
+         "--no-walk=unsorted HEAD HEAD~5 HEAD~2" "-n 100 HEAD -- Makefile" \
+         "-n 100 --parents HEAD -- Makefile" "-n 30 --topo-order HEAD -- diff.c" \
+         "-n 30 --date-order HEAD -- diff.c" \
+         "-n 30 --topo-order --parents HEAD -- diff.c" "-n 20 --skip=5 HEAD" \
+         "HEAD~3^!" "HEAD~3^@" "-n 5 --oneline HEAD" "-n 3 --pretty=medium HEAD" \
+         "-n 3 --pretty=raw HEAD" "-n 3 --pretty=fuller HEAD" \
+         "-n 3 --pretty=oneline HEAD" "-n 5 --format=%h HEAD" \
+         "-n 5 --format=%h --abbrev-commit HEAD" "--count v2.30.0..v2.31.0" \
+         "--left-right --count v2.30.0...v2.31.0" \
+         "-n 200 --since=2024-01-01 HEAD" "-n 200 --until=2020-01-01 HEAD" \
+         "-n 60 --topo-order HEAD -- t/" "--count --all"; do
+  p6ro rev-list $a
+done
+# `--objects` is the question a fetch asks, so both halves of a range matter.
+p6dir="$P6/fix"
+for a in "--objects HEAD" "--objects --all" "--objects main ^side" \
+         "--objects side ^main" "--objects --all --not main" \
+         "--objects --all --not v1" "--objects v1" "--objects --tags" \
+         "--objects HEAD --not HEAD~2" "--all" "--branches" "--tags" \
+         "--remotes" "--all --topo-order" "--all --date-order"; do
+  p6ro rev-list $a
+done
+[ $p6ok = 1 ] && { ok; report "rev-list" "$p6n option forms over real history"; } \
+              || bad "rev-list"
+
+# `log` shares the same parser, so what is tested here is that it *does*.
+p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="log"
+for a in "-n 20 --oneline --topo-order" "-n 20 --oneline --date-order" \
+         "-n 20 --oneline --all" "-n 10 --oneline HEAD~30..HEAD" \
+         "-n 10 --left-right HEAD~30...HEAD~10" \
+         "-n 10 --oneline --left-right HEAD~30...HEAD~10" \
+         "-n 10 --oneline --merges" "-n 10 --oneline --no-merges" \
+         "-n 10 --oneline --since=2025-01-01" "-n 5 --parents --oneline" \
+         "-n 5 --parents" "-n 20 --oneline --parents -- Makefile" \
+         "--no-walk --oneline HEAD HEAD~3" "-n 8 --oneline --first-parent" \
+         "-n 5 --oneline --branches" "-n 5 --oneline --tags"; do
+  # git applies .mailmap by default and gittle does not; see the note at the
+  # top of this file.
+  ao=$(git -C "$REFREPO" log $a $NOMAILMAP 2>&1); as=$?
+  bo=$("$GITTLE" -C "$REFREPO" log $a 2>&1); bs=$?
+  p6n=$((p6n+1))
+  { [ "$ao" = "$bo" ] && [ "$as" = "$bs" ]; } \
+    || { p6ok=0; echo "  log $a differs"; diff <(echo "$ao") <(echo "$bo")|head -4; }
+done
+[ $p6ok = 1 ] && { ok; report "log, shared surface" "$p6n forms through the same parser"; } \
+              || bad "log, shared surface"
+
+# ---------------------------------------------------------- for-each-ref
+p6ok=1; p6n=0; p6dir="$REFREPO"; p6what="for-each-ref"
+for f in '%(refname)' '%(refname:short)' '%(objectname)' '%(objectname:short)' \
+         '%(objectname:short=12)' '%(objecttype)' '%(subject)' '%(contents)' \
+         '%(contents:subject)' '%(contents:body)' '%(contents:lines=1)' \
+         '%(contents:lines=3)' '%(*objectname)' '%(HEAD)%(refname)' \
+         '%(upstream) %(upstream:short)'; do
+  p6ro for-each-ref --format="$f" refs/tags
+done
+p6ro for-each-ref refs/heads
+p6ro for-each-ref 'refs/tags/v2.3*'
+p6ro for-each-ref --count=5
+p6ro for-each-ref --sort=objectname
+p6ro for-each-ref --sort=-refname
+p6ro for-each-ref --contains v2.30.0 refs/tags
+p6ro for-each-ref --no-contains v2.30.0 refs/tags
+p6ro for-each-ref --merged v2.31.0 refs/tags
+p6ro for-each-ref --no-merged v2.31.0 refs/tags
+p6ro for-each-ref --points-at HEAD
+[ $p6ok = 1 ] && { ok; report "for-each-ref" "$p6n atoms and filters over 1,000 refs"; } \
+              || bad "for-each-ref"
+
+# --------------------------------------------------------------- branch
+p6ok=1; p6n=0; p6dir="$P6/fix"; p6what="branch"
+for a in "" "-v" "-vv" "-a" "-r" "-av" "-arv" "--show-current" "--list" \
+         "--contains side" "--merged" "--no-merged" "--sort=-refname" \
+         "-v --sort=objectname" "-l ma*" "-l s*"; do
+  p6ro branch $a
+done
+p6ro branch --format='%(refname)'
+p6ro branch --format='%(refname:short) %(objectname:short)'
+# A detached HEAD is a row in the listing that is not a ref, and it counts
+# toward the column width.
+( cd "$P6/fix" && git checkout -q --detach HEAD~1 ) >/dev/null 2>&1
+p6ro branch; p6ro branch -v; p6ro branch -a
+( cd "$P6/fix" && git checkout -q main ) >/dev/null 2>&1
+[ $p6ok = 1 ] && { ok; report "branch listing" "$p6n forms, detached HEAD included"; } \
+              || bad "branch listing"
+
+p6ok=1; p6n=0; p6what="branch"
+p6mut branch newb;            p6mut branch newb HEAD~1
+p6mut branch newb side;       p6mut branch newb origin/main
+p6mut branch -f side HEAD~1;  p6mut branch side
+p6mut branch -d stale;        p6mut branch -d side
+p6mut branch -D side;         p6mut branch -d nosuch
+p6mut branch -m stale renamed; p6mut branch -m main renamed
+p6mut branch -M main side;    p6mut branch -m nosuch x
+p6mut branch -u origin/main side
+p6mut branch --set-upstream-to=origin/main
+p6mut branch --unset-upstream
+p6mut branch -t newb origin/main
+p6mut branch --no-track newb origin/main
+p6mut branch newb v1;         p6mut branch -d -r origin/main
+p6mut branch -q newb;         p6mut branch -q -d stale
+p6mut branch -d main;         p6mut branch -d light
+[ $p6ok = 1 ] && { ok; report "branch" "$p6n creates, deletes, renames and upstreams"; } \
+              || bad "branch"
+
+# ------------------------------------------------------------------ tag
+p6ok=1; p6n=0; p6dir="$P6/fix"; p6what="tag"
+for a in "" "-l" "-n" "-n1" "-n2" "-n5" "--sort=-refname" "--contains HEAD~2" \
+         "--merged HEAD" "--points-at HEAD~1" "-l v*" "-l l*"; do
+  p6ro tag $a
+done
+p6ro tag --format='%(refname)'
+[ $p6ok = 1 ] && { ok; report "tag listing" "$p6n forms"; } || bad "tag listing"
+
+p6ok=1; p6n=0; p6what="tag"
+p6mut tag newtag;                p6mut tag newtag HEAD~1
+p6mut tag -a -m hello annot;     p6mut tag -mmsg mtag
+p6mut tag -a -m one -m two two;  p6mut tag -f v1
+p6mut tag -f -m new v1;          p6mut tag -d v1
+p6mut tag -d light;              p6mut tag -d nosuch
+p6mut tag v1;                    p6mut tag newtag v1
+[ $p6ok = 1 ] && { ok; report "tag" "$p6n creates and deletes, annotated and light"; } \
+              || bad "tag"
+
+# ------------------------------------------- checkout, switch and restore
+# The dangerous ones.  Every case is run against a *dirty* starting state as
+# well as a clean one, because the whole safety property is what happens when
+# something would be lost.
+p6ok=1; p6n=0; p6what="checkout"
+p6mut checkout side;             p6mut switch side
+p6mut checkout main;             p6mut checkout -b topic
+p6mut checkout --detach HEAD~1;  p6mut checkout v1
+p6mut checkout HEAD~1;           p6mut switch -c topic2 HEAD~1
+p6mut checkout -B side HEAD~1;   p6mut checkout -q side
+p6mut switch -d HEAD~1;          p6mut checkout nosuch
+p6mut switch v1;                 p6mut switch nosuch
+PREP='echo x >> a.txt'                 p6mut checkout side
+PREP='echo x >> a.txt'                 p6mut switch side
+PREP='echo x >> a.txt'                 p6mut checkout -f side
+PREP='echo x >> a.txt'                 p6mut restore a.txt
+PREP='echo x >> a.txt'                 p6mut checkout -- a.txt
+PREP='echo x >> a.txt'                 p6mut restore --source=HEAD~1 a.txt
+PREP='echo x >> a.txt; git add a.txt'  p6mut restore --staged a.txt
+PREP='echo x >> a.txt; git add a.txt'  p6mut checkout side
+PREP='rm a.txt'                        p6mut restore a.txt
+PREP='rm -r sub'                       p6mut restore sub
+PREP='echo z > c.txt'                  p6mut checkout side
+PREP='echo z > newfile.txt'            p6mut checkout side
+unset PREP
+[ $p6ok = 1 ] && { ok; report "checkout/switch/restore" "$p6n switches and restores, clean and dirty"; } \
+              || bad "checkout/switch/restore"
+
+# ---------------------------------------------------------------- reset
+p6ok=1; p6n=0; p6what="reset"
+p6mut reset;                p6mut reset HEAD~1
+p6mut reset --soft HEAD~1;  p6mut reset --hard HEAD~1
+p6mut reset --mixed HEAD~1; p6mut reset --hard
+p6mut reset -q HEAD~1;      p6mut reset HEAD -- a.txt
+p6mut reset -- a.txt;       p6mut reset HEAD~1 -- a.txt
+p6mut reset --hard side;    p6mut reset --hard HEAD~2
+p6mut reset --soft nosuch;  p6mut reset nosuch
+PREP='echo x >> a.txt'                     p6mut reset --hard
+PREP='echo x >> a.txt'                     p6mut reset --soft HEAD~1
+PREP='echo x >> a.txt; git add a.txt'      p6mut reset
+PREP='echo x >> a.txt; git add a.txt'      p6mut reset a.txt
+PREP='echo n > new.txt; git add new.txt'   p6mut reset new.txt
+PREP='rm a.txt'                            p6mut reset --hard
+PREP='rm -r sub'                           p6mut reset --hard
+unset PREP
+[ $p6ok = 1 ] && { ok; report "reset" "$p6n resets across the three modes"; } \
+              || bad "reset"
+
+# --------------------------------------------------------------- reflog
+p6ok=1; p6n=0; p6dir="$P6/fix"; p6what="reflog"
+p6ro reflog; p6ro reflog show; p6ro reflog show HEAD; p6ro reflog HEAD
+p6ro reflog main; p6ro reflog side; p6ro reflog -n 3
+[ $p6ok = 1 ] && { ok; report "reflog" "$p6n listings"; } || bad "reflog"
+
+# -------------------------------------- the upstream lines phase 5 deferred
+# All four `status` formats report the relationship with the upstream, and
+# each reports it differently.  Phase 5 could not: it had neither a range
+# count nor a remote-tracking ref.
+p6ok=1; p6n=0; p6what="status"
+for f in "" "-s" "-b" "-sb" "-bs" "--porcelain" "--porcelain=v2" \
+         "--porcelain=v2 -b" "--long" "-uno" "-uall" "-sz"; do
+  p6mut status $f
+done
+for f in "" "-sb" "--porcelain=v2 -b"; do
+  PREP='git commit -q --allow-empty -m ahead'              p6mut status $f
+  PREP='git update-ref refs/remotes/origin/main HEAD~1'    p6mut status $f
+  PREP='git update-ref -d refs/remotes/origin/main'        p6mut status $f
+done
+unset PREP
+[ $p6ok = 1 ] && { ok; report "upstream tracking" "$p6n status forms, four ways of saying it"; } \
+              || bad "upstream tracking"
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

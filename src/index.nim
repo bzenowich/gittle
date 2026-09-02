@@ -42,7 +42,7 @@
 ## `status`, while a missing one reports a modified file as clean.
 
 import std/[os, posix, times, algorithm, strutils]
-import oid, sha1, util
+import objects, oid, sha1, util
 
 const
   indexSignature = "DIRC"
@@ -370,13 +370,6 @@ proc addEntry*(idx: Index, e: IndexEntry) =
 # ---------------------------------------------------------------------------
 # The working tree
 # ---------------------------------------------------------------------------
-
-const
-  modeRegular* = 0o100644'u32
-  modeExecutable* = 0o100755'u32
-  modeSymlink* = 0o120000'u32
-  modeGitlink* = 0o160000'u32
-  modeTree* = 0o040000'u32
 
 proc modeForFile*(st: Stat): uint32 =
   ## git records exactly three modes for a file: a symlink, or a regular file

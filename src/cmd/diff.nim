@@ -16,8 +16,9 @@
 ## A leading argument that names an object is a revision and anything after it
 ## is a path, exactly as in `log`; `--` settles it.
 
-import std/[os, strutils]
-import ../cli, ../diffcore, ../index, ../pathspec, ../repository, ../util
+import std/strutils
+import ../cli, ../diffcore, ../index, ../pathspec, ../repository,
+       ../revision, ../revwalk, ../util
 
 const usageText = """usage: gittle diff [<options>] [<commit>] [<commit>] [--] [<path>…]
 
@@ -53,12 +54,7 @@ proc cmdDiff*(c: Ctx, args: seq[string]): int =
   var i = 0
   var seenDashDash = false
 
-  proc valueFor(a: string): string =
-    let eq = a.find('=')
-    if eq > 0: return a[eq + 1 .. ^1]
-    inc i
-    failIf(i >= args.len, "option '" & a & "' requires a value")
-    args[i]
+  optionValue(args, i)
 
   while i < args.len:
     let a = args[i]
@@ -87,28 +83,38 @@ proc cmdDiff*(c: Ctx, args: seq[string]): int =
     return if r.changed: 1 else: 0
 
   let repo = c.repo
-  for r in revs:
-    failIf(r.contains("..."),
-           "'" & r & "': the A...B form is phase 6, with rev-parse")
-    failIf(r.contains(".."),
-           "'" & r & "': the A..B form is phase 6, with rev-parse")
 
   # An argument that is not a revision is a path, and so is everything after
   # it -- which is what makes `gittle diff Makefile` work without a `--`.  When
   # `--` *was* given the question does not arise: everything before it is a
   # revision, which is exactly why scripts should use it.
+  #
+  # `A..B` is `A B`, and `A...B` is "what B added since they diverged", so it
+  # is the merge base against B.  A range spelling is one argument that names
+  # two trees, which is the only reason this loop is not a `map`.
   var trees: seq[Oid]
   for r in revs:
+    let dots = r.find("..")
+    if dots >= 0 and r != ".." and (seenDashDash or specs.len == 0):
+      let symmetric = dots + 2 < r.len and r[dots + 2] == '.'
+      let lhs = if dots == 0: "HEAD" else: r[0 ..< dots]
+      let rhsAt = dots + (if symmetric: 3 else: 2)
+      let rhs = if rhsAt >= r.len: "HEAD" else: r[rhsAt .. ^1]
+      if repo.looksLikeRev(lhs) and repo.looksLikeRev(rhs):
+        let b = repo.resolveCommittish(rhs)
+        let a = if not symmetric: repo.resolveCommittish(lhs)
+                else: repo.mergeBase(repo.resolveCommittish(lhs), b)
+        failIf(symmetric and a.isNull,
+               "fatal: " & lhs & " and " & rhs & " have no merge base")
+        trees.add repo.peelTo(a, otTree).oid
+        trees.add repo.peelTo(b, otTree).oid
+        continue
     var t: Oid
     var ok = true
     try: t = repo.resolveTree(r) except GittleError: ok = false
     if ok and (seenDashDash or specs.len == 0): trees.add t
     else:
-      failIf(not fileExists(repo.workTreePath(repo.prefix & r)) and
-             not dirExists(repo.workTreePath(repo.prefix & r)),
-             "ambiguous argument '" & r & "': unknown revision or path not " &
-             "in the working tree\n" &
-             "  Use '--' to separate paths from revisions")
+      failAmbiguous(repo, r)
       specs.add r
 
   failIf(trees.len > 2, "gittle diff takes at most two commits")

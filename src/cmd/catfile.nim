@@ -4,7 +4,7 @@
 ## `--batch[=<format>]`, `--batch-check[=<format>]`.
 
 import std/[strutils]
-import ../cli, ../objects, ../oid, ../repository, ../util
+import ../cli, ../objects, ../oid, ../repository, ../revision, ../util
 
 const
   usageText = "usage: gittle cat-file (-t | -s | -e | -p | <type>) <object>\n" &
@@ -44,7 +44,7 @@ proc runBatch(c: Ctx, fmt: string, withContents: bool): int =
     var o: Oid
     var ok = true
     try:
-      o = r.resolveOid(name)
+      o = r.resolveRevish(name)
     except GittleError:
       ok = false
     if ok and not r.hasObject(o): ok = false
@@ -110,11 +110,11 @@ proc cmdCatFile*(c: Ctx, args: seq[string]): int =
       # No output either way; the exit status is the whole answer.
       var o: Oid
       try:
-        o = r.resolveOid(rest[0])
+        o = r.resolveRevish(rest[0])
       except GittleError:
         return 1
       return (if r.hasObject(o): 0 else: 1)
-    let o = r.resolveOid(rest[0])
+    let o = r.resolveRevish(rest[0])
     case mode
     of 't': echo $r.objectInfo(o).kind
     of 's': echo $r.objectInfo(o).size
@@ -127,7 +127,7 @@ proc cmdCatFile*(c: Ctx, args: seq[string]): int =
   failIf(rest.len != 2, usageText)
   let want = parseObjectType(rest[0])
   failIf(want == otBad, "invalid object type '" & rest[0] & "'")
-  let o = r.resolveOid(rest[1])
+  let o = r.resolveRevish(rest[1])
   stdout.write r.peelTo(o, want).obj.data
   stdout.flushFile()
   0

@@ -120,6 +120,29 @@ proc skipBlankLines(msg: string, at: int): int =
     if trimmed > result: return
     result = next
 
+const signatureMarkers* = ["-----BEGIN PGP SIGNATURE-----",
+                           "-----BEGIN PGP MESSAGE-----",
+                           "-----BEGIN SIGNED MESSAGE-----",
+                           "-----BEGIN SSH SIGNATURE-----"]
+  ## `gpg-interface.c:parse_signed_buffer`.  A signed tag keeps its signature
+  ## in the message body rather than in a header, so anything reading a tag's
+  ## message has to know where the message stops -- otherwise the subject of
+  ## every signed tag in the git repository is its first line of base64.
+  ## gittle neither makes nor checks signatures (plan.md decision 5); it only
+  ## has to know where they begin.
+
+proc stripSignature*(msg: string): string =
+  ## The message without a trailing signature block.
+  var at = 0
+  while at < msg.len:
+    for m in signatureMarkers:
+      if msg.len - at >= m.len and msg[at ..< at + m.len] == m:
+        return msg[0 ..< at]
+    let eol = msg.find('\n', at)
+    if eol < 0: break
+    at = eol + 1
+  msg
+
 proc subject*(message: string): string =
   ## The first paragraph, folded onto one line -- what `--oneline`, `%s` and a
   ## reflog entry show.  A wrapped first paragraph is *one* subject, joined

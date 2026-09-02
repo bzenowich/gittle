@@ -13,13 +13,13 @@ share a repository with real git, and plausible in a busybox-class environment.
 
 ## Status
 
-**Phases 1–5 complete: the object store, refs and config, the index and
-trees, the first commit, and diff.** Twenty commands work and agree with real
-git. `gittle init`, `gittle add .`, `gittle commit` produces a repository real
-git continues in without noticing — identical commit objects, reflogs and
-index — and `gittle log` reproduces git's output over 20,000 commits of the
-repository next door. `git fsck --strict` is clean after everything gittle
-writes.
+**Phases 1–6 complete: the object store, refs and config, the index and
+trees, the first commit, diff, and history.** Thirty commands work and agree
+with real git. `gittle init`, `gittle add .`, `gittle commit` produces a
+repository real git continues in without noticing — identical commit objects,
+reflogs and index — and `gittle log` reproduces git's output over 20,000
+commits of the repository next door. `git fsck --strict` is clean after
+everything gittle writes.
 
 The diff engine is a reimplementation of git's `xdiff/` in the configuration
 `--minimal` selects, including the indent heuristic that decides where a hunk
@@ -27,10 +27,21 @@ sits: **every file pair of 900 real commits comes out hunk for hunk identical**.
 `diff`, `status` in all four output formats, and `grep` are in, `log -p` and
 `show` print their patches, and `commit` prints its diffstat.
 
+Phase 6 added the revision grammar — `HEAD~3`, `v1.0^{}`, `A..B`, `HEAD@{2}`,
+`:0:file` — and with it `rev-list`, `rev-parse`, `merge-base`, `branch`,
+`tag`, `reflog`, and the four commands that are the first to *change* tracked
+files: `checkout`, `switch`, `restore` and `reset`. `rev-list --topo-order`
+reproduces git's choice of topological order over the reference repository,
+and every mutating command is tested by running it in two copies of a
+repository and comparing every ref, reflog, config line, index entry and file
+either tool wrote.
+
 `grep` and `log --grep` use libc's POSIX regex rather than a vendored engine —
 which is what git itself does, and what turned a 500-line budget line into 45.
 
-6,940 lines of the ~9,000 budgeted.
+8,960 lines of the ~9,000 budgeted — which is the whole budget with four
+phases to go. [`docs/phase-6.md`](docs/phase-6.md) has the numbers and a
+revised estimate.
 
 - [`docs/plan.md`](docs/plan.md) — goals, the eight design rules, scope,
   budget, the ten decisions, build order. **Read this first.**
@@ -38,9 +49,9 @@ which is what git itself does, and what turned a 500-line budget line into 45.
   environment, and what finishing a phase requires.
 - [`docs/phase-1.md`](docs/phase-1.md), [`docs/phase-2.md`](docs/phase-2.md),
   [`docs/phase-3.md`](docs/phase-3.md), [`docs/phase-4.md`](docs/phase-4.md),
-  [`docs/phase-5.md`](docs/phase-5.md) — the finished phases: what was built,
-  what it was verified against, what was left for later, and where the budget
-  stands.
+  [`docs/phase-5.md`](docs/phase-5.md), [`docs/phase-6.md`](docs/phase-6.md) —
+  the finished phases: what was built, what it was verified against, what was
+  left for later, and where the budget stands.
 - [`docs/README.md`](docs/README.md) — index to the feature inventory
   (`01`–`15`), where every git command and option is marked in or out of scope.
 

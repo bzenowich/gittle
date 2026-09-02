@@ -358,6 +358,16 @@ The line that will blow the budget is the second-to-last. Every algorithm above
 it is bounded; the command layer scales with how many option combinations are
 accepted, which is why it is 28% of git. **Guard that number above all others.**
 
+**Superseded by measurement at the end of phase 6.** The whole ~9,000 was
+spent with four phases still to build: 8,959 lines of code for phases 1–6,
+of which the command layer is 3,186 for 30 of 56 commands. The layer does not
+scale with commands and it does not scale with option surface either — it
+scales with *shared* option surface not yet spent, and docs/03 and docs/04,
+the two large groups, are now both paid for. [`phase-6.md`](phase-6.md)
+revises the remaining figure to about 3,700, putting v1 near **12,700**, and
+names the cheapest cut if that is not acceptable (phase 9, serving). Decide
+before phase 7 starts.
+
 ---
 
 ## 6. Decisions
@@ -625,8 +635,10 @@ create state with one tool, verify with the other, in both directions.
    `status` in phase 5 is unusable without it. Only the `check-ignore` *command*
    waits for phase 10. The vertical slice that proves the format work.
 5. **Diff.** Myers plus unified output; `diff`, `status` in all forms, `grep`.
+   *Done: [phase-5.md](phase-5.md).*
 6. **History.** `rev-list`, `rev-parse`, `merge-base`, `branch`, `tag`,
    `checkout`/`switch`/`restore`, `reset`, `reflog`.
+   *Done: [phase-6.md](phase-6.md).*
 7. **Merge.** `merge-file`, then the structural tree merge, then `merge`,
    `cherry-pick`, `revert`, `rebase`, `stash`.
 8. **Transport.** pkt-line, protocol v2 `ls-refs` and `fetch`, `index-pack`,

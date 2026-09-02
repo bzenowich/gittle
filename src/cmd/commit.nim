@@ -103,10 +103,12 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
   var i = 0
   var noMoreOpts = false
 
-  proc valueFor(a: string): string =
+  proc valueFor(a: string, dflt = ""): string =
+    ## As `optionValue`, plus the stuck short spelling: `commit -mfoo` is one
+    ## argument, and `-m` is the only option here that takes a value at all.
+    if a.len > 2 and a[0] == '-' and a[1] != '-': return a[2 .. ^1]
     let eq = a.find('=')
     if eq > 0 and a.startsWith("--"): return a[eq + 1 .. ^1]
-    if a.len > 2 and a[0] == '-' and a[1] != '-': return a[2 .. ^1]
     inc i
     failIf(i >= args.len, "option '" & a & "' requires a value")
     args[i]

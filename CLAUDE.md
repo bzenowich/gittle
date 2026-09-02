@@ -38,6 +38,8 @@ first, by anyone, in every phase:
 | Test | `tests/oracle.sh`, or `--full` to sweep every object in the reference repository and every commit and tag in it (~4 min). Needs bash, not just a POSIX shell. |
 | Comparing `log` | git applies `.mailmap` to `log` and `show` by **default** (`log.mailmap`, true since 2.34) and gittle does not — 18,512 of the reference repository's 82,130 commits display a different identity. Pass `--no-use-mailmap` to git or you are diffing that and nothing else. |
 | Comparing a diff | Four more of the same kind, all deliberate cuts (`docs/phase-5.md`): `--no-renames` (gittle detects none), `--minimal` (gittle's Myers always is), `--diff-merges=off` (combined diffs are cut — note `show` defaults to `--cc` where `log` does not), and, on the reference repository only, `-c diff.cpp.xfuncname=...` because its `.gitattributes` sets `diff=cpp` and a userdiff driver changes the name on a `@@` line. `tests/oracle.sh` has all four as `$NOREN`, `$NOCC` and `$NOATTR`. |
+| Testing a command that **writes** | Comparing stdout is not enough: a `checkout` that prints the right thing and leaves the wrong index is the failure worth catching. `oracle.sh`'s `p6mut` runs the command in two identical copies of a fixture and compares every ref, HEAD, the config, every reflog, every working-tree file and the whole index. Nine of phase 6's eleven bugs were found in that second comparison. |
+| Naming | gittle says `gittle` where git says `git`, in messages and in hints. The oracle normalises that away (`p6norm`) rather than testing it. |
 
 ## Documentation
 
@@ -65,7 +67,12 @@ None of these is optional; `plan.md` §7 has the detail.
 
 ## Watch this number
 
-`plan.md` §5 budgets **2,000 lines for the whole command layer** — dispatch,
-argument parsing, and all 53 commands — and says to guard it above all others.
-It is the line that scales with accepted option combinations rather than with
-any algorithm, and it is 28% of git. Check it every phase.
+`plan.md` §5 budgeted **2,000 lines for the whole command layer** and ~9,000
+for the project. **Both are spent.** At the end of phase 6 the total is 8,960
+lines of code with four phases still to build, and the command layer is 3,186
+for 30 of 56 commands.
+
+`docs/phase-6.md` has the measurement and a revised estimate (~12,700 for v1),
+along with the cheapest available cut. Read it before adding anything, and
+record the number again at the end of every phase — the point of the budget is
+that it is checked, not that it is met.

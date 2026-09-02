@@ -8,10 +8,11 @@
 import std/[os, strutils]
 import cli, config, util
 import cmd/hashobject, cmd/catfile
-import cmd/updateref, cmd/symbolicref, cmd/foreachref
+import cmd/updateref, cmd/symbolicref, cmd/foreachref, cmd/revparse, cmd/revlist, cmd/mergebase
 import cmd/lstree, cmd/writetree, cmd/readtree, cmd/updateindex, cmd/lsfiles
 import cmd/config as cmdconfig
 import cmd/init, cmd/committree, cmd/add, cmd/log, cmd/commit, cmd/show
+import cmd/branch, cmd/tag, cmd/checkout, cmd/reset, cmd/reflog
 import cmd/diff as cmddiff
 import cmd/status as cmdstatus
 import cmd/grep as cmdgrep
@@ -32,7 +33,9 @@ Options before the command:
 
 Commands:
    add                   stage content into the index
+   branch                list, create, rename and delete branches
    cat-file              inspect objects
+   checkout              switch branches, or restore files
    commit                record the staged content as a new commit
    commit-tree           create a commit object
    config                read and write configuration
@@ -44,10 +47,18 @@ Commands:
    log                   show commit history
    ls-files              list index and working-tree files
    ls-tree               list a tree object's entries
+   merge-base            find the common ancestor of two commits
    read-tree             load a tree into the index
+   reflog                show where a ref has been
+   reset                 move HEAD, the index and the working tree
+   restore               restore working-tree and index files
+   rev-list              walk history and list the objects it reaches
+   rev-parse             resolve revisions and report repository layout
    show                  display objects
    status                report working tree state
+   switch                change branches
    symbolic-ref          read and write symbolic refs
+   tag                   create, list and delete tags
    update-index          modify the index
    update-ref            create, update and delete refs
    write-tree            write the index out as a tree
@@ -59,6 +70,13 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   of "cat-file": cmdCatFile(c, args)
   of "init": cmdInit(c, args)
   of "add": cmdAdd(c, args)
+  of "branch": cmdBranch(c, args)
+  of "checkout": cmdCheckout(c, args)
+  of "switch": cmdSwitch(c, args)
+  of "restore": cmdRestore(c, args)
+  of "reset": cmdReset(c, args)
+  of "reflog": cmdReflog(c, args)
+  of "tag": cmdTag(c, args)
   of "log": cmdLog(c, args)
   of "commit": cmdCommit(c, args)
   of "show": cmdShow(c, args)
@@ -66,6 +84,9 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   of "status": cmdstatus.cmdStatus(c, args)
   of "grep": cmdgrep.cmdGrep(c, args)
   of "commit-tree": cmdCommitTree(c, args)
+  of "merge-base": cmdMergeBase(c, args)
+  of "rev-list": cmdRevList(c, args)
+  of "rev-parse": cmdRevParse(c, args)
   of "update-ref": cmdUpdateRef(c, args)
   of "symbolic-ref": cmdSymbolicRef(c, args)
   of "for-each-ref": cmdForEachRef(c, args)

@@ -377,7 +377,7 @@ func indented(msg: string, tabWidth: int): string =
     first = false
     result.add "    " & (if tabWidth > 0: expandTabs(line, tabWidth) else: line) & "\n"
 
-proc headerName(repo: Repository, o: Oid, opts: PrettyOpts): string =
+proc headerName*(repo: Repository, o: Oid, opts: PrettyOpts): string =
   ## The object name in a `commit` or `oneline` line.
   ##
   ## `--abbrev=<n>` alone does **not** shorten it: that option sets the
@@ -498,9 +498,12 @@ proc identLine(id: Ident, line: string): string =
   id.name & " <" & id.email & ">"
 
 proc formatOne*(repo: Repository, o: Oid, c: Commit, opts: PrettyOpts,
-                header = ""): string =
+                header = "", mark = ""): string =
   ## One commit, rendered.  `header` is what `show` puts before a commit that
-  ## it reached through a tag.
+  ## it reached through a tag; `mark` is `--left-right`'s `<` or `>`, which
+  ## goes immediately before the object name -- so *after* the word `commit`
+  ## on the formats that print one, and not at all under a user format
+  ## (`log-tree.c:show_log`).
   let dec = if opts.decorate: decorations(repo, o) else: @[]
   let decText = if dec.len > 0: " (" & dec.join(", ") & ")" else: ""
 
@@ -515,12 +518,14 @@ proc formatOne*(repo: Repository, o: Oid, c: Commit, opts: PrettyOpts,
       result.add (if opts.nulTerminate: '\0' else: '\n')
     return
   of pkOneline:
-    result.add repo.headerName(o, opts)
+    result.add mark & repo.headerName(o, opts)
+    if opts.showParents:
+      for p in c.parents: result.add " " & repo.headerName(p, opts)
     result.add decText & " " & subject(c.message) & "\n"
     return
   else: discard
 
-  result.add "commit " & repo.headerName(o, opts) & decText
+  result.add "commit " & mark & repo.headerName(o, opts) & decText
   if opts.showParents:
     for p in c.parents: result.add " " & repo.headerName(p, opts)
   result.add "\n"

@@ -1,14 +1,10 @@
 ## `log` -- show commit history.
 ##
-## Phase 4 landed the walk and the formatting; phase 5 adds the diff and the
-## limiting patterns.  One group is still deferred:
-##
-## * **revision ranges** (`A..B`, `^A`, `--all`, `--branches`) and the
-##   traversal orders (`--topo-order`, `--since`) -- phase 6, with `rev-list`
-##   and `rev-parse`, where that whole option surface belongs.
-##
-## It refuses by name.  A `log` that silently ignored an option would answer a
-## different question from the one asked, and look like it had answered.
+## Phase 4 landed the walk and the formatting, phase 5 the diff and the
+## limiting patterns, and phase 6 the rest of docs/04 -- which is `rev-list`'s
+## whole option surface, parsed by the same code in `revision.nim`.  What is
+## left in this file is what `rev-list` does not do: the pretty formats and
+## the patch underneath each commit.
 ##
 ## ## What separates a commit from its diff
 ##
@@ -28,17 +24,23 @@
 ## otherwise it is an error naming both possibilities.  `--` settles it, which
 ## is why scripts should use it and why the error message says so.
 
-import std/[os, strutils, times]
-import ../cli, ../commitobj, ../diffcore, ../ident, ../pathspec, ../pretty,
-       ../regex, ../repository, ../revwalk, ../util
+import std/[strutils, times]
+import ../cli, ../commitobj, ../diffcore, ../ident, ../oid, ../pretty,
+       ../regex, ../repository, ../revision, ../revwalk, ../util
 
 const usageText = """usage: gittle log [<options>] [<commit>…] [[--] <path>…]
 
    -n <n>, --max-count=<n>   stop after <n> commits
    --skip=<n>                skip the first <n>
+   --since=<date>, --until=<date>
+   --merges, --no-merges     only, or never, commits with two or more parents
    --reverse                 oldest first
    --first-parent            follow only the first parent of a merge
+   --not                     invert `^` for every following argument
+   --all, --branches[=<pat>], --tags[=<pat>], --remotes[=<pat>], --stdin
+   --topo-order, --date-order
    --no-walk                 show the named commits only
+   --left-right              mark which side of an A...B a commit came from
    --parents                 also print each commit's parents
    --oneline                 one line each, abbreviated
    --pretty=<fmt>            oneline|medium|full|fuller|raw|format:…|tformat:…
@@ -91,63 +93,46 @@ proc selects(l: Limiters, c: Commit): bool =
     if hit == l.invertGrep: return false
   true
 
-const deferred: array[2, (string, seq[string])] = [
-  ("out of scope for gittle v1 (docs/04)", @[
-    "--full-diff", "--follow", "--graph"]),
-  ("phase 6, with rev-list and rev-parse", @[
-    "--all", "--branches", "--tags", "--remotes", "--not", "--stdin",
-    "--topo-order", "--date-order", "--since", "--after", "--until",
-    "--before", "--merges", "--no-merges", "--min-parents", "--max-parents",
-    "--ancestry-path", "--objects", "--left-right", "--cherry-pick",
-    "--boundary", "--simplify-by-decoration", "--count"])]
-    ## What `log` does not do yet, as a table, so that each refuses by name
-    ## with the phase that brings it.  Silently ignoring an option answers a
-    ## different question from the one asked, and looks like it answered.
+const deferred = @[
+  "--full-diff", "--follow", "--graph", "--min-parents", "--max-parents",
+  "--ancestry-path", "--cherry-pick", "--cherry-mark", "--boundary",
+  "--simplify-by-decoration", "--simplify-merges", "--objects",
+  "--walk-reflogs", "--author-date-order", "--children", "--source"]
+  ## What `log` does not do, as a table, so that each refuses by name rather
+  ## than being silently ignored -- which would answer a different question
+  ## from the one asked, and look like it had answered.
 
 proc checkDeferred(a: string) =
   let name = if a.contains('='): a[0 ..< a.find('=')] else: a
-  for (why, names) in deferred:
-    for n in names:
-      if n == name:
-        fail(a & " is not implemented in this version\n  it is " & why)
+  for n in deferred:
+    if n == name:
+      fail(a & " is out of scope for gittle v1 (docs/04)")
 
 proc cmdLog*(c: Ctx, args: seq[string]): int =
+  let repo = c.repo
+  let w = newRevWalk(repo)
+  var ri = initRevInput()
   var opts = PrettyOpts(kind: pkMedium, now: getTime().toUnix())
-  var maxCount = -1
-  var skip = 0
-  var reverse = false
-  var noWalk = false
   var decorateMode = "auto"
-  var firstParent = false
   var abbrevLen = 0
   var dopts = defaultDiffOpts()
   var lim = Limiters()
   var greps, authors, committers: seq[string]
   var icase = false
   var fixed = false
-  var revs: seq[string]
-  var specs: seq[string]
   var i = 0
-  var seenDashDash = false
 
-  proc valueFor(a: string): string =
-    ## `--opt=v`, `--opt v` and `-nV` all reach here.
-    let eq = a.find('=')
-    if eq > 0: return a[eq + 1 .. ^1]
-    inc i
-    failIf(i >= args.len, "option '" & a & "' requires a value")
-    args[i]
+  optionValue(args, i)
 
   while i < args.len:
     let a = args[i]
-    if seenDashDash:
-      specs.add a
+    if ri.seenDashDash:
+      ri.specs.add a
     elif a == "--":
-      seenDashDash = true
+      ri.seenDashDash = true
     elif a.len > 1 and a[0] == '-':
       checkDeferred(a)
-      if a == "--reverse": reverse = true
-      elif a == "--first-parent": firstParent = true
+      if w.parseWalkOpt(ri, a, valueFor): discard
       elif a == "--parents": opts.showParents = true
       elif a == "--oneline":
         opts.kind = pkOneline
@@ -156,11 +141,8 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
       elif a == "--no-abbrev-commit": opts.abbrevCommit = false
       elif a == "--relative-date": opts.dateMode = DateMode(kind: dkRelative)
       elif a == "--no-decorate": decorateMode = "no"
-      elif a == "--no-walk" or a.startsWith("--no-walk="): noWalk = true
-      elif a == "-n" or a.startsWith("--max-count"): maxCount = parseInt(valueFor(a))
       elif a.len > 2 and a[1] == 'n' and a[2] in {'0' .. '9'}:
-        maxCount = parseInt(a[2 .. ^1])       # `-n5`, which git also accepts
-      elif a.startsWith("--skip"): skip = parseInt(valueFor(a))
+        ri.maxCount = parseInt(a[2 .. ^1])    # `-n5`, which git also accepts
       elif a.startsWith("--abbrev"): abbrevLen = parseInt(valueFor(a))
       elif a.startsWith("--date"): opts.dateMode = parseDateMode(valueFor(a))
       elif a.startsWith("--decorate"):
@@ -183,12 +165,12 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
       elif a == "--all-match": lim.allMatch = true
       elif a == "--invert-grep": lim.invertGrep = true
       elif a.len > 1 and a[1] in {'0' .. '9'}:
-        maxCount = parseInt(a[1 .. ^1])       # the bare `-5` form
+        ri.maxCount = parseInt(a[1 .. ^1])    # the bare `-5` form
       elif parseDiffOpt(a, dopts, valueFor): discard
       else:
         fail("unknown option '" & a & "'\n" & usageText)
     else:
-      revs.add a
+      w.addRevisionArg(ri, a)
     inc i
 
   # Compiled once, after parsing, because `-i` and `-F` may follow the pattern
@@ -203,7 +185,6 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
          "--decorate=full is out of scope for gittle v1 (docs/07)")
   opts.decorate = decorateMode == "short" or (decorateMode == "auto" and isTty())
 
-  let repo = c.repo
   # An abbreviation is a *minimum* that `uniqueAbbrev` lengthens until it names
   # one object, and the default minimum scales with the repository -- seven in
   # a small one, ten in the git repository next door.
@@ -212,39 +193,8 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
   # line, so the value has to reach both option sets.
   if abbrevLen > 0: dopts.abbrev = abbrevLen
 
-  # A leading argument that is not a revision is a path -- and everything after
-  # it is too, which is what makes `log Makefile` work without a `--`.  When
-  # `--` *was* given the question does not arise: everything before it is a
-  # revision, which is exactly why scripts should use it.
-  var starts: seq[Oid]
-  for r in revs:
-    var o: Oid
-    var ok = true
-    try: o = repo.resolveOid(r)
-    except GittleError: ok = false
-    if ok and (seenDashDash or specs.len == 0):
-      starts.add o
-    else:
-      failIf(not fileExists(repo.workTreePath(repo.prefix & r)) and
-             not dirExists(repo.workTreePath(repo.prefix & r)),
-             "ambiguous argument '" & r & "': unknown revision or path not " &
-             "in the working tree\n" &
-             "  Use '--' to separate paths from revisions")
-      specs.add r
-
-  if starts.len == 0:
-    let h = repo.refs.resolveRef(headRef)
-    failIf(not h.found,
-           "your current branch '" & repo.headRefName &
-           "' does not have any commits yet")
-    starts.add h.oid
-
-  let ps = parsePathspec(specs, repo.prefix)
-  let w = newRevWalk(repo)
-  w.firstParent = firstParent
-  w.paths = ps
-  w.limiting = not ps.isEmpty
-  for o in starts: w.push(o)
+  w.finishRevInput(ri)
+  let ps = w.paths
 
   # `--no-walk` shows the named commits and stops; it is how `rev-list` is used
   # to format a list of commits somebody already has.
@@ -255,14 +205,22 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
   checkDiffOpts(dopts)
   opts.nulTerminate = dopts.nulTerminate
 
-  proc render(o: Oid, commit: Commit): string =
+  proc render(o: Oid, commit: Commit, parents: seq[Oid], left: bool): string =
     ## One commit, and the diff under it if any format was asked for.
     ##
     ## A merge has none: the combined formats are cut (docs/03), so there is
     ## nothing to show against several parents at once.  A root commit is
     ## diffed against the empty tree, which is what the null object ID means
     ## to `pairsTreeTree`.
-    result = formatOne(repo, o, commit, opts)
+    # The parents handed in are the *rewritten* ones under a pathspec, so the
+    # printed ancestry only names commits that are in the output.
+    var c = commit
+    c.parents = parents
+    # The `<`/`>` mark has a space after it, and sits immediately before the
+    # object name (`log-tree.c:put_revision_mark`).
+    result = formatOne(repo, o, c, opts,
+                       mark = if not ri.leftRight: ""
+                              elif left: "< " else: "> ")
     if not wantDiff or commit.parents.len > 1: return
     let old = if commit.parents.len == 1:
                 repo.peelTo(commit.parents[0], otTree).oid
@@ -281,22 +239,16 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
   var entries: seq[string]
   var shown = 0
   var skipped = 0
-  if noWalk:
-    for o in starts:
-      let commit = repo.readCommit(o)
-      if not lim.selects(commit): continue
-      entries.add render(o, commit)
-  else:
-    for (o, commit) in w.walk:
-      if not lim.selects(commit): continue
-      if skipped < skip:
-        inc skipped
-        continue
-      if maxCount >= 0 and shown >= maxCount: break
-      inc shown
-      entries.add render(o, commit)
+  for e in w.walk:
+    if not lim.selects(e.commit): continue
+    if skipped < ri.skip:
+      inc skipped
+      continue
+    if ri.maxCount >= 0 and shown >= ri.maxCount: break
+    inc shown
+    entries.add render(e.oid, e.commit, e.parents, e.left)
 
-  if reverse:
+  if ri.reverse:
     for k in 0 ..< entries.len div 2:
       swap(entries[k], entries[entries.high - k])
 

@@ -11,7 +11,7 @@
 ## "I do not know, go and look" that `status` needs, and it is what git leaves
 ## behind too.
 
-import ../cli, ../index, ../repository, ../trees, ../util
+import ../cli, ../index, ../repository, ../revision, ../trees, ../util
 
 const usageText = "usage: gittle read-tree (<tree-ish> | --empty)"
 

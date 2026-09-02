@@ -28,7 +28,7 @@
 ## need it.
 
 import std/[strutils]
-import ../cli, ../oid, ../repository, ../util
+import ../cli, ../oid, ../repository, ../revision, ../util
 
 const usageText = """usage: gittle update-ref [-m <reason>] <ref> <new-oid> [<old-oid>]
    or: gittle update-ref [-m <reason>] -d <ref> [<old-oid>]
@@ -304,7 +304,7 @@ proc runStdin(c: Ctx, nulTerminated: bool, defaultMsg: string): int =
         # An empty new value is the null object ID, and setting a ref to the
         # null object ID is how this stream spells a delete.
         if args[next].value.len == 0: u.kind = ruDelete
-        else: u.newOid = repo.resolveOid(args[next].value)
+        else: u.newOid = repo.resolveRevish(args[next].value)
         inc next
 
       case g.oldValue
@@ -324,7 +324,7 @@ proc runStdin(c: Ctx, nulTerminated: bool, defaultMsg: string): int =
             u.oldTarget = val.value
           of "oid":
             u.haveOldOid = true
-            if val.value.len > 0: u.oldOid = repo.resolveOid(val.value)
+            if val.value.len > 0: u.oldOid = repo.resolveRevish(val.value)
           else:
             fail(verb & ": expected 'ref' or 'oid', got '" & kind & "'")
       of ovTarget:
@@ -340,7 +340,7 @@ proc runStdin(c: Ctx, nulTerminated: bool, defaultMsg: string): int =
         if args[next].present and (args[next].value.len > 0 or emptyOldIsNull):
           u.haveOldOid = true
           if args[next].value.len > 0:
-            u.oldOid = repo.resolveOid(args[next].value)
+            u.oldOid = repo.resolveRevish(args[next].value)
 
       failIf(g.kind == ruVerify and not (u.haveOldOid or u.haveOldTarget),
              verb & ": missing the value to verify")
@@ -408,17 +408,17 @@ proc cmdUpdateRef*(c: Ctx, args: seq[string]): int =
   if del:
     failIf(rest.len < 1 or rest.len > 2, usageText)
     if rest.len == 2:
-      repo.refs.deleteRef(rest[0], repo.resolveOid(rest[1]), checkOld = true,
+      repo.refs.deleteRef(rest[0], repo.resolveRevish(rest[1]), checkOld = true,
                           msg = msg)
     else:
       repo.refs.deleteRef(rest[0], msg = msg)
     return 0
 
   failIf(rest.len < 2 or rest.len > 3, usageText)
-  let newOid = repo.resolveOid(rest[1])
+  let newOid = repo.resolveRevish(rest[1])
   if rest.len == 3:
     # An empty old value, or the null OID, both mean "must not exist".
-    let oldOid = if rest[2].len == 0: nullOid else: repo.resolveOid(rest[2])
+    let oldOid = if rest[2].len == 0: nullOid else: repo.resolveRevish(rest[2])
     repo.refs.updateRef(rest[0], newOid, oldOid, checkOld = true, msg = msg)
   else:
     repo.refs.updateRef(rest[0], newOid, msg = msg)

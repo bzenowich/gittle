@@ -276,6 +276,60 @@ const revParseRules* = ["", refsPrefix, "refs/tags/", "refs/heads/",
   ## name is substituted; every other rule is a plain prefix.  The order is why
   ## a tag beats a branch of the same name.
 
+proc refExists(s: RefStore, name: string): bool =
+  s.readRef(name).found
+
+proc shortenRef*(s: RefStore, full: string, strict = false): string =
+  ## The shortest name that still means this ref: `refs/heads/main` -> `main`,
+  ## for `rev-parse --abbrev-ref` and `branch`'s listings.
+  ##
+  ## It is `dwimRef` run backwards (`refs.c:refs_shorten_unambiguous_ref`).
+  ## Try the rules from the most specific to the least; a rule's short name is
+  ## acceptable only if **no earlier rule** turns it into a ref that exists,
+  ## because an earlier rule would win when the name is read back.  So a tag
+  ## and a branch both called `x` leave the branch spelled `heads/x`.
+  ##
+  ## `--abbrev-ref=strict` demands that *every* other rule fail, not only the
+  ## earlier ones -- a stricter answer for scripts that will feed it back to a
+  ## different tool.
+  for i in countdown(revParseRules.high, 1):
+    let rule = revParseRules[i]
+    var short: string
+    if rule.endsWith("/HEAD"):
+      let head = rule[0 ..< rule.len - 6]
+      if not (full.startsWith(head) and full.endsWith("/HEAD")): continue
+      short = full[head.len .. full.len - 6]
+    else:
+      if not full.startsWith(rule): continue
+      short = full[rule.len .. ^1]
+    if short.len == 0: continue
+
+    var ambiguous = false
+    for j in 0 ..< (if strict: revParseRules.len else: i):
+      if j == i: continue
+      let other = revParseRules[j]
+      let candidate = if other.endsWith("/HEAD"): other[0 ..< other.len - 6] & short & "/HEAD"
+                      else: other & short
+      if s.refExists(candidate): ambiguous = true; break
+    if not ambiguous: return short
+  full
+
+proc expandRefName*(s: RefStore, name: string): string =
+  ## The full name of the ref a short name means, **without** following it.
+  ##
+  ## `dwimRef` answers "what object does this name?" and therefore resolves
+  ## symbolic refs; `reflog HEAD` needs the other question, because HEAD has a
+  ## log of its own that is not the log of the branch it points at.
+  for rule in revParseRules:
+    let candidate = if rule.len == 0: name
+                    elif rule.endsWith("/HEAD"): rule[0 ..< rule.len - 6] & name & "/HEAD"
+                    else: rule & name
+    if not candidate.startsWith(refsPrefix) and
+       not isValidRefname(candidate, {rfAllowOneLevel}):
+      continue
+    if s.readRef(candidate).found: return candidate
+  ""
+
 proc dwimRef*(s: RefStore, name: string): tuple[found: bool, full: string, oid: Oid] =
   ## Turn a name a human typed -- `main`, `v1.0`, `origin/main`, `HEAD` -- into
   ## a full ref name and its value, trying git's rules in git's order.
@@ -384,6 +438,12 @@ type
     oldTarget*: string
     haveOldOid*: bool     ## an expected object ID was specified
     haveOldTarget*: bool  ## an expected symref target was specified
+    logOld*: Oid          ## what the reflog should record as the old value,
+                          ## when that is not what the ref currently holds.
+                          ## `branch -m` is the case: the new name has no
+                          ## value yet, and a log entry saying it came from
+                          ## nowhere would lose the rename.
+    haveLogOld*: bool
     noDeref*: bool        ## act on this ref itself, not on what it points at
     msg*: string          ## reflog reason
 
@@ -400,6 +460,8 @@ type
   Plan = object
     ## What `prepare` decided to do about one update.
     target: string    ## the ref actually written, after following symrefs
+    logBefore: Oid    ## what the reflog says it was, usually `before`
+    noop: bool        ## the ref already holds this value
     alias: string     ## the symref we came through, or "" -- it gets a reflog
                       ## entry of its own, which is how HEAD keeps a history
                       ## even though the branch is what moves
@@ -642,14 +704,39 @@ proc prepare*(tx: RefTransaction) =
                  "too many levels of symbolic refs starting at " & u.name)
           p.target = rf.symTarget
 
+      # git's "special hack" (`refs/files-backend.c:commit_ref_update`, and
+      # `refs.c:split_head_update` in the transaction layer): HEAD keeps a
+      # history of the branch it is on, so *any* update to that branch is
+      # logged to HEAD as well -- however the branch was named.  Without this,
+      # `update-ref refs/heads/main` and `branch -m` leave HEAD's reflog with
+      # a hole where the current branch moved.
+      if p.alias.len == 0 and p.target != headRef:
+        let (_, headTarget, _) = s.resolveRef(headRef)
+        if headTarget == p.target: p.alias = headRef
+
       var lock = s.lockRef(p.target)
       tx.locks.add lock
       s.checkNewValue(u, p.target)
       s.verifyOld(u, p.target)
       p.before = s.resolveRef(p.target).oid
+      p.logBefore = if u.haveLogOld: u.logOld else: p.before
 
       case u.kind
-      of ruSet: p.content = $u.newOid & "\n"
+      of ruSet:
+        p.content = $u.newOid & "\n"
+        # Writing a ref the value it already has is not a change, and git
+        # records neither the write nor a reflog entry for it
+        # (`refs/files-backend.c:lock_ref_for_update`).  HEAD is the exception
+        # below: it is updated *through* the branch, so its own log still gets
+        # the entry -- which is why `reset --soft HEAD` shows up in
+        # `reflog show` and leaves the branch's log alone.
+        # ... and never when the ref being written is itself symbolic: an
+        # object ID written into a symref *replaces* it, which is a change
+        # however equal the values are (git's test is on `REF_ISSYMREF` for
+        # exactly this reason).  That is how `symbolic-ref`-style refs get
+        # detached, and skipping it would leave HEAD attached.
+        let cur = s.readRef(p.target)
+        p.noop = cur.found and not cur.isSymbolic and p.before == u.newOid
       of ruSetSymbolic: p.content = "ref: " & u.newTarget & "\n"
       of ruDelete: p.delete = true
       of ruVerify: p.verifyOnly = true
@@ -686,6 +773,8 @@ proc commit*(tx: RefTransaction) =
       # The check already happened under the lock in `prepare`; all that is
       # left is to let go without touching the ref.
       tx.locks[i].rollback()
+    elif tx.plans[i].noop:
+      tx.locks[i].rollback()
     elif tx.plans[i].delete:
       discard tryRemoveFile(tx.locks[i].path)
       tx.locks[i].releaseAfterDelete()
@@ -707,9 +796,11 @@ proc commit*(tx: RefTransaction) =
       # the same name, created later, appear to continue the deleted one.
       discard tryRemoveFile(s.reflogPath(p.target))
       s.pruneEmptyRefDirs(p.target)
+      # HEAD's own log survives, and records that what it pointed at is gone.
+      if p.alias.len > 0: s.appendReflog(p.alias, p.before, nullOid, p.msg)
       continue
     let after = s.resolveRef(p.target).oid
-    s.appendReflog(p.target, p.before, after, p.msg)
+    if not p.noop: s.appendReflog(p.target, p.logBefore, after, p.msg)
     if p.alias.len > 0:
       s.appendReflog(p.alias, p.before, after, p.msg)
 
@@ -729,11 +820,16 @@ template withTransaction(store: RefStore, tx, body: untyped) =
 # -- single-update conveniences ---------------------------------------------
 
 proc updateRef*(s: RefStore, name: string, newOid: Oid, oldOid = nullOid,
-                checkOld = false, msg = "") =
+                checkOld = false, msg = "", logOld = nullOid,
+                haveLogOld = false, noDeref = false) =
   ## Point `name` at `newOid`, following it if it is a symbolic ref.
+  ##
+  ## `noDeref` is what detaches HEAD: writing an object ID *into* HEAD rather
+  ## than into the branch it names is the whole of what "detached" means.
   withTransaction(s, tx):
     tx.add RefUpdate(kind: ruSet, name: name, newOid: newOid,
-                     oldOid: oldOid, haveOldOid: checkOld, msg: msg)
+                     oldOid: oldOid, haveOldOid: checkOld, msg: msg,
+                     logOld: logOld, haveLogOld: haveLogOld, noDeref: noDeref)
 
 proc deleteRef*(s: RefStore, name: string, oldOid = nullOid, checkOld = false,
                 noDeref = false, msg = "") =

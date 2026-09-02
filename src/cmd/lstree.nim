@@ -9,7 +9,8 @@
 ## in a seven-column field, with `-` for anything that is not a blob.
 
 import std/[strutils]
-import ../cli, ../index, ../objects, ../oid, ../repository, ../trees, ../util
+import ../cli, ../objects, ../oid, ../repository, ../revision,
+       ../trees, ../util
 
 const usageText = "usage: gittle ls-tree [-d] [-r] [-t] [-l] [-z] " &
                   "[--name-only] [--abbrev[=<n>]] <tree-ish> [<path>…]"

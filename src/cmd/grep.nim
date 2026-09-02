@@ -30,7 +30,7 @@
 
 import std/[os, posix, algorithm, strutils]
 import ../cli, ../index, ../objects, ../pathspec, ../regex, ../repository,
-       ../trees, ../util
+       ../revision, ../trees, ../util
 
 const usageText = """usage: gittle grep [<options>] [-e] <pattern> [<rev>…] [[--] <path>…]
 
@@ -177,12 +177,7 @@ proc cmdGrep*(c: Ctx, args: seq[string]): int =
   var seenDashDash = false
   var havePattern = false
 
-  proc valueFor(a: string): string =
-    let eq = a.find('=')
-    if eq > 0: return a[eq + 1 .. ^1]
-    inc i
-    failIf(i >= args.len, "option '" & a & "' requires a value")
-    args[i]
+  optionValue(args, i)
 
   while i < args.len:
     let a = args[i]

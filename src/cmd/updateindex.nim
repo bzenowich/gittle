@@ -9,7 +9,8 @@
 ## plumbing, so it refuses to guess which of the two a caller meant.
 
 import std/[posix, strutils]
-import ../cli, ../dir, ../index, ../objects, ../repository, ../util
+import ../cli, ../dir, ../index, ../objects, ../repository, ../revision,
+       ../util
 
 const usageText = """usage: gittle update-index [--add] [--remove] [--refresh]
                           [--cacheinfo <mode>,<object>,<path>]
@@ -47,7 +48,7 @@ proc parseCacheinfo(repo: Repository, idx: Index, arg: string) =
   failIf(mode notin [modeRegular, modeExecutable, modeSymlink, modeGitlink],
          "invalid mode " & parts[0] & " in --cacheinfo")
   var e = IndexEntry(mode: mode, path: parts[2])
-  e.oid = repo.resolveOid(parts[1])
+  e.oid = repo.resolveRevish(parts[1])
   failIf(not repo.hasObject(e.oid),
          "--cacheinfo names an object that is not in the database: " & parts[1])
   idx.addEntry(e)

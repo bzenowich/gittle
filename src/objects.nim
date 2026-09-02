@@ -166,6 +166,33 @@ func modeType*(mode: uint32): ObjectType =
   of 0o160000'u32: otCommit
   else: otBlob
 
+const
+  modeRegular* = 0o100644'u32
+  modeExecutable* = 0o100755'u32
+  modeSymlink* = 0o120000'u32
+  modeGitlink* = 0o160000'u32
+  modeTree* = 0o040000'u32
+
+func canonMode*(mode: uint32): uint32 =
+  ## The mode git *works with*, which is not always the mode the tree records.
+  ##
+  ## git normalises every mode through `canon_mode` (`cache.h`) before it
+  ## reaches the diff or the working-tree update: a regular file becomes
+  ## 100644 or 100755 by
+  ## whether any execute bit is set, and everything else collapses to its
+  ## type.  It matters on real history -- git's own root commit records
+  ## `100664`, and `git show` on it prints `new file mode 100644`.
+  ##
+  ## Only the *display* is canonical.  The tree keeps its own bytes, because
+  ## rewriting them would change the tree's object ID (R1).
+  case modeType(mode)
+  of otTree: modeTree
+  of otCommit: modeGitlink
+  else:
+    if (mode and 0o170000'u32) == 0o120000'u32: modeSymlink
+    elif (mode and 0o111'u32) != 0: modeExecutable
+    else: modeRegular
+
 func octalMode*(mode: uint32): string =
   ## Octal with no leading zero -- how a mode is *stored* in a tree object.  A
   ## directory is `40000`, not `040000`, and writing the padded form would

@@ -136,7 +136,7 @@ proc checkDiffOpts*(o: DiffOpts) =
          "options '--name-only', '--name-status' and '-s' cannot be used together")
 
 proc parseDiffOpt*(a: string, o: var DiffOpts,
-                   valueFor: proc (a: string): string): bool =
+                   valueFor: proc (a, dflt: string): string): bool =
   ## Consume one option from the shared `diff-options` family, or say it is
   ## not one of ours.  `diff`, `log` and `show` all call this first and then
   ## parse only what is genuinely theirs.
@@ -184,17 +184,17 @@ proc parseDiffOpt*(a: string, o: var DiffOpts,
         failIf(parts.len > 1,
                "--stat=<width>,<name-width> is out of scope for gittle v1")
         o.statWidth = parseInt(parts[0])
-    elif a.startsWith("--unified"): o.ctxLen = parseInt(valueFor(a))
+    elif a.startsWith("--unified"): o.ctxLen = parseInt(valueFor(a, ""))
     elif a.len > 2 and a[0] == '-' and a[1] == 'U': o.ctxLen = parseInt(a[2 .. ^1])
     elif a.startsWith("--diff-filter"):
-      o.filter = valueFor(a).toUpperAscii
+      o.filter = valueFor(a, "").toUpperAscii
       for c in o.filter:
         failIf(c notin {'A', 'D', 'M', 'T', '*'},
                "unsupported --diff-filter character '" & c &
                "'\n  gittle detects no renames or copies, so only A, D, M " &
                "and T can occur")
-    elif a.startsWith("-S"): o.pickaxe = (if a.len > 2: a[2 .. ^1] else: valueFor(a))
-    elif a.startsWith("--abbrev"): o.abbrev = parseInt(valueFor(a))
+    elif a.startsWith("-S"): o.pickaxe = (if a.len > 2: a[2 .. ^1] else: valueFor(a, ""))
+    elif a.startsWith("--abbrev"): o.abbrev = parseInt(valueFor(a, ""))
     elif a.startsWith("--color"):
       let w = if a.contains('='): a[a.find('=') + 1 .. ^1] else: "always"
       o.color = case w
@@ -209,25 +209,6 @@ proc parseDiffOpt*(a: string, o: var DiffOpts,
 # ---------------------------------------------------------------------------
 # The four sources of pairs
 # ---------------------------------------------------------------------------
-
-func canonMode(mode: uint32): uint32 =
-  ## The mode a *diff* reports, which is not always the mode the tree records.
-  ##
-  ## git normalises every mode through `canon_mode` (`cache.h`) before it
-  ## reaches the diff machinery: a regular file becomes 100644 or 100755 by
-  ## whether any execute bit is set, and everything else collapses to its
-  ## type.  It matters on real history -- git's own root commit records
-  ## `100664`, and `git show` on it prints `new file mode 100644`.
-  ##
-  ## Only the *display* is canonical.  The tree keeps its own bytes, because
-  ## rewriting them would change the tree's object ID (R1).
-  case modeType(mode)
-  of otTree: modeTree
-  of otCommit: modeGitlink
-  else:
-    if (mode and 0o170000'u32) == 0o120000'u32: modeSymlink
-    elif (mode and 0o111'u32) != 0: modeExecutable
-    else: modeRegular
 
 type
   FileEntry = object

@@ -39,9 +39,18 @@
 ## ahead/behind counts, which need a remote (phase 8).
 
 import std/[algorithm, strutils]
-import diffcore, dir, ignore, index, objects, pathspec, repository, util
+import diffcore, dir, ignore, index, objects, pathspec, refs, repository,
+       revision, revwalk, util
 
 type
+  Tracking* = object
+    ## Where a branch stands against its configured upstream.  All four
+    ## `status` formats report it, and so does `checkout` after a switch, so
+    ## it is computed once and rendered four ways.
+    upstream*: string   ## the short name, or "" when none is configured
+    gone*: bool         ## configured, but the remote-tracking ref is absent
+    ahead*, behind*: int
+
   UntrackedMode* = enum
     umNo, umNormal, umAll
 
@@ -59,6 +68,8 @@ type
     untracked*: seq[string]
     branch*: string         ## the branch HEAD names, without `refs/heads/`
     detached*: bool
+    headDesc*: string       ## `HEAD detached at v1.0`, when it is detached
+    tracking*: Tracking     ## where the branch stands against its upstream
     headOid*: Oid
     initial*: bool          ## HEAD points at a branch with no commits yet
 
@@ -103,6 +114,19 @@ proc collapseUntracked(idx: Index, paths: seq[string]): seq[string] =
     if seen.len == 0 or seen[^1] != name: seen.add name
   seen
 
+proc trackingOf*(repo: Repository, branch: string): Tracking =
+  ## Two reachability counts, which is why nothing asks for this twice.
+  let up = repo.upstreamRef(branch)
+  if up.len == 0: return
+  result.upstream = repo.refs.shortenRef(up)
+  let here = repo.refs.resolveRef(branch)
+  let there = repo.refs.resolveRef(up)
+  if not there.found:
+    result.gone = true
+  elif here.found:
+    result.ahead = repo.countRange(here.oid, there.oid)
+    result.behind = repo.countRange(there.oid, here.oid)
+
 proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
                     untracked: UntrackedMode): Status =
   ## The whole model, in the order the two letters are defined.
@@ -113,8 +137,11 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
     result.branch = result.branch[heads.len .. ^1]
   else:
     result.detached = true
+    result.headDesc = headDescription(repo)
   result.initial = not h.found
   if h.found: result.headOid = h.oid
+
+  result.tracking = repo.trackingOf(repo.headRefName)
 
   let headTree = if h.found: repo.peelTo(h.oid, otTree).oid else: nullOid
 
@@ -193,13 +220,30 @@ proc shortLines*(st: Status, fmt: StatusFormat, branch: bool, nulTerm: bool,
                  (if st.initial: "(initial)" else: $st.headOid) & sep
       result.add "# branch.head " &
                  (if st.detached: "(detached)" else: st.branch) & sep
-      # `# branch.upstream` and `# branch.ab` need a configured remote-tracking
-      # branch, which is phase 8.  git omits both when there is none, so an
-      # absent upstream is silence rather than a divergence.
+      # Both lines are omitted entirely when there is no upstream: an absent
+      # relationship is silence, not a zero.
+      if st.tracking.upstream.len > 0:
+        result.add "# branch.upstream " & st.tracking.upstream & sep
+        if not st.tracking.gone:
+          result.add "# branch.ab +" & $st.tracking.ahead & " -" &
+                     $st.tracking.behind & sep
     else:
       if st.detached: result.add "## HEAD (no branch)" & sep
       elif st.initial: result.add "## No commits yet on " & st.branch & sep
-      else: result.add "## " & st.branch & sep
+      else:
+        # `## main...origin/main [ahead 1, behind 2]`.  The counts are omitted
+        # when the two are level, so the common case is just the two names.
+        result.add "## " & st.branch
+        if st.tracking.upstream.len > 0:
+          result.add "..." & st.tracking.upstream
+          if st.tracking.ahead > 0 or st.tracking.behind > 0:
+            result.add " ["
+            if st.tracking.ahead > 0: result.add "ahead " & $st.tracking.ahead
+            if st.tracking.ahead > 0 and st.tracking.behind > 0: result.add ", "
+            if st.tracking.behind > 0: result.add "behind " & $st.tracking.behind
+            result.add "]"
+          elif st.tracking.gone: result.add " [gone]"
+        result.add sep
 
   for e in st.entries:
     if fmt == sfPorcelainV2:
@@ -235,6 +279,35 @@ proc labelFor(c: char): string =
     if k == c: return text.alignLeft(labelWidth)
   "unknown:".alignLeft(labelWidth)
 
+proc trackingLine*(t: Tracking): string =
+  ## `Your branch is up to date with 'origin/main'.` and its three siblings.
+  ## Printed by `checkout` and `status` alike, which is why it lives here
+  ## rather than in either (`wt-status.c:wt_status_print_tracking`).
+  if t.upstream.len == 0: return ""
+  let name = t.upstream
+  if t.gone:
+    return "Your branch is based on '" & name & "', but the upstream is gone.\n" &
+           "  (use \"gittle branch --unset-upstream\" to fixup)\n"
+  let ahead = t.ahead
+  let behind = t.behind
+
+  proc commits(n: int): string = $n & (if n == 1: " commit" else: " commits")
+  if ahead == 0 and behind == 0:
+    "Your branch is up to date with '" & name & "'.\n"
+  elif behind == 0:
+    "Your branch is ahead of '" & name & "' by " & commits(ahead) & ".\n" &
+    "  (use \"gittle push\" to publish your local commits)\n"
+  elif ahead == 0:
+    "Your branch is behind '" & name & "' by " & commits(behind) &
+    ", and can be fast-forwarded.\n" &
+    "  (use \"gittle pull\" to update your local branch)\n"
+  else:
+    "Your branch and '" & name & "' have diverged,\nand have " &
+    commits(ahead) & " and " & commits(behind) &
+    " different each respectively.\n" &
+    "  (use \"gittle pull\" if you want to integrate the remote branch with " &
+    "yours)\n"
+
 proc longStatus*(st: Status, untracked: UntrackedMode, hints: bool,
                  prefix: string): string =
   ## The descriptive format, which is the default and is the only one whose
@@ -255,9 +328,13 @@ proc longStatus*(st: Status, untracked: UntrackedMode, hints: bool,
       if e.y == 'D': anyDeleted = true
 
   if st.detached:
-    result.add "HEAD detached at " & ($st.headOid)[0 ..< 7] & "\n"
+    result.add st.headDesc & "\n"
   else:
     result.add "On branch " & st.branch & "\n"
+    # A blank line closes the tracking paragraph, the same way every other
+    # section here is closed (`wt-status.c:wt_longstatus_print_tracking`).
+    let track = st.tracking.trackingLine
+    if track.len > 0: result.add track & "\n"
   # Sections are separated by a blank line *after* each one, so the first
   # follows `On branch …` directly and the last leaves a trailing blank.
   if st.initial:
