@@ -2556,6 +2556,17 @@ p8clone -q "file://$P8/empty"
 p8clone -q --bare "file://$P8/empty"
 p8clone -q --upload-pack "$P8/v0" "$SRC"
 p8clone -q "$P8/src"
+# A repository with a submodule in it.  git leaves an *empty directory* where
+# the gitlink is (`entry.c:write_entry`, `case S_IFGITLINK`), and a clone that
+# does not is one whose very first `status` reports a deletion.
+GL="$P8/gl"; rm -rf "$GL"; mkdir -p "$GL"
+( cd "$GL" && git init -q -b main w && cd w
+  echo a > a.txt; mkdir -p d; echo b > d/b.txt
+  git add .; git commit -qm one
+  git update-index --add --cacheinfo 160000,"$(git rev-parse HEAD)",sub
+  git commit -qm sub ) >/dev/null 2>&1
+git clone -q --bare "$GL/w" "$GL/src" >/dev/null 2>&1
+p8clone -q "file://$GL/src"
 [ $p8ok = 1 ] && { ok; report "clone" "$p8n clones compared whole"; } \
               || bad "clone"
 

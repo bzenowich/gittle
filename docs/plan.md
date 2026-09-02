@@ -448,8 +448,8 @@ which puts v1 near **13,000**.  Recorded, not cut against (§5's own rule).
 
 ### 5.3 After phase 8
 
-**12,841 lines**, eight of nine phases done (nine is empty).  Phase 8 cost
-2,083 — [phase-8.md](phase-8.md) has the breakdown — and it split the same way
+**12,847 lines**, eight of nine phases done (nine is empty).  Phase 8 cost
+2,089 — [phase-8.md](phase-8.md) has the breakdown — and it split the same way
 phase 7 did, for a new reason:
 
 | | budgeted | actual |
@@ -458,7 +458,7 @@ phase 7 did, for a new reason:
 | pack write + delta reuse (and `index-pack`) | 500 | **327** |
 | refspecs and the fetch engine | — | **382** |
 | the phase's eight commands | — | **860** |
-| everything else (thirteen files touched) | — | 112 |
+| everything else (fourteen files touched) | — | 118 |
 
 Both algorithms came in **under**, and the 700 for the wire was wrong in an
 instructive way: it assumed that supporting protocol v0 *and* v2 costs twice.

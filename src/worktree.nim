@@ -144,7 +144,13 @@ proc removeWorkingPath*(repo: Repository, path: string) =
   ## those because a checkout that left `a/b/c/` behind as three empty
   ## directories would make the next `status` report a directory that is not
   ## in any tree.
+  ##
+  ## A gitlink is a *directory*, and an empty one goes the same way; one with
+  ## a submodule checked out into it stays, because the work inside it is not
+  ## this repository's to throw away.
   discard tryRemoveFile(repo.workTreePath(path))
+  if dirExists(repo.workTreePath(path)):
+    try: removeDir(repo.workTreePath(path)) except OSError: discard
   var dir = parentDir(path)
   while dir.len > 0:
     let full = repo.workTreePath(dir)
@@ -162,6 +168,14 @@ proc writeWorkingPath*(repo: Repository, path: string, v: Version) =
   ## does the wrong thing.
   let full = repo.workTreePath(path)
   createDir(parentDir(full))
+  # A gitlink is not a file.  git creates an empty directory to stand in for
+  # the submodule and records the commit in the index (`entry.c:write_entry`,
+  # `case S_IFGITLINK`); the commit itself lives in a repository this one does
+  # not have, so nothing is read here.  Without the directory, every `status`
+  # after a clone reports the submodule as deleted.
+  if modeType(v.mode) == otCommit:
+    createDir(full)
+    return
   discard tryRemoveFile(full)
   let data = repo.readObject(v.oid).data
   if v.mode == modeSymlink:
@@ -197,7 +211,6 @@ proc applyPlan*(repo: Repository, idx: Index, plan: Plan, newTree: TreeMap,
     discard idx.removePath(path)
   for path in plan.take:
     let v = newTree[path]
-    if modeType(v.mode) == otCommit: continue   # a gitlink is another repository
     if not toWorkTree:
       idx.addEntry IndexEntry(path: path, mode: v.mode, oid: v.oid)
       continue
@@ -338,7 +351,9 @@ proc resetWorkTree*(repo: Repository, idx: Index, tree: TreeMap) =
   for path in known:
     if path notin tree: repo.removeWorkingPath(path)
   for path, v in tree:
-    if modeType(v.mode) == otCommit: continue
+    if modeType(v.mode) == otCommit:
+      createDir(repo.workTreePath(path))
+      continue
     let k = idx.find(path)
     if k >= 0 and idx.entries[k].oid == v.oid and
        canonMode(idx.entries[k].mode) == v.mode:

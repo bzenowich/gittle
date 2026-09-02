@@ -69,7 +69,7 @@ pass on one you were given — makes `pack-objects` 54 lines and still
 `grep` and `log --grep` use libc's POSIX regex rather than a vendored engine —
 which is what git itself does, and what turned a 500-line budget line into 45.
 
-12,841 lines of code so far, against an original sketch of ~9,000 for the whole
+12,847 lines of code so far, against an original sketch of ~9,000 for the whole
 of v1. That sketch is now a measurement rather than a limit: the server was cut
 (it is the one phase with no client-side benefit), the rest is accepted at an
 estimated ~13,000, and an optimisation and refactoring pass comes once v1 is

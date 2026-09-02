@@ -74,7 +74,7 @@ None of these is optional; `plan.md` §7 has the detail.
 `plan.md` §5 is **a measurement, not a limit** — that was settled after phase 6,
 along with cutting the server. Do not cram to hit a figure, and do not let it
 drift unremarked either: record the line count at the end of every phase and
-explain the over-runs. §5.1–§5.3 have the running total (12,841 after phase 8,
+explain the over-runs. §5.1–§5.3 have the running total (12,847 after phase 8,
 ~13,000 projected for v1) and the reasons the command layer costs what it
 does — after phase 7 *state machines*, and after phase 8 *compatibility
 surface*: the rules a tool has to reproduce because someone else's output

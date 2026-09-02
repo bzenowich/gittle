@@ -182,8 +182,8 @@ exactly as in git, and worth knowing before relying on it.
 
 ## What the oracle found
 
-Eight bugs, and the shape of them is worth recording: **one was in an
-algorithm and seven were in agreeing with git.**
+Nine bugs, and the shape of them is worth recording: **one was in an
+algorithm and eight were in agreeing with git.**
 
 1. **The pack cache was never reloaded.** `Repository` opens the packs once
    and remembers them, which is right for a process that reads. `fetch` is
@@ -213,7 +213,13 @@ algorithm and seven were in agreeing with git.**
    followed tags; a fetch that writes no ref still prints
    `* branch main -> FETCH_HEAD`; and if anything was refused the summary
    column has no width at all.
-8. And one in the *test*: a packfile is created read-only, so the `dd` that
+8. **A checkout wrote no directory for a gitlink** — a phase 6 bug that only
+   became reachable now, because cloning a repository with a submodule in it
+   is what finds it. git creates an empty directory to stand in for the
+   submodule (`entry.c:write_entry`, `case S_IFGITLINK`); without it the very
+   first `status` after a clone reports the submodule as deleted. Cloning
+   the reference repository, which has one, is what showed it.
+9. And one in the *test*: a packfile is created read-only, so the `dd` that
    was supposed to corrupt one for the "this must be refused" check silently
    did nothing and the check passed for the wrong reason. It now compares the
    file with the original first. A test that passes because nothing happened
@@ -226,7 +232,7 @@ algorithm and seven were in agreeing with git.**
 | Check | Coverage |
 |---|---|
 | `ls-remote` | 12 forms, over protocol v2 **and** v0, including an empty repository |
-| `clone` | 13 clones — bare, `-n`, `-b <branch>`, `-o`, an empty source, a v0 server, a plain path — each compared *whole* against git's |
+| `clone` | 14 clones — bare, `-n`, `-b <branch>`, `-o`, an empty source, a v0 server, a plain path, a repository with a submodule — each compared *whole* against git's |
 | `fetch` | 19 fetches: new branches, new tags, a rewind, `--prune`, `--tags`, `--no-tags`, five refspec forms, a bare URL, a tag clobber refused and then forced, and a second fetch that has nothing to say |
 | `push` | 19 pushes: new branch, fast-forward, rewind refused and then forced, `--force-with-lease` holding and stale, two deletion spellings, `--tags`, `-u`, `-n`, a pattern refspec, and `Everything up-to-date` |
 | `pull` | 7 pulls, merged and rebased, including the divergence git refuses to resolve for you |
@@ -234,6 +240,24 @@ algorithm and seven were in agreeing with git.**
 | `index-pack` | every pack in the fixture **and the reference repository's own 318 MiB one**, byte-identical `.idx`; a truncated pack and a corrupted one refused |
 | `pack-objects` | the object set matches `rev-list --objects`, git verifies the pack, and 28,284 deltas are reused |
 | `git fsck --strict` | clean after a gittle clone, a gittle fetch, and on the **server** after a gittle push |
+
+### The end-to-end one
+
+`gittle clone file:///path/to/git.git` — the reference repository itself,
+**408,115 objects**, 305 MiB of pack, in 80 seconds. What it produces:
+
+* `git status` in it is **clean**, including the empty directory where the
+  `sha1collisiondetection` gitlink is (bug 8 above);
+* `git fsck --strict` says **exactly what it says about git's own clone of
+  the same repository** — 99 lines of warnings about a tag with no tagger and
+  trees with bad file modes, all of them objects from 2005 that gittle copied
+  across faithfully;
+* and of the four thousand files in the working tree, **three differ from
+  git's own clone** — `compat/vcbuild/*.bat`, which `.gitattributes` marks
+  `eol=crlf`. They are byte-identical once the carriage returns are removed.
+  That is plan.md decision 6 (Linux only, no gitattributes) showing up
+  exactly where it was said it would, and `git status` does not report them
+  because git normalises on the way in.
 
 ### How both ends are tested
 
@@ -288,6 +312,10 @@ The minimisation pass moved four things and un-exported four:
 * **`installPack` is now what `index-pack --stdin` uses too**, so the rule for
   where a received pack lands and what it is called is written once.
 
+And one thing was *added* to a module this phase does not own: `worktree.nim`
+now creates a directory for a gitlink instead of skipping it, which is bug 8
+above.
+
 ## Budget
 
 ```
@@ -296,12 +324,12 @@ wire protocol v2 over ssh                      700      402   pktline 84 + trans
 pack write + delta reuse                       500      327   packwrite 54 + indexpack 273
 refspecs and the fetch engine                  ---      382   refspec 47 + remotes 335
 the phase's 8 commands                         ---      860   clone, fetch, pull, push, remote, ls-remote, index-pack, pack-objects
-everything else (13 files touched)             ---      112   revwalk +46, packfile +41, the driver +19, rev-list -20, and nine one-liners
+everything else (14 files touched)             ---      118   revwalk +46, packfile +41, the driver +19, rev-list -20, worktree +6, and nine one-liners
                                                     -------
-phase 8                                                2,083
+phase 8                                                2,089
 ```
 
-Total: **12,841 lines of code** (20,473 including comments), against the
+Total: **12,847 lines of code** (20,488 including comments), against the
 ~13,000 [plan.md](plan.md) §5.2 projects for v1 with phase 10 still to build.
 The static binary is 3.3 MB.
 
@@ -335,6 +363,7 @@ left are `gc`, `worktree`, `clean`, `check-ignore`, `mv`, `rm` and `stage`
 | `--all`, `--multiple`, groups, `--atomic`, `--porcelain`, `--dry-run` for `fetch` | docs/05 cuts them |
 | `--mirror`, `--single-branch`, `--reference`, `--separate-git-dir`, `--template`, submodules for `clone` | docs/06 |
 | `--all`, `--mirror`, `--prune`, `--atomic`, `--porcelain`, `--follow-tags`, push options and signing for `push` | docs/08 |
+| CRLF, and `.gitattributes` generally — `eol=crlf`, `text=auto`, filters | **out of v1 by decision** (plan.md decision 6). Visible for the first time this phase: a clone of the git repository differs from git's in three `*.bat` files and nothing else. |
 | `--thin` on the *writing* side: gittle always sends a complete pack | docs/10. It costs a push of new work a little size and nothing else; `--fix-thin` on the reading side is implemented, because a fetch needs it. |
 | `remote rename`, `set-head`, `set-branches`, `show`, `prune`, `update` | docs/11 |
 | `unpack-objects`, and with it `fetch.unpackLimit` | docs/01 cuts it. git explodes a small fetched pack into loose objects; gittle always keeps the pack, which `gc` (phase 10) will fold in. |
