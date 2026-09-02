@@ -79,7 +79,7 @@ proc walkWorkTree*(repo: Repository, idx: Index, ig: Ignore, ps: Pathspec,
         stack.add rel & "/"
         continue
 
-      if idx.find(rel) >= 0: continue       # tracked; ignore rules do not apply
+      if idx.isTracked(rel): continue       # tracked; ignore rules do not apply
       let ignored = ig.isIgnored(rel, false)
       if ignored and wwIgnored notin want: continue
       if not ignored and wwUntracked notin want: continue
@@ -90,7 +90,7 @@ proc walkWorkTree*(repo: Repository, idx: Index, ig: Ignore, ps: Pathspec,
 proc pathIsIgnored*(repo: Repository, idx: Index, ig: Ignore, path: string): bool =
   ## For a path named outright rather than found by walking.  A tracked path is
   ## never ignored, whatever the rules say.
-  if idx.find(path) >= 0: return false
+  if idx.isTracked(path): return false
   ig.isIgnored(path, dirExists(repo.workTreePath(path)))
 
 # ---------------------------------------------------------------------------

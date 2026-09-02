@@ -35,7 +35,8 @@
 
 import std/[os, strutils]
 import ../cli, ../commitobj, ../diffcore, ../dir, ../hooks, ../ident, ../index,
-       ../pathspec, ../pretty, ../repository, ../status, ../trees, ../util
+       ../oid, ../pathspec, ../pretty, ../repository, ../sequencer, ../status,
+       ../trees, ../util
 
 const usageText = """usage: gittle commit [-a] [-m <msg>] [-F <file>] [--amend]
                      [--author=<author>] [--date=<date>] [-s] [-q]
@@ -156,21 +157,39 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
 
   let idx = readIndex(repo.indexPath)
   for e in idx.entries:
-    failIf(e.stage != 0,
-           "cannot commit because you have unmerged files\n" &
-           "  fix them up in the work tree, stage the result, and commit")
+    if e.stage != 0: repo.dieResolveConflict("commit", idx)
 
   let head = repo.refs.resolveRef(headRef)
+  # A merge that stopped on a conflict is concluded here, and this is the only
+  # thing that makes the result a merge commit: `MERGE_HEAD` names the other
+  # parent, and `MERGE_MSG` is the message `merge` had already prepared.
+  let op = repo.currentOp
+  let extraParents = if op == opMerge: repo.mergeHeads else: @[]
+  # A conflicted cherry-pick concluded here keeps the picked commit's author:
+  # the commit being made *is* that commit, replayed
+  # (`builtin/commit.c` reuses `CHERRY_PICK_HEAD` as its author-message).
+  var pickedAuthor: Ident
+  var havePicked = false
+  if op == opCherryPick:
+    pickedAuthor = parseCommit(
+      repo.readObject(repo.stateOid("CHERRY_PICK_HEAD")).data).author
+    havePicked = true
+
   var parents: seq[Oid]
   var oldCommit: Commit
   var haveOld = false
   if amend:
+    # Amending would replace the commit HEAD names, and the operation in
+    # progress is *about* to make a new one on top of it -- so there is no
+    # sensible thing for the two to mean together.
+    failIf(op != opNone,
+           "You are in the middle of a " & op.opName & " -- cannot amend.")
     failIf(not head.found, "you have nothing to amend")
     oldCommit = parseCommit(repo.readObject(head.oid).data)
     haveOld = true
     parents = oldCommit.parents
   elif head.found:
-    parents = @[head.oid]
+    parents = @[head.oid] & extraParents
 
   # `-a` is the index pass of `add` over the whole tree: every tracked path is
   # restaged, and one whose file has gone is removed.  Untracked files are not
@@ -213,7 +232,10 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
   # Nothing to commit: the tree we would record is the one the parent already
   # has.  `--amend` is exempt, because amending the message alone is the
   # commonest use of it.
-  if not allowEmpty and not amend:
+  # A merge whose result happens to equal the first parent's tree is still a
+  # merge worth recording -- the second parent is the point of it -- so the
+  # empty check is skipped there as it is for `--amend`.
+  if not allowEmpty and not amend and extraParents.len == 0:
     let parentTree = if parents.len == 1:
                        parseCommit(repo.readObject(parents[0]).data).tree
                      else: nullOid
@@ -248,6 +270,7 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
   # 2. the message.
   var msg = joinMessages(messages)
   let useEditor = (messages.len == 0 and not noEdit) or forceEdit
+  if msg.len == 0 and op != opNone: msg = repo.readState("MERGE_MSG")
   if msg.len == 0 and haveOld: msg = oldCommit.message
   if signoff:
     msg = appendSignoff(cleanupMessage(msg, dropComments = false),
@@ -268,17 +291,26 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
 
   # 5. the commit, then the ref.
   let author = identFor(repo.cfg, irAuthor, authorOpt, dateOpt,
-                        (if haveOld: oldCommit.author else: Ident()), haveOld)
+                        (if haveOld: oldCommit.author else: pickedAuthor),
+                        haveOld or havePicked)
   let committer = getIdent(repo.cfg, irCommitter)
   let newOid = repo.writeObject(otCommit,
                                 buildCommit(treeOid, parents, author, committer, msg))
 
+  # git names the operation in the reflog only for the two it recognises as
+  # "in progress" -- a revert concluded by hand records a plain `commit:`.
   let what = if amend: "commit (amend): "
              elif parents.len == 0: "commit (initial): "
+             elif extraParents.len > 0: "commit (merge): "
+             elif havePicked: "commit (cherry-pick): "
              else: "commit: "
   repo.refs.updateRef(headRef, newOid,
                       oldOid = (if head.found: head.oid else: nullOid),
                       checkOld = true, msg = what & subject(msg))
+  # The operation is over the moment its commit exists; leaving the markers
+  # would make the *next* `commit` record two parents again.
+  repo.removeState("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE",
+                   "CHERRY_PICK_HEAD", "REVERT_HEAD")
 
   # A partial commit stages what it committed.  git does this *after* the
   # commit succeeds, and so does gittle: an index updated for a commit that
@@ -298,17 +330,24 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
                subject(msg)
     if author.name != committer.name or author.email != committer.email:
       line.add "\n Author: " & author.name & " <" & author.email & ">"
-    if amend:
+    # The date is worth printing exactly when it is not this moment: an
+    # amended commit keeps its original one, and a cherry-pick concluded here
+    # keeps the picked commit's (`builtin/commit.c:author_date_is_interesting`).
+    if amend or havePicked:
       line.add "\n Date: " &
                formatDate(author.when0, author.tzOffset, DateMode(kind: dkDefault),
                           author.when0)
     echo line
     # The counts and the creations, deletions and mode changes: what changed
-    # structurally, which the subject line does not say.
-    let parentTree = if parents.len >= 1:
-                       parseCommit(repo.readObject(parents[0]).data).tree
-                     else: nullOid
-    stdout.write commitSummary(repo,
-      pairsTreeTree(repo, parentTree, treeOid, parsePathspec(@[], "")))
-    stdout.flushFile()
+    # structurally, which the subject line does not say.  A merge commit gets
+    # none of it: the summary is a diff against the first parent, and git's
+    # default for a merge is to show no diff at all (`log_tree_commit` with
+    # `diff-merges` off), so there is nothing to count.
+    if parents.len < 2:
+      let parentTree = if parents.len == 1:
+                         parseCommit(repo.readObject(parents[0]).data).tree
+                       else: nullOid
+      stdout.write commitSummary(repo,
+        pairsTreeTree(repo, parentTree, treeOid, parsePathspec(@[], "")))
+      stdout.flushFile()
   0

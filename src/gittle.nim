@@ -11,15 +11,18 @@
 ## stays because it is twelve lines, already tested, and the `git` symlink is
 ## what lets a system have both without gittle shadowing a real one.
 
-import std/[os, strutils]
+import std/[os, posix, strutils]
 import cli, config, util
 import cmd/hashobject, cmd/catfile
 import cmd/updateref, cmd/symbolicref, cmd/foreachref
-import cmd/revparse, cmd/revlist, cmd/mergebase
+import cmd/revparse, cmd/revlist, cmd/mergebase, cmd/mergefile
 import cmd/lstree, cmd/writetree, cmd/readtree, cmd/updateindex, cmd/lsfiles
 import cmd/config as cmdconfig
 import cmd/init, cmd/committree, cmd/add, cmd/log, cmd/commit, cmd/show
 import cmd/branch, cmd/tag, cmd/checkout, cmd/reset, cmd/reflog
+import cmd/merge as cmdmerge
+import cmd/cherrypick, cmd/rebase
+import cmd/stash as cmdstash
 import cmd/diff as cmddiff
 import cmd/status as cmdstatus
 import cmd/grep as cmdgrep
@@ -43,6 +46,7 @@ Commands:
    branch                list, create, rename and delete branches
    cat-file              inspect objects
    checkout              switch branches, or restore files
+   cherry-pick           replay existing commits onto this branch
    commit                record the staged content as a new commit
    commit-tree           create a commit object
    config                read and write configuration
@@ -54,14 +58,19 @@ Commands:
    log                   show commit history
    ls-files              list index and working-tree files
    ls-tree               list a tree object's entries
+   merge                 join another history into this one
    merge-base            find the common ancestor of two commits
+   merge-file            three-way merge of three files
+   rebase                replay commits onto a different base
    read-tree             load a tree into the index
    reflog                show where a ref has been
    reset                 move HEAD, the index and the working tree
    restore               restore working-tree and index files
    rev-list              walk history and list the objects it reaches
    rev-parse             resolve revisions and report repository layout
+   revert                undo commits with new commits
    show                  display objects
+   stash                 set aside uncommitted work
    status                report working tree state
    switch                change branches
    symbolic-ref          read and write symbolic refs
@@ -86,12 +95,18 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   of "tag": cmdTag(c, args)
   of "log": cmdLog(c, args)
   of "commit": cmdCommit(c, args)
+  of "cherry-pick": cmdCherryPick(c, args)
+  of "revert": cmdRevert(c, args)
+  of "rebase": cmdRebase(c, args)
   of "show": cmdShow(c, args)
   of "diff": cmddiff.cmdDiff(c, args)
+  of "stash": cmdstash.cmdStash(c, args)
   of "status": cmdstatus.cmdStatus(c, args)
   of "grep": cmdgrep.cmdGrep(c, args)
   of "commit-tree": cmdCommitTree(c, args)
+  of "merge": cmdmerge.cmdMerge(c, args)
   of "merge-base": cmdMergeBase(c, args)
+  of "merge-file": cmdMergeFile(c, args)
   of "rev-list": cmdRevList(c, args)
   of "rev-parse": cmdRevParse(c, args)
   of "update-ref": cmdUpdateRef(c, args)
@@ -175,6 +190,11 @@ when isMainModule:
   except GittleError as e:
     stderr.write "gittle: " & e.msg & "\n"
     exitWith(128)   # git's status for a fatal error
-  except IOError:
-    # A closed pipe (`gittle cat-file -p ... | head`) is not an error.
-    exitWith(0)
+  except IOError as e:
+    # A closed pipe (`gittle cat-file -p ... | head`) is not an error, and it
+    # is the only write failure that is not: everything else -- a full disk,
+    # a directory where a file should be -- has to be reported, or a command
+    # that wrote half its output would exit 0.
+    if errno == EPIPE: exitWith(0)
+    stderr.write "gittle: " & e.msg & "\n"
+    exitWith(128)

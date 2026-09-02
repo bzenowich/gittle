@@ -30,7 +30,8 @@
 ## `add` that then failed would be worse than either outcome.
 
 import std/[algorithm, os, posix, strutils]
-import ../cli, ../dir, ../ignore, ../index, ../pathspec, ../repository, ../util
+import ../cli, ../dir, ../ignore, ../index, ../oid, ../pathspec, ../repository,
+       ../util
 
 const usageText = """usage: gittle add [-n] [-v] [-f] [-u] [-A] [--] <pathspec>…"""
 
@@ -102,7 +103,10 @@ proc cmdAdd*(c: Ctx, argv: seq[string]): int =
   # the entry list underneath us.
   var tracked: seq[string]
   for e in idx.entries:
-    if e.stage == 0 and ps.matches(e.path): tracked.add e.path
+    # Every stage of a conflicted path names the same file, and staging it
+    # once replaces all three -- which is what resolving a conflict *is*.
+    if ps.matches(e.path) and (tracked.len == 0 or tracked[^1] != e.path):
+      tracked.add e.path
   for path in tracked:
     touched.add path
     let (ok, st) = statPath(repo.workTreePath(path))
@@ -111,11 +115,13 @@ proc cmdAdd*(c: Ctx, argv: seq[string]): int =
       if not dryRun: discard idx.removePath(path)
     else:
       let before = idx.find(path)
-      let oidBefore = idx.entries[before].oid
+      # An unmerged path has no stage 0, so there is no "before" object ID:
+      # staging it is always a change, which is exactly right.
+      let oidBefore = if before >= 0: idx.entries[before].oid else: nullOid
       if dryRun:
         # Report only a real change: a dry run that lists every tracked file
         # tells the user nothing.
-        if not idx.entries[before].statMatches(st): staged.add path
+        if before < 0 or not idx.entries[before].statMatches(st): staged.add path
       else:
         discard stageWorkingPath(repo, idx, path)
         if idx.entries[idx.find(path)].oid != oidBefore: staged.add path

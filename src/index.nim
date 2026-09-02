@@ -352,6 +352,16 @@ proc find*(idx: Index, path: string, stage = 0): int =
     else: hi = mid
   -1
 
+proc isTracked*(idx: Index, path: string): bool =
+  ## Is the path in the index at *any* stage?
+  ##
+  ## A conflicted path has no stage-0 entry at all, so `find` alone would call
+  ## it untracked -- and `status` would list every file in a conflicted merge
+  ## under "Untracked files".
+  for s in 0 .. 3:
+    if idx.find(path, s) >= 0: return true
+  false
+
 proc removePath*(idx: Index, path: string): bool =
   ## Remove every stage of `path`.  Returns whether anything was there.
   var kept: seq[IndexEntry]
@@ -359,6 +369,23 @@ proc removePath*(idx: Index, path: string): bool =
     if e.path != path: kept.add e
     else: result = true
   if result: idx.entries = kept
+
+func setStage*(e: var IndexEntry, stage: int) =
+  ## Move an entry to a merge stage.  The stage lives in the flags word beside
+  ## the name length, which `serializeIndex` recomputes, so only these two bits
+  ## have to be preserved by hand.
+  e.flags = (e.flags and not flagStageMask) or (uint16(stage) shl 12)
+
+proc addUnmerged*(idx: Index, entries: openArray[IndexEntry]) =
+  ## Insert the stages of one conflicted path together.
+  ##
+  ## `addEntry` cannot do this one stage at a time: adding an entry replaces
+  ## every stage of its path, which is exactly what makes staging a resolution
+  ## a single call, and here it would delete the stage just written.
+  if entries.len == 0: return
+  discard idx.removePath(entries[0].path)
+  for e in entries: idx.entries.add e
+  sort(idx.entries, cmpEntries)
 
 proc addEntry*(idx: Index, e: IndexEntry) =
   ## Insert or replace, keeping the list sorted.  Adding a merged entry

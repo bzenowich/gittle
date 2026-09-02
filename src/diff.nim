@@ -117,6 +117,10 @@ func nrec(s: Side): int = s.lo.len
 
 func line(s: Side, i: int): string = s.text[s.lo[i] ..< s.hi[i]]
 
+func terminated(s: Side, i: int): bool = s.hi[i] < s.text.len
+  ## Did this line end in a newline, or in the end of the file?  Only the last
+  ## line of a file can answer no, and only ever one of them.
+
 func chg(s: Side, i: int): bool =
   ## `changed` with git's two sentinels: the C code allocates the array with a
   ## slot at -1 and at N so the sliding loops need no bounds test, and every
@@ -146,7 +150,13 @@ proc classify(a, b: var Side, ws: WsMode) =
   proc classifyOne(s: var Side) =
     s.cls.setLen(s.nrec)
     for i in 0 ..< s.nrec:
-      let key = normalize(s.line(i), ws)
+      # The terminator is part of the record git hashes, so a file that gained
+      # or lost its final newline differs from one that did not -- which is
+      # the whole content of `\ No newline at end of file`.  Under any of the
+      # whitespace modes it is whitespace like any other and is ignored, so
+      # only the exact comparison carries it (`xutils.c:xdl_recmatch`).
+      let key = normalize(s.line(i), ws) &
+                (if ws == wsExact and s.terminated(i): "\n" else: "")
       let found = ids.getOrDefault(key, -1)
       if found >= 0:
         s.cls[i] = found
@@ -779,3 +789,41 @@ proc diffCounts*(oldText, newText: string, ws = wsExact):
   for ch in changes:
     result.added += ch.c2
     result.deleted += ch.c1
+
+# ---------------------------------------------------------------------------
+# 6. The ungrouped script, for the three-way merge
+# ---------------------------------------------------------------------------
+
+type
+  Edit* = object
+    ## One run of changed lines, exactly as `xdl_build_script` produces it:
+    ## `c1` lines of the old file at `i1` become `c2` lines of the new file at
+    ## `i2`.  `diffText` groups these into hunks and adds context; the merge
+    ## (mergefile.nim) wants them ungrouped, because two scripts against the
+    ## same base are what it interleaves.
+    i1*, i2*, c1*, c2*: int
+
+  Records* = object
+    ## Two files as line *records*, plus the script between them.
+    ##
+    ## A record keeps its terminator, where the `text` of a `DiffLine` does
+    ## not.  The merge builds its output by concatenating records
+    ## (`xmerge.c:xdl_recs_copy`), so what it copies has to be the original
+    ## bytes -- including whether the last line had a newline at all.
+    a*, b*: seq[string]
+    edits*: seq[Edit]
+
+func records(s: Side): seq[string] =
+  for i in 0 ..< s.nrec:
+    # `hi[i]` is the newline, or the end of the text for a final line without
+    # one, so one past it is the record and the bound is what distinguishes
+    # the two cases.
+    result.add s.text[s.lo[i] ..< min(s.hi[i] + 1, s.text.len)]
+
+proc diffRecords*(oldText, newText: string): Records =
+  ## The whole engine again, stopping one stage earlier than `diffText`.
+  let (a, b, changes, _, _) = runDiff(oldText, newText, wsExact, 3)
+  result.a = a.records
+  result.b = b.records
+  for ch in changes:
+    result.edits.add Edit(i1: ch.i1, i2: ch.i2, c1: ch.c1, c2: ch.c2)

@@ -74,6 +74,7 @@ type
     oldOid*, newOid*: Oid
     oldValid*, newValid*: bool ## is the recorded OID the real content hash?
     oldFromWork*, newFromWork*: bool  ## read that side from a file, not an object
+    unmerged*: bool            ## the index holds stages here, not one entry
 
 func oldName(p: DiffPair): string =
   if p.oldPath.len > 0: p.oldPath else: p.path
@@ -82,6 +83,7 @@ func defaultDiffOpts*(): DiffOpts =
   DiffOpts(ctxLen: 3, ws: wsExact, abbrev: 0)
 
 func status*(p: DiffPair): char =
+  ## (An unmerged path is `U` whatever its two sides look like.)
   ## The letter `--raw` and `--name-status` print.  `T` is a type change --
   ## a regular file replaced by a symlink or a gitlink -- and it matters
   ## because a patch renders it as a deletion *and* a creation rather than as
@@ -89,7 +91,8 @@ func status*(p: DiffPair): char =
   ## The test is on `S_IFMT`, not on the object type: a symlink and a regular
   ## file are both stored as blobs, and replacing one with the other is
   ## exactly the case `T` exists for.
-  if p.oldMode == 0: 'A'
+  if p.unmerged: 'U'
+  elif p.oldMode == 0: 'A'
   elif p.newMode == 0: 'D'
   elif (p.oldMode and 0o170000'u32) != (p.newMode and 0o170000'u32): 'T'
   else: 'M'
@@ -217,6 +220,7 @@ type
     oid: Oid
     valid: bool     ## the OID really is this content's hash
     fromWork: bool
+    unmerged: bool  ## a placeholder for a path the index holds in stages
 
 proc listTree(repo: Repository, tree: Oid, ps: Pathspec): seq[FileEntry] =
   ## Every blob in a tree, full paths, in index order.  A null object ID is
@@ -235,11 +239,22 @@ proc listTree(repo: Repository, tree: Oid, ps: Pathspec): seq[FileEntry] =
     result.add FileEntry(path: e.name, mode: canonMode(e.mode), oid: e.oid, valid: true)
   result.sort(proc (x, y: FileEntry): int = cmp(x.path, y.path))
 
-proc listIndex(idx: Index, ps: Pathspec): seq[FileEntry] =
+proc listIndex(idx: Index, ps: Pathspec, withUnmerged = false): seq[FileEntry] =
+  ## `withUnmerged` adds a zero-mode placeholder for every conflicted path, so
+  ## that a tree-to-index diff reports it as `U` rather than as a deletion --
+  ## which is what it would look like, the stages having no stage 0 between
+  ## them.  The index-to-working-tree diff does not ask for it: git shows a
+  ## *combined* diff there, and combined diffs are cut (docs/03).
+  var lastUnmerged = ""
   for e in idx.entries:
-    if e.stage != 0: continue
     if not ps.matches(e.path): continue
+    if e.stage != 0:
+      if withUnmerged and e.path != lastUnmerged:
+        lastUnmerged = e.path
+        result.add FileEntry(path: e.path, unmerged: true)
+      continue
     result.add FileEntry(path: e.path, mode: canonMode(e.mode), oid: e.oid, valid: true)
+  result.sort(proc (x, y: FileEntry): int = cmp(x.path, y.path))
 
 proc listWorkTree(repo: Repository, idx: Index, ps: Pathspec): seq[FileEntry] =
   ## The working tree, seen through the index: `diff` reports changes to
@@ -283,13 +298,14 @@ proc join(old, new: seq[FileEntry]): seq[DiffPair] =
       inc i
     elif c > 0:
       p = DiffPair(path: new[k].path, newMode: new[k].mode, newOid: new[k].oid,
-                   newValid: new[k].valid, newFromWork: new[k].fromWork)
+                   newValid: new[k].valid, newFromWork: new[k].fromWork,
+                   unmerged: new[k].unmerged)
       inc k
     else:
       p = DiffPair(path: old[i].path,
                    oldMode: old[i].mode, oldOid: old[i].oid, oldValid: old[i].valid,
                    newMode: new[k].mode, newOid: new[k].oid, newValid: new[k].valid,
-                   newFromWork: new[k].fromWork)
+                   newFromWork: new[k].fromWork, unmerged: new[k].unmerged)
       inc i
       inc k
     result.add p
@@ -299,7 +315,7 @@ proc pairsTreeTree*(repo: Repository, a, b: Oid, ps: Pathspec): seq[DiffPair] =
 
 proc pairsTreeIndex*(repo: Repository, tree: Oid, idx: Index,
                      ps: Pathspec): seq[DiffPair] =
-  join(listTree(repo, tree, ps), listIndex(idx, ps))
+  join(listTree(repo, tree, ps), listIndex(idx, ps, withUnmerged = true))
 
 proc pairsIndexWork*(repo: Repository, idx: Index, ps: Pathspec): seq[DiffPair] =
   join(listIndex(idx, ps), listWorkTree(repo, idx, ps))
@@ -432,6 +448,11 @@ proc abbrevOf(repo: Repository, o: DiffOpts, id: Oid, valid: bool): string =
 proc writePatch(repo: Repository, p0: DiffPair, o: DiffOpts, out0: var string) =
   ## One file's patch.  The header is a small grammar and it is written here
   ## in the order git writes it (`diff.c:builtin_diff` and `fill_metainfo`).
+  if p0.unmerged:
+    # There is no single "after" to show: a combined diff is what git prints
+    # here for a path both sides changed, and it is cut (docs/03).
+    out0.add "* Unmerged path " & quotePath(p0.path) & "\n"
+    return
   var p = p0
   repo.fillOid(p)
   # `-R` swaps the *prefixes* as well as the contents, so a reversed patch
@@ -592,6 +613,7 @@ proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
     name: string
     added, deleted: int
     binary: bool
+    unmerged: bool
   var rows: seq[Row]
   var maxChange = 0
   var maxLen = 0
@@ -600,6 +622,11 @@ proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
 
   for p in pairs:
     var r = Row(name: quotePath(p.path))
+    if p.unmerged:
+      r.unmerged = true
+      maxLen = max(maxLen, displayWidth(r.name))
+      rows.add r
+      continue
     let a = repo.oldText(p)
     let b = repo.newText(p)
     if not o.text and (isBinary(a) or isBinary(b)):
@@ -648,6 +675,10 @@ proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
       let slash = name.find('/')
       if slash >= 0: name = name[slash .. ^1]
     let padding = max(nameWidth - 3 * ord(prefix.len > 0) - displayWidth(name), 0)
+
+    if r.unmerged:
+      out0.add " " & prefix & name & repeat(' ', padding) & " | Unmerged\n"
+      continue
 
     if r.binary:
       out0.add " " & prefix & name & repeat(' ', padding) & " | " &
@@ -701,6 +732,9 @@ proc writeRaw(repo: Repository, p: DiffPair, o: DiffOpts, out0: var string) =
   out0.add pathField(o, p.path)
 
 proc writeNumstat(repo: Repository, p: DiffPair, o: DiffOpts, out0: var string) =
+  if p.unmerged:
+    out0.add "0\t0\t" & pathField(o, p.path)
+    return
   let a = repo.oldText(p)
   let b = repo.newText(p)
   if not o.text and (isBinary(a) or isBinary(b)):
@@ -721,6 +755,7 @@ proc shortstat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts): string =
   var del = 0
   var files = 0
   for p in pairs:
+    if p.unmerged: continue   # counted in neither the files nor the lines
     inc files
     let a = repo.oldText(p)
     let b = repo.newText(p)
@@ -780,20 +815,13 @@ proc renderDiff*(repo: Repository, pairs0: seq[DiffPair], o: DiffOpts):
     for p in splitTypeChange(pairs): repo.writePatch(p, o, out0)
   result.text = out0
 
-proc commitSummary*(repo: Repository, pairs0: seq[DiffPair]): string =
-  ## What `commit` prints under its `[master abc1234] subject` line.
-  ##
-  ## Not the histogram: git asks for `DIFF_FORMAT_SHORTSTAT |
-  ## DIFF_FORMAT_SUMMARY` (`builtin/commit.c:print_summary`), which is the
-  ## one-line count followed by a line per structural change.  `--summary` is
-  ## cut as an *option* (docs/03) but these are the lines it would print, and
-  ## they are the ones that tell you a file was created rather than edited.
-  var o = defaultDiffOpts()
-  var pairs: seq[DiffPair]
+proc summaryLines*(repo: Repository, pairs0: seq[DiffPair]): string =
+  ## `--summary`: one line per *structural* change -- a file created, deleted,
+  ## or whose mode changed.  Cut as an option (docs/03), but `commit` and
+  ## `merge` both print these lines under their statistics, and they are what
+  ## tells you a file was created rather than edited.
   for p in pairs0:
-    if repo.changed(p): pairs.add p
-  result = repo.shortstat(pairs, o)
-  for p in pairs:
+    if not repo.changed(p): continue
     if p.oldMode == 0:
       result.add " create mode " & formatMode(p.newMode) & " " &
                  quotePath(p.path) & "\n"
@@ -803,3 +831,19 @@ proc commitSummary*(repo: Repository, pairs0: seq[DiffPair]): string =
     elif p.oldMode != p.newMode:
       result.add " mode change " & formatMode(p.oldMode) & " => " &
                  formatMode(p.newMode) & " " & quotePath(p.path) & "\n"
+
+proc commitSummary*(repo: Repository, pairs0: seq[DiffPair]): string =
+  ## What `commit` prints under its `[master abc1234] subject` line: the
+  ## one-line count and then the summary above it
+  ## (`builtin/commit.c:print_summary` asks for `SHORTSTAT | SUMMARY`).
+  var pairs: seq[DiffPair]
+  for p in pairs0:
+    if repo.changed(p): pairs.add p
+  repo.shortstat(pairs, defaultDiffOpts()) & repo.summaryLines(pairs)
+
+proc mergeSummary*(repo: Repository, pairs0: seq[DiffPair]): string =
+  ## What `merge` prints instead: the histogram rather than the one-liner
+  ## (`builtin/merge.c:finish` asks for `DIFFSTAT | SUMMARY`).
+  var o = defaultDiffOpts()
+  o.formats = {dfStat}
+  repo.renderDiff(pairs0, o).text & repo.summaryLines(pairs0)

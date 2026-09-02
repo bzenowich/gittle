@@ -26,7 +26,7 @@
 
 import std/[os, strutils]
 import ../cli, ../config, ../reffilter, ../refname, ../refs,
-       ../repository, ../revision, ../revwalk, ../util
+       ../repository, ../revision, ../revwalk, ../sequencer, ../util
 import foreachref
 
 const usageText = """usage: gittle branch [<options>] [<pattern>…]
@@ -136,7 +136,19 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
   var detached = ""
   if 0 in kinds and repo.headRefName == headRef and f.patterns.len == 0:
     let h = repo.refs.resolveRef(headRef)
-    if h.found: detached = "(" & repo.headDescription & ")"
+    if h.found:
+      # Mid-rebase, HEAD really is detached, but saying so is useless: what
+      # the user wants to know is which branch is being moved
+      # (`builtin/branch.c:get_head_description`).
+      const heads = refsPrefix & "heads/"
+      let moving = repo.readState(rebaseDir / "head-name").strip()
+      detached =
+        if repo.currentOp != opRebase: "(" & repo.headDescription & ")"
+        elif moving.startsWith(heads):
+          "(no branch, rebasing " & moving[heads.len .. ^1] & ")"
+        else:
+          "(no branch, rebasing detached HEAD " &
+          repo.uniqueAbbrev(h.oid, repo.autoAbbrev) & ")"
 
   var width = detached.len
   for r in rows: width = max(width, shownName(r).len)

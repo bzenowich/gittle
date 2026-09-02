@@ -408,6 +408,40 @@ squeezing would come out of behavior the daily loop needs. The number is
 recorded here so that the *next* revision has evidence to argue with, and so
 the refactoring pass has a baseline.
 
+### 5.2 After phase 7
+
+**10,756 lines**, seven of nine phases done.  Phase 7 cost 1,795 —
+[phase-7.md](phase-7.md) has the breakdown — and it split unusually:
+
+| | budgeted | actual |
+|---|---:|---:|
+| merge: file 3-way + structural tree merge | 600 | **486** |
+| the phase's seven commands | — | **989** |
+| unmerged paths and in-progress reporting in `status` | — | 155 |
+| everything else (ten files touched) | — | 165 |
+
+The **algorithm came in under**, because a three-way merge is two diffs and
+the diff engine already existed, and because rename detection — most of
+`merge-ort.c` — is a v2 cut.
+
+The **command layer over-ran, for a reason §5 does not model.**  It counts
+option combinations; `stash` (257 lines) and `rebase` (253) are the two
+largest command files in the project and neither has a large option surface.
+What they have is a *state machine*: a directory of files to write, read back
+and remove correctly under four verbs.  Phase 8's `clone`, `fetch` and `push`
+have the same shape, so:
+
+```
+wire protocol v2 over ssh: ls-refs, fetch, push               700
+pack write + delta reuse                                      500
+argument parsing, the remaining 16 commands                 1,000
+gc, worktree, clean, check-ignore                             300
+                                                          -------
+                                                            2,500
+```
+
+which puts v1 near **13,000**.  Recorded, not cut against (§5's own rule).
+
 ---
 
 ## 6. Decisions
@@ -691,6 +725,7 @@ create state with one tool, verify with the other, in both directions.
    *Done: [phase-6.md](phase-6.md).*
 7. **Merge.** `merge-file`, then the structural tree merge, then `merge`,
    `cherry-pick`, `revert`, `rebase`, `stash`.
+   *Done: [phase-7.md](phase-7.md).*
 8. **Transport.** pkt-line, protocol v2 `ls-refs` and `fetch`, `index-pack`,
    then `clone`/`fetch`/`pull`; then `pack-objects` and `push`.
 9. ~~**Serving.**~~ **Cut (2026-09-01)**, with decision 2. It was `argv[0]`

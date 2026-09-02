@@ -84,6 +84,17 @@ proc workingMatches(repo: Repository, idx: Index, path: string): bool =
   if modeForFile(st) != canonMode(idx.entries[k].mode): return false
   hashObject(otBlob, readWorkingFile(full, st)) == idx.entries[k].oid
 
+proc upToDate*(repo: Repository, idx: Index, path: string, v: Version): bool =
+  ## Is this path already exactly `v`, in both the index and the working tree?
+  ##
+  ## Asked before every write, because rewriting a file with the bytes it
+  ## already has is not free: it resets the mtime, which makes the stat cache
+  ## miss on the next `status`, and it changes how many paths a command
+  ## reports having updated.
+  let k = idx.find(path)
+  k >= 0 and idx.entries[k].oid == v.oid and
+    canonMode(idx.entries[k].mode) == v.mode and repo.workingMatches(idx, path)
+
 proc planTwoWay*(repo: Repository, idx: Index, oldTree, newTree: TreeMap,
                  force: bool): Plan =
   ## Decide, and only decide.  Nothing on disk changes here.
@@ -174,16 +185,36 @@ proc applyToIndex*(repo: Repository, idx: Index, path: string, v: Version) =
   e.mode = v.mode
   idx.addEntry(e)
 
-proc applyPlan*(repo: Repository, idx: Index, plan: Plan, newTree: TreeMap) =
+proc applyPlan*(repo: Repository, idx: Index, plan: Plan, newTree: TreeMap,
+                toWorkTree = true) =
   ## Do what was decided, and record it in the index.
+  ##
+  ## `read-tree -m` without `-u` is the one caller that wants the index moved
+  ## and the files left alone -- it is the plumbing half of a checkout -- and
+  ## the entry it writes has no stat data, because no file matches it.
   for path in plan.remove:
-    repo.removeWorkingPath(path)
+    if toWorkTree: repo.removeWorkingPath(path)
     discard idx.removePath(path)
   for path in plan.take:
     let v = newTree[path]
     if modeType(v.mode) == otCommit: continue   # a gitlink is another repository
+    if not toWorkTree:
+      idx.addEntry IndexEntry(path: path, mode: v.mode, oid: v.oid)
+      continue
     repo.writeWorkingPath(path, v)
     repo.applyToIndex(idx, path, v)
+
+proc refusedPlumbing*(plan: Plan): bool =
+  ## The same three refusals in `unpack-trees`' *plumbing* words, which are not
+  ## the porcelain ones: `read-tree` is a script's tool and names the one entry
+  ## that stopped it, where `checkout` groups them under an explanation and
+  ## some advice.
+  for (paths, text) in [(plan.staged, "Entry '$1' would be overwritten by merge. Cannot merge."),
+                        (plan.modified, "Entry '$1' not uptodate. Cannot merge."),
+                        (plan.untracked, "Untracked working tree file '$1' would be overwritten by merge.")]:
+    for p in paths:
+      result = true
+      stderr.write "error: " & text.replace("$1", p) & "\n"
 
 proc refused*(plan: Plan, verb: string): bool =
   ## The refusals, in git's words (`unpack-trees.c` carries one message per
@@ -215,22 +246,36 @@ proc refused*(plan: Plan, verb: string): bool =
                  "\n" & advice & " you " & doing & ".\nAborting\n"
 
 proc checkoutPaths*(repo: Repository, idx: Index, source: TreeMap,
-                    ps: Pathspec, toWorktree, toIndex: bool): int =
+                    ps: Pathspec, toWorktree, toIndex: bool,
+                    skipUnchanged = false):
+    tuple[matched, written: int] =
   ## `restore`, and `checkout -- <paths>`: replace some paths from a source,
   ## and leave everything else -- including HEAD -- alone.
   ##
   ## No two-way rule applies here.  The user named the paths, so overwriting
   ## them is the request, not a risk to be checked for.
+  ##
+  ## Two counts come back, and they are different questions: `matched` says
+  ## whether the pathspec found anything at all -- a pathspec that matched
+  ## nothing is an error -- and `written` is what the "Updated N paths"
+  ## message reports.
+  ##
+  ## `skipUnchanged` is for the case where the *index* is the source: git's
+  ## `checkout_entry` returns without writing when the file already matches
+  ## its index entry, and the count it reports -- "Updated 2 paths from the
+  ## index" -- is of files actually written, not of files matched.
   for path, v in source:
     if not ps.matches(path): continue
     if modeType(v.mode) == otCommit: continue
+    inc result.matched
+    if skipUnchanged and repo.upToDate(idx, path, v): continue
     if toIndex: repo.applyToIndex(idx, path, v)
     if toWorktree:
       repo.writeWorkingPath(path, v)
       # Writing the file changes its stat data, so the index entry describing
       # it has to be refreshed even when only the working tree was asked for.
       if idx.find(path) >= 0: repo.applyToIndex(idx, path, versionOf(idx, path))
-    inc result
+    inc result.written
 
 proc refreshIndex*(repo: Repository, idx: Index): seq[string] =
   ## Fill in the stat data for every entry whose working file still matches
@@ -286,7 +331,10 @@ proc resetWorkTree*(repo: Repository, idx: Index, tree: TreeMap) =
   ## anything that was tracked and is not in the tree goes.
   var known: seq[string]
   for e in idx.entries:
-    if e.stage == 0: known.add e.path
+    # Every stage, not only stage 0: a path a conflict added exists in the
+    # index at stages 1 and 3 with no stage 0 at all, and skipping it would
+    # leave the file behind as a mysterious untracked one.
+    if known.len == 0 or known[^1] != e.path: known.add e.path
   for path in known:
     if path notin tree: repo.removeWorkingPath(path)
   for path, v in tree:

@@ -166,16 +166,29 @@ proc doSwitch(c: Ctx, target: string, newBranch: string, forceBranch: bool,
   0
 
 proc doRestore(c: Ctx, source: string, sourceGiven: bool, specs: seq[string],
-               toWorktree, toIndex: bool): int =
+               toWorktree, toIndex: bool, stage = 0, overlay = true,
+               report = false): int =
   ## Replace paths, and touch nothing else.
+  ##
+  ## `stage` is `--ours` (2) or `--theirs` (3): for a conflicted path the
+  ## source becomes that stage rather than the index's own version, which is
+  ## how a user takes one side of a conflict wholesale.  Merged paths are
+  ## unaffected, so `checkout --ours .` in the middle of a merge also discards
+  ## edits to files nobody conflicted over.
+  ##
+  ## A path that has no such stage -- `--theirs` on a file they deleted --
+  ## is an error under `checkout`, which is *overlay* mode, and a deletion
+  ## under `restore`, which is not (`builtin/checkout.c:checkout_stage`).
   let repo = c.repo
   let idx = readIndex(repo.indexPath)
   let ps = parsePathspec(specs, repo.prefix)
   failIf(ps.isEmpty, "you must specify path(s) to restore")
 
   var src: TreeMap
+  var sourceTree: Oid
   if sourceGiven:
-    src = repo.flatten(repo.resolveTree(source))
+    sourceTree = repo.resolveTree(source)
+    src = repo.flatten(sourceTree)
   else:
     # No source: the index is the source, which is what makes `restore <path>`
     # and `checkout -- <path>` mean "throw away my edit".
@@ -183,13 +196,61 @@ proc doRestore(c: Ctx, source: string, sourceGiven: bool, specs: seq[string],
       if e.stage == 0:
         src[e.path] = Version(mode: canonMode(e.mode), oid: e.oid)
 
-  let n = repo.checkoutPaths(idx, src, ps, toWorktree, toIndex)
-  if n == 0:
+  # Every conflicted path the pathspec reaches is decided *before* anything is
+  # written, and an undecidable one stops the whole command
+  # (`builtin/checkout.c:checkout_paths` runs this as its own pass, ahead of
+  # the writes).  Half a checkout is worse than none.
+  #
+  # A source tree makes the question moot: its version replaces every stage,
+  # which is why `checkout HEAD -- <conflicted path>` is the third way to
+  # resolve a conflict.
+  var drop: seq[string]
+  var failed = false
+  if not sourceGiven:
+    var last = ""
+    for e in idx.entries:
+      if e.stage == 0 or e.path == last: continue
+      last = e.path
+      if not ps.matches(e.path): continue
+      if stage == 0:
+        stderr.write "error: path '" & e.path & "' is unmerged\n"
+        failed = true
+        continue
+      let k = idx.find(e.path, stage)
+      if k >= 0:
+        src[e.path] = Version(mode: canonMode(idx.entries[k].mode),
+                              oid: idx.entries[k].oid)
+      elif overlay:
+        stderr.write "error: path '" & e.path & "' does not have " &
+                     (if stage == 2: "our" else: "their") & " version\n"
+        failed = true
+      else: drop.add e.path
+  if failed: return 1
+
+  var (matched, n) = repo.checkoutPaths(idx, src, ps, toWorktree, toIndex,
+                                        skipUnchanged = not sourceGiven)
+  # No-overlay: a conflicted path with no such stage loses its *file*, but
+  # keeps its stages -- the conflict is still unresolved, and the index is
+  # where that is recorded.
+  for path in drop:
+    repo.removeWorkingPath(path)
+    inc matched
+    inc n
+  if matched == 0:
     # An `error:` and exit 1: a pathspec that matches nothing is a mistake in
-    # the command line, not a broken repository.
+    # the command line, not a broken repository.  Checked before the count is
+    # reported, as git checks it before it checks anything out.
     stderr.write "error: pathspec '" & specs[0] &
                  "' did not match any file(s) known to gittle\n"
     return 1
+  if report:
+    # `checkout <paths>` says how much it did; `checkout -- <paths>` and
+    # `restore` do not, and the difference really is the `--`
+    # (`builtin/checkout.c`: `count_checkout_paths = !quiet && !has_dash_dash`).
+    stderr.write "Updated " & $n & " path" & (if n == 1: "" else: "s") &
+                 " from " &
+                 (if sourceGiven: repo.uniqueAbbrev(sourceTree, repo.autoAbbrev)
+                  else: "the index") & "\n"
   idx.writeIndex()
   0
 
@@ -200,6 +261,7 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
   var rest: seq[string]
   var forceBranch, detach, force, quiet, track, trackGiven = false
   var sourceGiven, staged, worktreeGiven, seenDashDash = false
+  var stage = 0
   var i = 0
   let a2 = expandShortOptions(args, {'b', 'B', 'c', 'C', 's'})
 
@@ -219,9 +281,8 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
       of "-S", "--staged": staged = true
       of "-W", "--worktree": worktreeGiven = true
       of "-h", "--help": (echo usageText; return 0)
-      of "--ours", "--theirs":
-        fail(a & " needs unmerged index entries, which arrive with the merge " &
-             "machinery in phase 7")
+      of "--ours": stage = 2
+      of "--theirs": stage = 3
       of "-m", "--merge", "-p", "--patch", "--orphan", "--overlay",
          "--no-overlay", "--conflict", "--guess", "--no-guess":
         fail(a & " is out of scope for gittle v1 (docs/06)")
@@ -246,17 +307,24 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
     # documented way to say "both" and "the working tree".
     # `--staged` with no `--source` restores from HEAD: the index's own
     # content is what is being replaced, so it cannot also be the source.
+    failIf(stage != 0 and staged,
+           "'--ours' or '--theirs' cannot be used with --staged")
     if staged and not sourceGiven:
       source = "HEAD"
       sourceGiven = true
+    # `restore` is the no-overlay one: a path with no such stage is removed
+    # rather than reported.
     return c.doRestore(source, sourceGiven, specs,
                        toWorktree = worktreeGiven or not staged,
-                       toIndex = staged)
+                       toIndex = staged, stage = stage, overlay = false)
 
   # `checkout` has to decide, per invocation, whether it was asked to switch
   # or to restore -- and the answer is "restore" as soon as any path is named.
-  if mode == mCheckout and (specs.len > 0 or
-      (rest.len > 0 and newBranch.len == 0 and not repo.looksLikeRev(rest[0]))):
+  # `checkout <tree-ish> <pathspec>…` needs no `--` when the first argument
+  # resolves and the rest cannot be references -- git only insists on the
+  # separator when the first argument is ambiguous.
+  if mode == mCheckout and newBranch.len == 0 and (specs.len > 0 or
+      rest.len > 1 or (rest.len > 0 and not repo.looksLikeRev(rest[0]))):
     var tree = ""
     var given = false
     if rest.len > 0 and (seenDashDash or repo.looksLikeRev(rest[0])):
@@ -264,7 +332,8 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
       given = true
       rest = rest[1 .. ^1]
     specs = rest & specs
-    return c.doRestore(tree, given, specs, toWorktree = true, toIndex = given)
+    return c.doRestore(tree, given, specs, toWorktree = true, toIndex = given,
+                       stage = stage, report = not quiet and not seenDashDash)
 
   failIf(rest.len > 1, usageText)
   var target = if rest.len > 0: rest[0]

@@ -30,17 +30,23 @@
 ## screen while still showing a new file dropped next to tracked ones.
 ## `-u all` lists every file; `-u no` lists none.
 ##
+## ## Unmerged paths
+##
+## A conflicted path is neither staged nor unstaged: it has no stage-0 entry
+## for either diff to see, so both of them skip it and it is collected
+## separately, straight out of the index.  Which of the three stages exist is
+## the whole content of the report -- `DU` is "deleted by us", meaning stages
+## 1 and 3 but no 2 -- so the seven combinations are a table indexed by that
+## bitmask (`wt-status.c:wt_shortstatus_unmerged`).
+##
 ## ## What is deliberately not here
 ##
-## The in-progress states -- merge, rebase, cherry-pick, revert, bisect --
-## are 400 lines of `wt-status.c` on their own and every one of them belongs
-## to a command gittle has not built yet.  They arrive in phase 7.  Likewise
-## `--ignored` (docs/08 cuts it), submodule summaries, and the upstream
-## ahead/behind counts, which need a remote (phase 8).
+## `--ignored` (docs/08 cuts it), submodule summaries, and `bisect` and `am`,
+## whose in-progress states have no command behind them in gittle.
 
-import std/[algorithm, strutils]
+import std/[algorithm, os, sets, strutils]
 import diffcore, dir, ignore, index, objects, pathspec, refs, repository,
-       revision, revwalk, util
+       revision, revwalk, sequencer, util
 
 type
   Tracking* = object
@@ -62,6 +68,9 @@ type
     x*, y*: char            ## index-vs-HEAD, worktree-vs-index; ' ' is "same"
     headMode*, indexMode*, workMode*: uint32
     headOid*, indexOid*: Oid
+    stagemask*: int         ## bit s-1 set when stage s exists; 0 when merged
+    stageModes*: array[3, uint32]
+    stageOids*: array[3, Oid]
 
   Status* = object
     entries*: seq[Entry]
@@ -72,6 +81,30 @@ type
     tracking*: Tracking     ## where the branch stands against its upstream
     headOid*: Oid
     initial*: bool          ## HEAD points at a branch with no commits yet
+    op*: Operation          ## what the repository is in the middle of
+    opHead*: string         ## the commit being picked or reverted, abbreviated
+    opBranch*, opOnto*: string   ## what a rebase is moving, and onto what
+    opDone*, opTodo*: seq[string]  ## a rebase's todo list, either side of now
+
+const unmergedTable = [
+  (1, "DD", "both deleted:"),    (2, "AU", "added by us:"),
+  (3, "UD", "deleted by them:"), (4, "UA", "added by them:"),
+  (5, "DU", "deleted by us:"),   (6, "AA", "both added:"),
+  (7, "UU", "both modified:")]
+  ## Which stages exist, as a bitmask, and how the short and long formats name
+  ## it (`wt-status.c:wt_shortstatus_unmerged` and
+  ## `wt_status_unmerged_status_string`).  Stage 1 is the base, 2 ours, 3
+  ## theirs, so mask 3 is "we have it, they deleted it".
+
+func unmergedLetters(mask: int): (char, char) =
+  for (m, letters, _) in unmergedTable:
+    if m == mask: return (letters[0], letters[1])
+  ('U', 'U')
+
+func unmergedLabel(mask: int): string =
+  for (m, _, label) in unmergedTable:
+    if m == mask: return label
+  "unmerged:"
 
 proc hasTrackedUnder(idx: Index, dir: string): bool =
   ## Does the index hold anything inside this directory?
@@ -145,9 +178,30 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
 
   let headTree = if h.found: repo.peelTo(h.oid, otTree).oid else: nullOid
 
+  # The conflicted paths, first: an unmerged path has no stage-0 entry, so the
+  # HEAD-to-index diff would otherwise report every one of them as *deleted*.
+  # Which stages exist is the whole report, and it comes straight out of the
+  # index.
+  var byPath: seq[Entry]
+  var conflicted: HashSet[string]
+  var u: Entry
+  for e in idx.entries:
+    if e.stage == 0 or not ps.matches(e.path): continue
+    if e.path != u.path or u.stagemask == 0:
+      if u.stagemask != 0: byPath.add u
+      u = Entry(path: e.path)
+      conflicted.incl e.path
+      let (ok, st) = statPath(repo.workTreePath(e.path))
+      if ok: u.workMode = modeForFile(st)
+    u.stagemask = u.stagemask or (1 shl (e.stage - 1))
+    u.stageModes[e.stage - 1] = canonMode(e.mode)
+    u.stageOids[e.stage - 1] = e.oid
+  if u.stagemask != 0: byPath.add u
+  for i in 0 ..< byPath.len:
+    (byPath[i].x, byPath[i].y) = unmergedLetters(byPath[i].stagemask)
+
   # An entry is indexed by path so the two diffs can meet in it: a path may
   # appear in both, and `MM` is exactly that case.
-  var byPath: seq[Entry]
   proc slot(path: string): int =
     for i, e in byPath:
       if e.path == path: return i
@@ -155,7 +209,7 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
     byPath.high
 
   for p in pairsTreeIndex(repo, headTree, idx, ps):
-    if not repo.changed(p): continue
+    if p.path in conflicted or not repo.changed(p): continue
     let i = slot(p.path)
     byPath[i].x = p.status
     byPath[i].headMode = p.oldMode
@@ -167,10 +221,10 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
   # unless the unstaged pass below says otherwise.  Porcelain v2 prints all
   # three modes, and `000000` there would claim the file is gone.
   for i in 0 ..< byPath.len:
-    byPath[i].workMode = byPath[i].indexMode
+    if byPath[i].stagemask == 0: byPath[i].workMode = byPath[i].indexMode
 
   for p in pairsIndexWork(repo, idx, ps):
-    if not repo.changed(p): continue
+    if p.path in conflicted or not repo.changed(p): continue
     let i = slot(p.path)
     byPath[i].y = p.status
     byPath[i].workMode = p.newMode
@@ -184,6 +238,37 @@ proc computeStatus*(repo: Repository, idx: Index, ps: Pathspec,
 
   byPath.sort(proc (a, b: Entry): int = cmp(a.path, b.path))
   result.entries = byPath
+
+  result.op = repo.currentOp
+  case result.op
+  of opCherryPick, opRevert:
+    let o = repo.stateOid(if result.op == opCherryPick: "CHERRY_PICK_HEAD"
+                          else: "REVERT_HEAD")
+    result.opHead = repo.uniqueAbbrev(o, repo.autoAbbrev)
+  of opRebase:
+    const heads = refsPrefix & "heads/"
+    let name = repo.readState(rebaseDir / "head-name").strip()
+    if name.startsWith(heads): result.opBranch = name[heads.len .. ^1]
+    let onto = repo.readState(rebaseDir / "onto").strip()
+    if onto.len == OidHexLen:
+      result.opOnto = repo.uniqueAbbrev(parseOid(onto), repo.autoAbbrev)
+    # The todo lines are re-rendered with an abbreviated object ID, because
+    # the file holds the full one and the report is for a human
+    # (`wt-status.c:read_rebase_todolist` calls `format_todo_line`).
+    proc shorten(lines: seq[string]): seq[string] =
+      for line in lines:
+        let f = line.splitWhitespace
+        if f.len < 2: continue
+        result.add f[0] & " " & repo.uniqueAbbrev(parseOid(f[1]), repo.autoAbbrev) &
+                   (if f.len > 2: " " & f[2 .. ^1].join(" ") else: "")
+    var doneLines, todoLines: seq[string]
+    for line in repo.readState(rebaseDir / "done").splitLines:
+      if line.strip().len > 0: doneLines.add line
+    for line in repo.readState(rebaseDir / "git-rebase-todo").splitLines:
+      if line.strip().len > 0: todoLines.add line
+    result.opDone = shorten(doneLines)
+    result.opTodo = shorten(todoLines)
+  else: discard
 
   if untracked != umNo:
     let ig = newIgnore(repo)
@@ -245,19 +330,36 @@ proc shortLines*(st: Status, fmt: StatusFormat, branch: bool, nulTerm: bool,
           elif st.tracking.gone: result.add " [gone]"
         result.add sep
 
-  for e in st.entries:
-    if fmt == sfPorcelainV2:
-      # Porcelain v2 spells "unchanged" as `.` where the short format spells
-      # it as a space, so that every field is non-blank and the record splits
-      # on whitespace.
-      let x = if e.x == ' ': '.' else: e.x
-      let y = if e.y == ' ': '.' else: e.y
-      result.add "1 " & x & y & " N... " &
-                 formatMode(e.headMode) & " " & formatMode(e.indexMode) & " " &
-                 formatMode(e.workMode) & " " &
-                 $e.headOid & " " & $e.indexOid & " " & name(e.path) & sep
-    else:
-      result.add e.x & e.y & " " & name(e.path) & sep
+  # Porcelain v2 prints every changed entry and *then* every unmerged one --
+  # two passes rather than one path-sorted list, which is the only place where
+  # a format's order is not path order
+  # (`wt-status.c:wt_porcelain_v2_print`).  Every other format interleaves.
+  let passes = if fmt == sfPorcelainV2: 1 else: 0
+  for pass in 0 .. passes:
+    for e in st.entries:
+      if passes == 1 and (e.stagemask != 0) != (pass == 1): continue
+      if fmt != sfPorcelainV2:
+        result.add e.x & e.y & " " & name(e.path) & sep
+      elif e.stagemask != 0:
+        # The `u` record carries *four* modes -- the three stages and the
+        # working tree -- and three object IDs, where the `1` record carries
+        # three modes and two IDs.  A parser tells them apart by the leading
+        # letter, not by counting.
+        result.add "u " & e.x & e.y & " N... "
+        for m in e.stageModes: result.add formatMode(m) & " "
+        result.add formatMode(e.workMode) & " "
+        for o in e.stageOids: result.add $o & " "
+        result.add name(e.path) & sep
+      else:
+        # Porcelain v2 spells "unchanged" as `.` where the short format spells
+        # it as a space, so that every field is non-blank and the record
+        # splits on whitespace.
+        let x = if e.x == ' ': '.' else: e.x
+        let y = if e.y == ' ': '.' else: e.y
+        result.add "1 " & x & y & " N... " &
+                   formatMode(e.headMode) & " " & formatMode(e.indexMode) &
+                   " " & formatMode(e.workMode) & " " &
+                   $e.headOid & " " & $e.indexOid & " " & name(e.path) & sep
 
   for p in st.untracked:
     result.add (if fmt == sfPorcelainV2: "? " else: "?? ") & name(p) & sep
@@ -308,6 +410,70 @@ proc trackingLine*(t: Tracking): string =
     "  (use \"gittle pull\" if you want to integrate the remote branch with " &
     "yours)\n"
 
+proc inProgressBlock(st: Status, hints: bool, unmerged: bool): string =
+  ## "You have unmerged paths." and its four siblings, plus the hints that
+  ## name the way out.
+  ##
+  ## Every one of them differs on whether conflicts are still outstanding,
+  ## because that decides whether the next command is `--continue` or fixing
+  ## a file first -- so each is one line and a two-way hint
+  ## (`wt-status.c:show_merge_in_progress` and the three beside it).
+  proc hint(s: string): string = (if hints: s else: "")
+  case st.op
+  of opNone: return ""
+  of opMerge:
+    if unmerged:
+      result = "You have unmerged paths.\n" &
+        hint("  (fix conflicts and run \"git commit\")\n" &
+             "  (use \"git merge --abort\" to abort the merge)\n")
+    else:
+      result = "All conflicts fixed but you are still merging.\n" &
+        hint("  (use \"git commit\" to conclude merge)\n")
+  of opCherryPick, opRevert:
+    let verb = st.op.opName
+    let noun = if st.op == opCherryPick: "cherry-picking" else: "reverting"
+    result = "You are currently " & noun & " commit " & st.opHead & ".\n" &
+      hint((if unmerged: "  (fix conflicts and run \"git " & verb & " --continue\")\n"
+            else: "  (all conflicts fixed: run \"git " & verb & " --continue\")\n") &
+           "  (use \"git " & verb & " --skip\" to skip this patch)\n" &
+           "  (use \"git " & verb & " --abort\" to cancel the " & verb &
+           " operation)\n")
+  of opRebase:
+    # Every rebase runs through the interactive machinery now, so every one
+    # reports its todo list: what was done, and what is left
+    # (`wt-status.c:show_rebase_information`).  Two lines of each, which is
+    # what makes the report fit above the file list.
+    func plural(n: int, one, many: string): string =
+      $n & " " & (if n == 1: one else: many)
+    if st.opDone.len == 0: result.add "No commands done.\n"
+    else:
+      result.add "Last command" & (if st.opDone.len == 1: "" else: "s") &
+                 " done (" & plural(st.opDone.len, "command", "commands") &
+                 " done):\n"
+      for k in max(st.opDone.len - 2, 0) ..< st.opDone.len:
+        result.add "   " & st.opDone[k] & "\n"
+      if st.opDone.len > 2 and hints:
+        result.add "  (see more in file .git/rebase-merge/done)\n"
+    if st.opTodo.len == 0: result.add "No commands remaining.\n"
+    else:
+      result.add "Next command" & (if st.opTodo.len == 1: "" else: "s") &
+                 " to do (" & plural(st.opTodo.len, "remaining command",
+                                     "remaining commands") & "):\n"
+      for k in 0 ..< min(2, st.opTodo.len):
+        result.add "   " & st.opTodo[k] & "\n"
+      if hints: result.add "  (use \"git rebase --edit-todo\" to view and edit)\n"
+    result.add (if st.opBranch.len > 0:
+                "You are currently rebasing branch '" & st.opBranch & "' on '" &
+                st.opOnto & "'.\n"
+              else: "You are currently rebasing.\n")
+    result.add hint(
+      if unmerged:
+        "  (fix conflicts and then run \"git rebase --continue\")\n" &
+        "  (use \"git rebase --skip\" to skip this patch)\n" &
+        "  (use \"git rebase --abort\" to check out the original branch)\n"
+      else: "  (all conflicts fixed: run \"git rebase --continue\")\n")
+  result.add "\n"
+
 proc longStatus*(st: Status, untracked: UntrackedMode, hints: bool,
                  prefix: string): string =
   ## The descriptive format, which is the default and is the only one whose
@@ -319,15 +485,23 @@ proc longStatus*(st: Status, untracked: UntrackedMode, hints: bool,
   ## means there is no commit to restore *from*, and "git add/rm" rather than
   ## "git add" means a file has been deleted and `add` alone would not record
   ## it.
-  var staged, unstaged: seq[Entry]
+  var staged, unstaged, unmerged: seq[Entry]
   var anyDeleted = false
   for e in st.entries:
+    if e.stagemask != 0:
+      unmerged.add e
+      continue
     if e.x != ' ': staged.add e
     if e.y != ' ':
       unstaged.add e
       if e.y == 'D': anyDeleted = true
 
-  if st.detached:
+  if st.op == opRebase and st.opOnto.len > 0:
+    # Not `On branch` and not `HEAD detached`: during a rebase HEAD really is
+    # detached, and saying so would bury what the user needs to know
+    # (`wt-status.c` substitutes this line wholesale).
+    result.add "interactive rebase in progress; onto " & st.opOnto & "\n"
+  elif st.detached:
     result.add st.headDesc & "\n"
   else:
     result.add "On branch " & st.branch & "\n"
@@ -340,15 +514,53 @@ proc longStatus*(st: Status, untracked: UntrackedMode, hints: bool,
   if st.initial:
     result.add "\nNo commits yet\n\n"
 
+  result.add inProgressBlock(st, hints, unmerged.len > 0)
+
   if staged.len > 0:
     result.add "Changes to be committed:\n"
-    if hints:
+    # The unstage hint is suppressed in the middle of a merge or a cherry-pick:
+    # what is staged there was staged by the operation, and `restore --staged`
+    # would be the wrong advice.  Only those two, because `whence` is derived
+    # from `MERGE_HEAD` and `CHERRY_PICK_HEAD` alone -- a revert and a rebase
+    # get the hint (`builtin/commit.c:determine_whence`).
+    if hints and st.op notin {opMerge, opCherryPick}:
       result.add (if st.initial:
                     "  (use \"git rm --cached <file>...\" to unstage)\n"
                   else:
                     "  (use \"git restore --staged <file>...\" to unstage)\n")
     for e in staged:
       result.add "\t" & labelFor(e.x) & quotePath(relativeTo(e.path, prefix)) & "\n"
+    result.add "\n"
+
+  if unmerged.len > 0:
+    result.add "Unmerged paths:\n"
+    # The same unstage hint the staged section carries, under the same rule:
+    # it is advice about `restore --staged`, so it is silent while an
+    # operation owns the index (`wt-status.c`'s unmerged header).
+    if hints and st.op notin {opMerge, opCherryPick}:
+      result.add (if st.initial:
+                    "  (use \"git rm --cached <file>...\" to unstage)\n"
+                  else:
+                    "  (use \"git restore --staged <file>...\" to unstage)\n")
+    if hints:
+      # Which hint appears says which resolutions are possible: a path deleted
+      # on one side needs `rm`, and one deleted on both needs nothing else.
+      var bothDeleted, delMod, notDeleted = false
+      for e in unmerged:
+        case e.stagemask
+        of 1: bothDeleted = true
+        of 3, 5: delMod = true
+        else: notDeleted = true
+      result.add (
+        if not bothDeleted:
+          if not delMod: "  (use \"git add <file>...\" to mark resolution)\n"
+          else: "  (use \"git add/rm <file>...\" as appropriate to mark resolution)\n"
+        elif not delMod and not notDeleted:
+          "  (use \"git rm <file>...\" to mark resolution)\n"
+        else: "  (use \"git add/rm <file>...\" as appropriate to mark resolution)\n")
+    for e in unmerged:
+      result.add "\t" & unmergedLabel(e.stagemask).alignLeft(labelWidth + 5) &
+                 quotePath(relativeTo(e.path, prefix)) & "\n"
     result.add "\n"
 
   if unstaged.len > 0:
@@ -382,7 +594,7 @@ proc longStatus*(st: Status, untracked: UntrackedMode, hints: bool,
   # decides which sentence appears (`wt-status.c`, the `!s->committable` block).
   if staged.len == 0:
     result.add (
-      if unstaged.len > 0:
+      if unstaged.len > 0 or unmerged.len > 0:
         if hints: "no changes added to commit (use \"git add\" and/or \"git commit -a\")\n"
         else: "no changes added to commit\n"
       elif st.untracked.len > 0:

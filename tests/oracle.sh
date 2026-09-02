@@ -1679,6 +1679,7 @@ P6="$WORK/p6"; mkdir -p "$P6"
 # and not one to test.
 p6norm(){ sed -e 's/^fatal: //' -e 's/^gittle: //' -e "s/'git /'gittle /" \
               -e 's/^  git /  gittle /' -e 's/"git /"gittle /g' \
+              -e 's/\tgit /\tgittle /' -e 's/ git add/ gittle add/' \
               -e 's/known to git$/known to gittle/'; }
 
 # p6ro <expected-name> <args...> -- a read-only command, both tools, one repo.
@@ -1704,6 +1705,16 @@ p6state(){
     git for-each-ref --format='%(refname) %(objectname) %(symref)'
     git symbolic-ref -q HEAD || git rev-parse HEAD
     sed -e 's/[ \t]*$//' .git/config
+    # The in-progress markers are as much a result as the refs are: a merge
+    # that stopped is concluded only by what these say (phase 7).
+    for f in MERGE_HEAD MERGE_MSG MERGE_MODE ORIG_HEAD CHERRY_PICK_HEAD \
+             REVERT_HEAD REBASE_HEAD sequencer/head sequencer/todo \
+             rebase-merge/head-name rebase-merge/onto rebase-merge/orig-head \
+             rebase-merge/git-rebase-todo rebase-merge/done \
+             rebase-merge/msgnum rebase-merge/end rebase-merge/message \
+             rebase-merge/author-script rebase-merge/stopped-sha; do
+      [ -e ".git/$f" ] && { echo "== $f"; cat ".git/$f"; }
+    done
     ( cd .git/logs 2>/dev/null && find . -type f | sort |
       while read -r f; do echo "== $f"; cat "$f"; done )
     # `-type f` alone would follow a symlink and hash what it points at, and
@@ -1718,13 +1729,22 @@ p6state(){
     git ls-files -s )
 }
 
+# Each tool's own view of the same repository, which p6state -- a neutral
+# observer -- cannot check.  A `status` that describes a state both tools
+# agree on differently is exactly the bug this catches.
+p6own(){ ( cd "$2" && "$1" status; "$1" status --porcelain=v2 --branch
+           "$1" ls-files -u; "$1" branch -a ) 2>&1 | p6norm; }
+
 # p6mut <args...> -- a mutating command, run in two copies of $P6/fix.
 # $PREP, if set, is run in each copy first to build a dirty starting state.
 p6mut(){
   local ao as bo bs sa sb this
-  rm -rf "$P6/a" "$P6/b"; cp -a "$P6/fix" "$P6/a"; cp -a "$P6/fix" "$P6/b"
-  ( cd "$P6/a" && eval "${PREP:-true}" ) >/dev/null 2>&1
-  ( cd "$P6/b" && eval "${PREP:-true}" ) >/dev/null 2>&1
+  rm -rf "$P6/a" "$P6/b"
+  cp -a "${P6FIX:-$P6/fix}" "$P6/a"; cp -a "${P6FIX:-$P6/fix}" "$P6/b"
+  # $GITX inside a PREP is "whichever tool is under test in this copy", so
+  # that a state gittle itself created is the one gittle is asked to continue.
+  ( cd "$P6/a" && GITX="$GIT"    && eval "${PREP:-true}" ) >/dev/null 2>&1
+  ( cd "$P6/b" && GITX="$GITTLE" && eval "${PREP:-true}" ) >/dev/null 2>&1
   ao=$( cd "$P6/a" && git "$@" 2>&1 ); as=$?
   bo=$( cd "$P6/b" && "$GITTLE" "$@" 2>&1 ); bs=$?
   p6n=$((p6n+1)); this=1
@@ -1735,10 +1755,15 @@ p6mut(){
   [ "$as" = "$bs" ] || this=0
   sa=$(p6state "$P6/a"); sb=$(p6state "$P6/b")
   [ "$sa" = "$sb" ] || this=0
+  local oa ob
+  oa=$(p6own "$GIT" "$P6/a"); ob=$(p6own "$GITTLE" "$P6/b")
+  [ "$oa" = "$ob" ] || { this=0; sa="$sa
+$oa"; sb="$sb
+$ob"; }
   if [ $this = 0 ]; then
     p6ok=0
-    printf '  %s%s  [git %d / gittle %d]\n' \
-      "${PREP:+($PREP) }" "$*" "$as" "$bs"
+    printf '  %s%s%s  [git %d / gittle %d]\n' \
+      "${P6FIX:+[$(basename "$P6FIX")] }" "${PREP:+($PREP) }" "$*" "$as" "$bs"
     diff <(printf '%s\n' "$ao" | p6norm) <(printf '%s\n' "$bo" | p6norm) | head -5
     diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -6
   fi
@@ -2046,6 +2071,316 @@ done
 unset PREP
 [ $p6ok = 1 ] && { ok; report "upstream tracking" "$p6n status forms, four ways of saying it"; } \
               || bad "upstream tracking"
+
+# ===========================================================================
+# Phase 7 -- merge.
+#
+# Every command here can stop in the middle, so the comparison is not only
+# "did it print the same thing" but "did it leave the same *state* to be
+# continued from" -- which is why p6state grew the in-progress markers and
+# p6mut grew p6own.  The `$GITX` in a PREP is what makes that meaningful: the
+# state gittle is asked to continue is one gittle itself created.
+P7="$WORK/p7"; mkdir -p "$P7"
+p7mk(){ rm -rf "$P7/$1"; mkdir -p "$P7/$1"; ( cd "$P7/$1" && git init -q -b main . ); }
+
+# f1: one of every conflict shape -- content, add/add, modify/delete -- plus
+# an executable and a symlink, so the merge has to get modes right too.
+p7mk f1
+( cd "$P7/f1"
+  printf 'a\nb\nc\nd\ne\n' > f; printf 'one\n' > keep; printf 'del\n' > gone
+  mkdir -p sub; printf 's\n' > sub/s
+  git add .; git commit -qm base
+  git checkout -qb topic
+  printf 'a\nB\nc\nd\ne\n' > f; printf 'topic\n' > both; printf 'x\n' > sub/t
+  git rm -q gone; printf 'e\n' > exe; chmod +x exe
+  git add .; git commit -qm topic-work
+  git checkout -q main
+  printf 'a\nb\nc\nD\ne\n' > f; printf 'main\n' > both; printf 'del2\n' > gone
+  ln -s f link
+  git add .; git commit -qm main-work )
+
+# f2: a fast-forward, which records nothing at all.
+p7mk f2
+( cd "$P7/f2"
+  echo a > f; git add .; git commit -qm one
+  git checkout -qb topic; echo b >> f; echo n > new
+  git add .; git commit -qm two
+  git checkout -q main )
+
+# f3: criss-cross -- two equally good merge bases, so the base is virtual.
+p7mk f3
+( cd "$P7/f3"
+  printf '1\n2\n3\n4\n5\n6\n7\n8\n' > f; git add .; git commit -qm base
+  git checkout -qb a; sed -i 's/^2$/A2/' f; git commit -qam a1
+  git checkout -q main; git checkout -qb b; sed -i 's/^7$/B7/' f; git commit -qam b1
+  git checkout -q a; git merge -q --no-edit b >/dev/null 2>&1
+  git checkout -q b; git merge -q --no-edit a >/dev/null 2>&1
+  git checkout -q a; sed -i 's/^4$/A4/' f; git commit -qam a2
+  git checkout -q b; sed -i 's/^5$/B5/' f; git commit -qam b2
+  git checkout -q a )
+
+# f4: an annotated tag, whose own message the merge commit quotes.
+p7mk f4
+( cd "$P7/f4"
+  echo a > f; git add .; git commit -qm one
+  git checkout -qb topic; echo b >> f; git add .; git commit -qm two
+  git tag -a -m "the tag body" v1
+  git checkout -q main; echo z > other; git add .; git commit -qm three )
+
+# f5: two histories that never met.
+p7mk f5
+( cd "$P7/f5"
+  echo a > f; git add .; git commit -qm one
+  git checkout -q --orphan other 2>/dev/null; git rm -q -rf . 2>/dev/null
+  echo z > g; git add .; git commit -qm alone
+  git checkout -q main )
+
+# f6: a linear topic to pick from and to revert.
+p7mk f6
+( cd "$P7/f6"
+  printf '1\n2\n3\n4\n5\n' > f; git add .; git commit -qm base
+  git checkout -qb topic
+  printf '1\nT2\n3\n4\n5\n' > f; git commit -qam "topic one"
+  printf '1\nT2\n3\n4\nT5\n' > f; echo nn > n; git add .; git commit -qm "topic two"
+  echo more >> n; git commit -qam "topic three"
+  git checkout -q main
+  printf '1\n2\n3\nM4\n5\n' > f; git commit -qam "main work" )
+
+# f7: two branches that diverged, the second commit of one conflicting.
+p7mk f7
+( cd "$P7/f7"
+  printf '1\n2\n3\n4\n5\n' > f; git add .; git commit -qm base
+  git checkout -qb topic
+  echo a > a; git add a; git commit -qm "add a"
+  printf '1\nT2\n3\n4\n5\n' > f; git commit -qam "touch f"
+  echo b > b; git add b; git commit -qm "add b"
+  git checkout -q main
+  printf '1\n2\nM3\n4\n5\n' > f; git commit -qam "main f"
+  echo c > c; git add c; git commit -qm "add c"
+  git checkout -q topic )
+
+# f9, f10: a directory where the other side has a file, both ways round.  The
+# working tree cannot hold both, so one of them has to be renamed aside -- the
+# one case where a merge invents a path name.
+p7mk f9
+( cd "$P7/f9"
+  echo base > base; git add .; git commit -qm base
+  git checkout -qb topic; mkdir a; echo inner > a/b; git add .; git commit -qm dir
+  git checkout -q main; echo file > a; git add .; git commit -qm file )
+p7mk f10
+( cd "$P7/f10"
+  echo base > base; git add .; git commit -qm base
+  git checkout -qb topic; echo file > a; git add .; git commit -qm file
+  git checkout -q main; mkdir a; echo inner > a/b; git add .; git commit -qm dir )
+
+# f8: a clean tree, made dirty by each stash test's own PREP.
+p7mk f8
+( cd "$P7/f8"
+  printf '1\n2\n3\n' > f; echo k > keep; mkdir -p sub; echo s > sub/s
+  git add .; git commit -qm base )
+
+# ------------------------------------------------------------- merge-file
+# The three-way file merge on its own, over random three-way cases.  git is
+# given --diff-algorithm=minimal for the same reason `diff` is given
+# --minimal: it is the one algorithm gittle implements (mergefile.nim).
+mf_ok=1; mf_n=0
+if command -v python3 >/dev/null && python3 "$(dirname "$0")/mkmerge.py" "$WORK/mf"
+then
+  for d in "$WORK"/mf/c*; do
+    mf_n=$((mf_n+1))
+    ao=$(git merge-file -p --diff-algorithm=minimal -L ours -L base -L theirs \
+         "$d/ours" "$d/base" "$d/theirs" 2>&1); as=$?
+    bo=$("$GITTLE" merge-file -p -L ours -L base -L theirs \
+         "$d/ours" "$d/base" "$d/theirs" 2>&1); bs=$?
+    if [ "$ao" != "$bo" ] || [ "$as" != "$bs" ]; then
+      mf_ok=0
+      [ $mf_n -lt 3 ] && diff <(printf '%s\n' "$ao") <(printf '%s\n' "$bo") | head -8
+    fi
+  done
+  [ "$mf_ok" = 1 ] && { ok; report "merge-file" "$mf_n three-way merges, conflicts included"; } \
+                   || bad "merge-file"
+else
+  report "merge-file" "skipped (no python3)"
+fi
+
+# ------------------------------------------------------------------ merge
+p6ok=1; p6n=0
+P6FIX="$P7/f1"
+p6mut merge topic;             p6mut merge -m custom topic
+p6mut merge --no-commit topic; p6mut merge --ff-only topic
+p6mut merge --abort;           p6mut merge --continue
+PREP='$GITX merge topic'                 p6mut status
+PREP='$GITX merge topic'                 p6mut merge --abort
+PREP='$GITX merge topic'                 p6mut merge --quit
+PREP='$GITX merge topic'                 p6mut merge --continue
+PREP='$GITX merge topic'                 p6mut commit -m done
+PREP='$GITX merge topic'                 p6mut merge topic
+PREP='$GITX merge topic'                 p6mut diff --cached
+PREP='$GITX merge topic; $GITX add -A'   p6mut merge --continue
+PREP='$GITX merge topic; $GITX add -A'   p6mut commit -m done
+PREP='$GITX merge topic; $GITX add -A'   p6mut status
+PREP='$GITX merge topic; $GITX add -A'   p6mut commit -m done --amend
+PREP='$GITX merge --no-commit topic'     p6mut status
+PREP='echo dirty >> f'                   p6mut merge topic
+PREP='echo dirty > exe'                  p6mut merge topic
+unset PREP
+P6FIX="$P7/f2"
+p6mut merge topic;            p6mut merge --no-ff -m nff topic
+p6mut merge --ff-only topic;  p6mut merge -q topic
+p6mut merge main;             p6mut merge nosuch
+P6FIX="$P7/f3"; p6mut merge b; p6mut merge -m x b
+P6FIX="$P7/f4"; p6mut merge v1; p6mut merge --no-ff -m t v1; p6mut merge topic
+P6FIX="$P7/f5"; p6mut merge other
+P6FIX="$P7/f9";  p6mut merge topic; PREP='$GITX merge topic' p6mut status
+P6FIX="$P7/f10"; p6mut merge topic; PREP='$GITX merge topic' p6mut status
+unset PREP
+[ $p6ok = 1 ] && { ok; report "merge" "$p6n merges, conflicts and conclusions"; } \
+              || bad "merge"
+
+# ---------------------------------------------- taking one side of a conflict
+p6ok=1; p6n=0
+P6FIX="$P7/f1"
+for a in "checkout --ours -- ." "checkout --theirs -- ." "checkout --ours -- both" \
+         "checkout --theirs -- gone" "checkout --ours -- gone" \
+         "restore --ours ." "restore --theirs ." "restore --ours both" \
+         "restore --theirs gone" "restore --staged --ours both" \
+         "checkout --ours ." "checkout --theirs both" "checkout -q --ours ." \
+         "checkout -- both" "checkout both" "checkout HEAD -- both" \
+         "checkout HEAD both"; do
+  PREP='$GITX merge topic' p6mut $a
+done
+unset PREP
+[ $p6ok = 1 ] && { ok; report "checkout --ours/--theirs" "$p6n ways to resolve by hand"; } \
+              || bad "checkout --ours/--theirs"
+
+# -------------------------------------------------------- cherry-pick, revert
+p6ok=1; p6n=0
+P6FIX="$P7/f6"
+for a in "cherry-pick topic~2" "cherry-pick topic" "cherry-pick -x topic~2" \
+         "cherry-pick -s topic~2" "cherry-pick -n topic~2" \
+         "cherry-pick topic~2 topic~1" "cherry-pick main~1..topic" \
+         "cherry-pick nosuch" "cherry-pick --continue" "cherry-pick --abort" \
+         "cherry-pick --quit" "revert HEAD" "revert --no-edit HEAD" \
+         "revert -n HEAD" "revert HEAD HEAD~1" "revert --abort" \
+         "cherry-pick topic~2 topic" "revert topic"; do
+  p6mut $a
+done
+PREP='$GITX cherry-pick topic'                       p6mut status
+PREP='$GITX cherry-pick topic'                       p6mut cherry-pick --abort
+PREP='$GITX cherry-pick topic'                       p6mut cherry-pick --quit
+PREP='$GITX cherry-pick topic'                       p6mut cherry-pick --continue
+PREP='$GITX cherry-pick topic; $GITX add -A'         p6mut cherry-pick --continue
+PREP='$GITX cherry-pick topic; $GITX add -A'         p6mut commit -m resolved
+PREP='$GITX cherry-pick topic~2 topic'               p6mut status
+PREP='$GITX cherry-pick topic~2 topic'               p6mut cherry-pick --abort
+PREP='$GITX cherry-pick topic~2 topic'               p6mut cherry-pick --quit
+PREP='$GITX cherry-pick topic~2 topic; $GITX add -A' p6mut cherry-pick --continue
+PREP='$GITX revert topic'                            p6mut status
+PREP='$GITX revert topic'                            p6mut revert --abort
+PREP='$GITX revert topic; $GITX add -A'              p6mut revert --continue
+unset PREP
+[ $p6ok = 1 ] && { ok; report "cherry-pick and revert" "$p6n replays, both directions"; } \
+              || bad "cherry-pick and revert"
+
+# ----------------------------------------------------------------- rebase
+p6ok=1; p6n=0
+P6FIX="$P7/f7"
+for a in "rebase main" "rebase -q main" "rebase -v main" "rebase --onto main~1 main" \
+         "rebase --continue" "rebase --abort" "rebase --quit" \
+         "rebase main topic" "rebase topic" "rebase HEAD"; do
+  p6mut $a
+done
+PREP='$GITX rebase main'                 p6mut status
+PREP='$GITX rebase main'                 p6mut rebase --abort
+PREP='$GITX rebase main'                 p6mut rebase --quit
+PREP='$GITX rebase main'                 p6mut rebase --continue
+PREP='$GITX rebase main'                 p6mut rebase --skip
+PREP='$GITX rebase main'                 p6mut status --porcelain=v2 --branch
+PREP='$GITX rebase main; $GITX add -A'   p6mut rebase --continue
+# The other way a user resolves: commit it by hand and then continue.  git
+# notices there is nothing staged and does not commit a second time.
+PREP='$GITX rebase main; $GITX add -A; $GITX commit -qm resolved' \
+  p6mut rebase --continue
+unset PREP
+[ $p6ok = 1 ] && { ok; report "rebase" "$p6n rebases, stopped and resumed"; } \
+              || bad "rebase"
+
+# ------------------------------------------------------------------ stash
+p6ok=1; p6n=0
+P6FIX="$P7/f8"
+DIRTY='printf "1\nX\n3\n" > f; echo s > staged; $GITX add staged; echo u > untracked'
+for a in "stash" "stash push" "stash push -m message" "stash push -u" \
+         "stash push -k" "stash push -q" "stash push -- f" "stash list" \
+         "stash show" "stash pop" "stash apply" "stash drop" "stash clear"; do
+  PREP="$DIRTY" p6mut $a
+done
+PREP='true' p6mut stash; PREP='true' p6mut stash pop; PREP='true' p6mut stash list
+TWO='printf "1\nX\n3\n" > f; $GITX stash push -q; echo n > n; $GITX add n; $GITX stash push -q'
+for a in "stash list" "stash pop" "stash apply" "stash drop" \
+         "stash show stash@{1}" "stash pop stash@{1}" "stash drop stash@{1}" \
+         "stash clear"; do
+  PREP="$TWO" p6mut $a
+done
+PREP='printf "1\nX\n3\n" > f; $GITX stash push -q; printf "1\nZ\n3\n" > f; $GITX commit -qam other' \
+  p6mut stash pop
+PREP='printf "1\nX\n3\n" > f; echo u > untracked; $GITX stash push -q -u' \
+  p6mut stash pop
+unset PREP; unset P6FIX
+[ $p6ok = 1 ] && { ok; report "stash" "$p6n pushes, pops and drops"; } || bad "stash"
+
+# ------------------------------------------- read-tree -m: the plumbing merge
+# f11: main and topic each changed the same file, differently, and topic added
+# one -- so the two-way form has something to refuse and the three-way form
+# has something to leave unmerged.
+p7mk f11
+( cd "$P7/f11"
+  printf '1\n2\n3\n' > f; echo k > keep; git add .; git commit -qm base
+  git checkout -qb topic; printf '1\nT\n3\n' > f; echo n > n
+  git add .; git commit -qm t
+  git checkout -q main; printf '1\n2\nM\n' > f; git commit -qam m )
+p6ok=1; p6n=0; P6FIX="$P7/f11"
+MB=$( cd "$P7/f11" && git merge-base HEAD topic )
+# `cp -a` gives every file a new inode, and git calls a path "not uptodate" on
+# an inode change alone where gittle's stat comparison deliberately does not
+# (index.nim).  Refreshing first makes these tests measure `read-tree`.
+REFRESH='git update-index --refresh >/dev/null 2>&1'
+for a in "read-tree topic" "read-tree -m topic" "read-tree --reset topic" \
+         "read-tree -m HEAD topic" "read-tree -m -u HEAD topic" \
+         "read-tree --reset -u HEAD topic" "read-tree -u topic" \
+         "read-tree --empty" "read-tree -m" \
+         "read-tree -m $MB HEAD topic" "read-tree -m -u $MB HEAD topic"; do
+  PREP="$REFRESH" p6mut $a
+done
+PREP="$REFRESH; echo dirty >> f"              p6mut read-tree -m -u HEAD topic
+PREP="$REFRESH; echo dirty >> f"              p6mut read-tree --reset -u HEAD topic
+PREP="$REFRESH; echo dirty >> f; git add f"   p6mut read-tree -m -u HEAD topic
+PREP="$REFRESH; echo x > n"                   p6mut read-tree -m -u HEAD topic
+unset PREP; unset P6FIX
+[ $p6ok = 1 ] && { ok; report "read-tree -m" "$p6n one-, two- and three-tree reads"; } \
+              || bad "read-tree -m"
+
+# ------------------------------------------------------- objects git will read
+# Everything above compares gittle against git.  This asks the other question:
+# is what gittle *wrote* a repository git considers sound?  A merge commit with
+# the wrong parent order, a stash whose second parent is not a commit, a tree
+# with a bad mode -- none of those show up in an output comparison.
+fsck_ok=1; fsck_n=0
+fsck_after(){   # fsck_after <fixture> <shell command run in a copy of it>
+  rm -rf "$P7/z"; cp -a "$1" "$P7/z"
+  ( cd "$P7/z" && eval "$2" ) >/dev/null 2>&1
+  fsck_n=$((fsck_n+1))
+  ( cd "$P7/z" && git fsck --strict --no-progress ) >/dev/null 2>&1 \
+    || { fsck_ok=0; echo "  not clean after: $2"; }
+}
+fsck_after "$P7/f1" '"$GITTLE" merge -m x topic; "$GITTLE" add -A; "$GITTLE" commit -m done'
+fsck_after "$P7/f2" '"$GITTLE" merge --no-ff -m x topic'
+fsck_after "$P7/f3" '"$GITTLE" merge -m x b'
+fsck_after "$P7/f6" '"$GITTLE" cherry-pick topic~2 topic~1'
+fsck_after "$P7/f6" '"$GITTLE" revert --no-edit HEAD'
+fsck_after "$P7/f7" '"$GITTLE" rebase main; "$GITTLE" add -A; "$GITTLE" rebase --continue'
+fsck_after "$P7/f8" 'printf "1\nX\n3\n" > f; echo u > u; "$GITTLE" stash push -u; "$GITTLE" stash pop'
+[ $fsck_ok = 1 ] && { ok; report "git fsck after gittle" "$fsck_n merged, picked, rebased and stashed states"; } \
+                 || bad "git fsck after gittle"
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

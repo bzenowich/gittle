@@ -377,7 +377,8 @@ proc willWriteReflog*(s: RefStore, name: string): bool =
   ## it can demand the writer's identity before anything is renamed.
   fileExists(s.reflogPath(name)) or s.shouldAutocreateReflog(name)
 
-proc appendReflog(s: RefStore, name: string, oldOid, newOid: Oid, msg: string) =
+proc appendReflog(s: RefStore, name: string, oldOid, newOid: Oid, msg: string,
+                  force = false) =
   ## Append one entry, creating the log only where the policy says to.
   ##
   ## Where the policy says not to, an *existing* log is still appended to: a
@@ -385,7 +386,7 @@ proc appendReflog(s: RefStore, name: string, oldOid, newOid: Oid, msg: string) =
   ## it off still expects the logs they already have to stay coherent.
   let path = s.reflogPath(name)
   let exists = fileExists(path)
-  if not exists and not s.shouldAutocreateReflog(name): return
+  if not exists and not force and not s.shouldAutocreateReflog(name): return
   if not exists: createDir(parentDir(path))
 
   var line = $oldOid & " " & $newOid & " " & $s.identFn()
@@ -445,6 +446,9 @@ type
                           ## nowhere would lose the rename.
     haveLogOld*: bool
     noDeref*: bool        ## act on this ref itself, not on what it points at
+    forceLog*: bool       ## write a reflog whatever the policy says.  `stash`
+                          ## is the case: the stack of stashes *is* the reflog
+                          ## of `refs/stash`, so it cannot be optional
     msg*: string          ## reflog reason
 
   RefLock = object
@@ -469,6 +473,7 @@ type
     content: string   ## bytes to write; empty when nothing is written
     delete: bool
     verifyOnly: bool  ## locked and checked, but left exactly as it was
+    forceLog: bool
     msg: string
 
   RefTransaction* = ref object
@@ -685,7 +690,7 @@ proc prepare*(tx: RefTransaction) =
 
   try:
     for u in tx.updates:
-      var p = Plan(msg: u.msg, target: u.name)
+      var p = Plan(msg: u.msg, target: u.name, forceLog: u.forceLog)
 
       # Following a symbolic ref is the default for *every* kind of update:
       # `update-ref HEAD <oid>` moves the branch HEAD names rather than turning
@@ -748,7 +753,7 @@ proc prepare*(tx: RefTransaction) =
     # prevent -- and the identity is the one input that can fail this late.
     for p in tx.plans:
       if not p.delete and not p.verifyOnly and
-         (s.willWriteReflog(p.target) or
+         (p.forceLog or s.willWriteReflog(p.target) or
           (p.alias.len > 0 and s.willWriteReflog(p.alias))):
         discard s.identFn()
         break
@@ -800,7 +805,8 @@ proc commit*(tx: RefTransaction) =
       if p.alias.len > 0: s.appendReflog(p.alias, p.before, nullOid, p.msg)
       continue
     let after = s.resolveRef(p.target).oid
-    if not p.noop: s.appendReflog(p.target, p.logBefore, after, p.msg)
+    if not p.noop: s.appendReflog(p.target, p.logBefore, after, p.msg,
+                                  force = p.forceLog)
     if p.alias.len > 0:
       s.appendReflog(p.alias, p.before, after, p.msg)
 
@@ -821,7 +827,7 @@ template withTransaction(store: RefStore, tx, body: untyped) =
 
 proc updateRef*(s: RefStore, name: string, newOid: Oid, oldOid = nullOid,
                 checkOld = false, msg = "", logOld = nullOid,
-                haveLogOld = false, noDeref = false) =
+                haveLogOld = false, noDeref = false, forceLog = false) =
   ## Point `name` at `newOid`, following it if it is a symbolic ref.
   ##
   ## `noDeref` is what detaches HEAD: writing an object ID *into* HEAD rather
@@ -829,7 +835,8 @@ proc updateRef*(s: RefStore, name: string, newOid: Oid, oldOid = nullOid,
   withTransaction(s, tx):
     tx.add RefUpdate(kind: ruSet, name: name, newOid: newOid,
                      oldOid: oldOid, haveOldOid: checkOld, msg: msg,
-                     logOld: logOld, haveLogOld: haveLogOld, noDeref: noDeref)
+                     logOld: logOld, haveLogOld: haveLogOld, noDeref: noDeref,
+                     forceLog: forceLog)
 
 proc deleteRef*(s: RefStore, name: string, oldOid = nullOid, checkOld = false,
                 noDeref = false, msg = "") =

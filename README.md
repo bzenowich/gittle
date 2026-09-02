@@ -10,13 +10,14 @@ share a repository with real git, and plausible in a busybox-class environment.
   pushes to a git host, and does not host one.
 - **One static binary**, busybox-style `argv[0]` dispatch. Only external
   dependency is the system zlib.
-- **Small enough to read in an afternoon** — around 10 kloc of Nim.
+- **Small enough to read in an afternoon** — 10.8 kloc of Nim today, and
+  ~13 projected for the whole of v1.
 
 ## Status
 
-**Phases 1–6 complete: the object store, refs and config, the index and
-trees, the first commit, diff, and history.** Thirty commands work and agree
-with real git. `gittle init`, `gittle add .`, `gittle commit` produces a
+**Phases 1–7 complete: the object store, refs and config, the index and
+trees, the first commit, diff, history, and merge.** Thirty-six commands work
+and agree with real git. `gittle init`, `gittle add .`, `gittle commit` produces a
 repository real git continues in without noticing — identical commit objects,
 reflogs and index — and `gittle log` reproduces git's output over 20,000
 commits of the repository next door. `git fsck --strict` is clean after
@@ -37,14 +38,29 @@ and every mutating command is tested by running it in two copies of a
 repository and comparing every ref, reflog, config line, index entry and file
 either tool wrote.
 
+Phase 7 is the merge: one algorithm behind five commands. `merge`,
+`cherry-pick`, `revert`, `rebase` and `stash` differ only in *which three
+trees* they hand the three-way merge and what they write afterwards, so the
+phase is three modules — the file merge (`xdiff/xmerge.c`), the tree merge
+(`merge-ort.c` without renames) and the in-progress state on disk — and five
+thin commands over them. **400 random three-way file merges come out
+byte-identical to git's**, conflict markers included, and every conflicted
+merge, pick, rebase and stash is checked by running it in two copies of a
+repository and comparing not only the refs, index and files but *every
+in-progress marker* and *each tool's own `status`* — because half of what
+these commands write is state for the next command to continue from. A merge
+gittle stopped is concluded by `git commit`; a cherry-pick git stopped is
+continued by `gittle cherry-pick --continue`.
+
 `grep` and `log --grep` use libc's POSIX regex rather than a vendored engine —
 which is what git itself does, and what turned a 500-line budget line into 45.
 
-8,960 lines of code so far, against an original sketch of ~9,000 for the whole
+10,756 lines of code so far, against an original sketch of ~9,000 for the whole
 of v1. That sketch is now a measurement rather than a limit: the server was cut
 (it is the one phase with no client-side benefit), the rest is accepted at an
-estimated ~12,300, and an optimisation and refactoring pass comes once v1 is
-feature-complete. [`docs/plan.md`](docs/plan.md) §5.1 has the numbers.
+estimated ~13,000, and an optimisation and refactoring pass comes once v1 is
+feature-complete. [`docs/plan.md`](docs/plan.md) §5.1 and §5.2 have the
+numbers.
 
 - [`docs/plan.md`](docs/plan.md) — goals, the eight design rules, scope,
   budget, the ten decisions, build order. **Read this first.**
@@ -52,8 +68,8 @@ feature-complete. [`docs/plan.md`](docs/plan.md) §5.1 has the numbers.
   environment, and what finishing a phase requires.
 - [`docs/phase-1.md`](docs/phase-1.md), [`docs/phase-2.md`](docs/phase-2.md),
   [`docs/phase-3.md`](docs/phase-3.md), [`docs/phase-4.md`](docs/phase-4.md),
-  [`docs/phase-5.md`](docs/phase-5.md), [`docs/phase-6.md`](docs/phase-6.md) —
-  the finished phases: what was built, what it was verified against, what was
+  [`docs/phase-5.md`](docs/phase-5.md), [`docs/phase-6.md`](docs/phase-6.md),
+  [`docs/phase-7.md`](docs/phase-7.md) — the finished phases: what was built, what it was verified against, what was
   left for later, and where the budget stands.
 - [`docs/README.md`](docs/README.md) — index to the feature inventory
   (`01`–`15`), where every git command and option is marked in or out of scope.
@@ -71,11 +87,12 @@ tests/oracle.sh --full   # ... over every object in the reference repository
 
 The tests prefer a `git` built from the reference checkout above this one over
 whatever is on `PATH`, because the installed one may be years older than the
-tree it is being asked to explain. They also pass git the four options that
-select the behavior gittle deliberately does not implement — `--no-renames`,
-`--minimal`, `--diff-merges=off` and `--no-use-mailmap` — so that each
-divergence is *tested* rather than merely absent. [`docs/phase-5.md`](docs/phase-5.md)
-lists them with the reasoning.
+tree it is being asked to explain. They also pass git the options that select
+the behavior gittle deliberately does not implement — `--no-renames`,
+`--minimal`, `--diff-merges=off`, `--no-use-mailmap`, and
+`--diff-algorithm=minimal` for `merge-file` — so that each divergence is
+*tested* rather than merely absent. [`docs/phase-5.md`](docs/phase-5.md) and
+[`docs/phase-7.md`](docs/phase-7.md) list them with the reasoning.
 
 ## Layout
 
