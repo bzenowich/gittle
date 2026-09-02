@@ -24,8 +24,6 @@ proc testDiff() =
     let a = paramStr(i)
     case a
     of "-w", "--ignore-all-space": ws = wsIgnoreAll
-    of "-b", "--ignore-space-change": ws = wsIgnoreChange
-    of "--ignore-space-at-eol": ws = wsIgnoreEol
     of "--ignore-cr-at-eol": ws = wsIgnoreCr
     else:
       if a.startsWith("-U"): ctx = parseInt(a[2 .. ^1])

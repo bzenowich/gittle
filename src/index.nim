@@ -46,13 +46,10 @@ import objects, oid, sha1, util
 
 const
   indexSignature = "DIRC"
-  entryHeaderLen = 62   ## the fixed part: 10 * 4 bytes of stat, 20 of OID, 2 of flags
   flagExtended = 0x4000'u16
-  flagValid = 0x8000'u16
   flagStageMask = 0x3000'u16
   flagNameMask = 0x0FFF'u16
   extFlagSkipWorktree = 0x2000'u16
-  extFlagIntentToAdd = 0x1000'u16
 
 type
   IndexEntry* = object

@@ -57,8 +57,7 @@ proc readState*(repo: Repository, name: string): string =
   ## The contents of a state file, or the empty string when there is none.
   ## Absence is the normal case and not an error, which is why this is not
   ## `readWholeFile`.
-  let p = repo.statePath(name)
-  if fileExists(p): readFile(p) else: ""
+  readIfExists(repo.statePath(name))
 
 proc writeState*(repo: Repository, name, data: string) =
   ## Write a state file, creating its directory.

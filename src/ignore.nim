@@ -152,9 +152,8 @@ proc readPatternList(path, base, src: string): PatternList =
   ## name for `check-ignore -v` to report.
   result.base = base
   result.src = src
-  if not fileExists(path): return
   var lineNo = 0
-  for rawLine in readWholeFile(path).split('\n'):
+  for rawLine in readIfExists(path).split('\n'):
     inc lineNo
     var line = rawLine
     if line.endsWith("\r"): line.setLen(line.len - 1)

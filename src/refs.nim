@@ -180,10 +180,9 @@ proc loadPackedRefs(s: RefStore) =
   ## at this scale and removes a way to be wrong about someone else's file.
   if s.packedLoaded: return
   s.packedLoaded = true
-  let path = s.packedRefsPath
-  if not fileExists(path): return
+  let path = s.packedRefsPath   # named in every error message below
   var lineNo = 0
-  for line in readWholeFile(path).splitLines:
+  for line in readIfExists(path).splitLines:
     inc lineNo
     if line.len == 0: continue
     if line[0] == '#': continue

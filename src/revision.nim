@@ -107,9 +107,7 @@ proc readReflog*(s: RefStore, name: string): seq[ReflogEntry] =
   ## Malformed lines are skipped rather than fatal: a reflog is a convenience
   ## file that any tool may have appended to, and one bad line must not make a
   ## ref unreadable.
-  let path = s.reflogPath(name)
-  if not fileExists(path): return
-  for line in readWholeFile(path).splitLines():
+  for line in readIfExists(s.reflogPath(name)).splitLines():
     if line.len < 2 * OidHexLen + 2: continue
     var e: ReflogEntry
     if not tryParseOid(line[0 ..< OidHexLen], e.oldOid): continue

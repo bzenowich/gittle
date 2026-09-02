@@ -193,8 +193,7 @@ proc globalConfigPath*(): string =
 proc loadConfig*(path: string): Config =
   ## Parse a file, or nothing when it does not exist -- an absent config
   ## file is an empty one.
-  if not fileExists(path): return
-  parseConfig(readWholeFile(path), path)
+  parseConfig(readIfExists(path), path)
 
 proc add*(c: var Config, other: Config) =
   ## Later entries win, which is git's own last-one-wins rule.
@@ -319,13 +318,11 @@ proc setConfigValue*(path, key, value: string) =
   ## or the variable as needed.  An existing variable keeps its line's
   ## indentation and the spelling of its name.
   let k = splitKey(key)
-  var lines: seq[string]
-  if fileExists(path):
-    var text = readWholeFile(path)
-    # `splitLines` on a trailing newline yields a final empty element; drop it
-    # so the file does not gain a blank line every time it is written.
-    if text.len > 0 and text[^1] == '\n': text.setLen(text.len - 1)
-    lines = text.splitLines
+  var text = readIfExists(path)
+  # `splitLines` on a trailing newline yields a final empty element; drop it
+  # so the file does not gain a blank line every time it is written.
+  if text.len > 0 and text[^1] == '\n': text.setLen(text.len - 1)
+  var lines = if text.len > 0: text.splitLines else: @[]
   let scanned = scanLines(lines, path)
 
   var lastMatch = -1

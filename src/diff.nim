@@ -60,11 +60,14 @@ type
   WsMode* = enum
     ## The whitespace comparison flags, strongest first.  git checks them in
     ## this order and the first one set wins (`xutils.c:xdl_recmatch`), so one
-    ## enum says everything four booleans would.
+    ## enum says everything three booleans would.
+    ##
+    ## git has two more, `-b` and `--ignore-space-at-eol`; they were cut in the
+    ## second minimisation pass (docs/minimize-2.md §B4) because neither
+    ## appears in the tool-call logs, while `-w` and `--ignore-cr-at-eol` do
+    ## and are kept.  Both cut spellings refuse by name in `diffOptions`.
     wsExact          ## bytes must match
     wsIgnoreCr       ## --ignore-cr-at-eol
-    wsIgnoreEol      ## --ignore-space-at-eol
-    wsIgnoreChange   ## -b
     wsIgnoreAll      ## -w
 
 const spaceChars = {' ', '\t', '\n', '\v', '\f', '\r'}
@@ -76,32 +79,15 @@ func normalize(line: string, ws: WsMode): string =
   ##
   ## git compares character by character with the flag's rule inline; gittle
   ## rewrites each line once into a canonical form and compares those, which is
-  ## equivalent in all four modes and lets a hash table do the work:
+  ## equivalent in both modes and lets a hash table do the work:
   ##
   ## * `-w` -- every whitespace byte removed;
-  ## * `-b` -- each run of whitespace collapsed to one space, trailing dropped.
-  ##   The run must exist on *both* sides, which is why it collapses to a space
-  ##   rather than to nothing;
-  ## * `--ignore-space-at-eol` -- trailing whitespace dropped;
   ## * `--ignore-cr-at-eol` -- one trailing `\r` dropped.
   case ws
   of wsExact:
     line
   of wsIgnoreCr:
     if line.len > 0 and line[^1] == '\r': line[0 ..< line.high] else: line
-  of wsIgnoreEol:
-    line.strip(leading = false, chars = spaceChars)
-  of wsIgnoreChange:
-    var s = ""
-    var i = 0
-    while i < line.len:
-      if line[i] in spaceChars:
-        while i < line.len and line[i] in spaceChars: inc i
-        if i < line.len: s.add ' '     # a trailing run is dropped outright
-      else:
-        s.add line[i]
-        inc i
-    s
   of wsIgnoreAll:
     var s = ""
     for c in line:
@@ -118,8 +104,6 @@ func nrec(s: Side): int = s.lo.len
 
 func line(s: Side, i: int): string = s.text[s.lo[i] ..< s.hi[i]]
 
-func terminated(s: Side, i: int): bool = s.hi[i] < s.text.len
-  ## Did line `i` end with a newline?  Only the last line can fail to.
 
 func splitLines(text: string, s: var Side) =
   ## git's line splitting: a line ends at `\n` or at the end of the buffer, and
