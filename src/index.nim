@@ -189,11 +189,10 @@ proc skipExtensions(r: var Reader, endAt: int) =
     if sig[0] notin {'A' .. 'Z'}:
       case sig
       of "link":
-        fail("this index is split, which gittle does not read\n" &
-             "  Undo it with real git:  git update-index --no-split-index")
+        fail("this index is split; undo it with 'git update-index --no-split-index'")
       of "sdir":
-        fail("this index uses sparse directory entries, which gittle does " &
-             "not read\n  Expand it with real git:  git sparse-checkout disable")
+        fail("this index uses sparse directory entries; expand it with " &
+             "'git sparse-checkout disable'")
       else:
         fail("unknown required index extension '" & sig & "'")
     r.pos += size
@@ -333,9 +332,8 @@ proc writeIndex*(idx: Index) =
   let fd = open(lockPath.cstring, O_WRONLY or O_CREAT or O_EXCL, 0o666.Mode)
   if fd < 0:
     if errno == EEXIST:
-      fail("cannot lock the index: " & lockPath & " already exists\n" &
-           "  another gittle or git process may be running, or a previous " &
-           "one crashed")
+      fail("cannot lock the index: " & lockPath &
+           " exists -- another process holds it, or one crashed and left it")
     fail("cannot lock the index: " & $strerror(errno))
   discard close(fd)
   try:

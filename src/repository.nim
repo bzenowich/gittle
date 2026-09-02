@@ -27,6 +27,7 @@ type
     packsLoaded: bool
     packs: seq[Pack]
     refStoreCache: RefStore
+    abbrevCache: int     ## `autoAbbrev`'s answer once computed; 0 = not yet
 
 # -- discovery --------------------------------------------------------------
 
@@ -85,9 +86,8 @@ const
     ("objectformat",       "sha1",
       "gittle implements SHA-1 only (plan.md R4)."),
     ("refstorage",         "files",
-      "gittle supports only the 'files' ref backend.\n" &
-      "  Convert with real git:  git refs migrate --ref-format=files\n" &
-      "  (that command cannot migrate a repository that has worktrees)"),
+      "gittle supports only the 'files' ref backend; convert with " &
+      "'git refs migrate --ref-format=files', which needs no worktrees"),
     ("compatobjectformat", noValue,
       "gittle cannot read a dual-hash repository."),
     ("partialclone",       noValue,
@@ -140,12 +140,12 @@ proc loadObjDirs(r: Repository) =
   ## them.)
   r.objDirs = @[r.commonDir / "objects"]
   # objects/info/alternates: one directory per line, relative to objects/.
-  let altFile = r.objDirs[0] / "info" / "alternates"
-  if fileExists(altFile):
-    for line in readWholeFile(altFile).splitLines:
-      let s = line.strip()
-      if s.len == 0 or s[0] == '#': continue
-      r.objDirs.add(if isAbsolute(s): s else: r.objDirs[0] / s)
+  # Absent in every repository that was not cloned `--shared`, which is why it
+  # is read through `readIfExists`.
+  for line in readIfExists(r.objDirs[0] / "info" / "alternates").splitLines:
+    let s = line.strip()
+    if s.len == 0 or s[0] == '#': continue
+    r.objDirs.add(if isAbsolute(s): s else: r.objDirs[0] / s)
 
 proc openRepository*(gitDirOpt, workTreeOpt, startDir: string,
                      bareOpt: bool, overrides: Config): Repository =
@@ -174,9 +174,8 @@ proc openRepository*(gitDirOpt, workTreeOpt, startDir: string,
 
   # A linked worktree keeps objects and most refs in the common directory.
   result.commonDir = result.gitDir
-  let commonFile = result.gitDir / "commondir"
-  if fileExists(commonFile):
-    let t = readWholeFile(commonFile).strip()
+  let t = readIfExists(result.gitDir / "commondir").strip()
+  if t.len > 0:
     result.commonDir = (if isAbsolute(t): t else: result.gitDir / t).normalizedPath
 
   # Configuration is a merge, later files winning: the user's own file, then
@@ -225,6 +224,7 @@ proc reopenPacks*(r: Repository) =
   for p in r.packs: p.close()
   r.packs.setLen(0)
   r.packsLoaded = false
+  r.abbrevCache = 0     # the object count changed, so the length may have too
 
 proc findPacked*(r: Repository, o: Oid): tuple[pack: Pack, offset: int] =
   ## Which pack holds the object, and where in it; `(nil, 0)` if none.
@@ -446,12 +446,20 @@ proc autoAbbrev*(r: Repository): int =
   ## are four bits to a hex digit, so the length is ceil((msb + 1) / 2) -- with
   ## a floor of seven (`odb.c`).  On the repository next door, 420,113 objects
   ## give ten, which is what `git ls-tree --abbrev` prints.
+  ##
+  ## Cached, because the count is a directory scan and the answer cannot
+  ## change while a command runs: 23 call sites ask for it, several of them
+  ## once per ref, per reflog entry or per branch in a listing loop.
+  ## `reopenPacks` clears it, since a fetch is the one thing that adds objects
+  ## mid-command.
+  if r.abbrevCache > 0: return r.abbrevCache
   var count = approximateObjectCount(r)
   var msb = -1
   while count > 0:
     inc msb
     count = count shr 1
-  result = max((msb + 1 + 1) div 2, fallbackAbbrev)
+  r.abbrevCache = max((msb + 1 + 1) div 2, fallbackAbbrev)
+  r.abbrevCache
 
 proc uniqueAbbrev*(r: Repository, o: Oid, minLen: int): string =
   ## The shortest prefix of `o` that is at least `minLen` digits and names no

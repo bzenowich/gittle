@@ -88,9 +88,8 @@ proc writeTree*(repo: Repository, idx: Index): Oid =
   ## An unmerged entry is refused: a path with three stages has no single
   ## content, so there is no tree to write.  git says the same thing.
   for e in idx.entries:
-    failIf(e.stage != 0,
-           "cannot write a tree: '" & e.path & "' is unmerged\n" &
-           "  resolve the conflict and stage the result first")
+    failIf(e.stage != 0, "cannot write a tree: '" & e.path &
+           "' is unmerged; resolve the conflict and stage the result")
     failIf(e.path.startsWith("/") or e.path.contains("//") or
            e.path.endsWith("/"),
            "cannot write a tree: malformed path '" & e.path & "'")

@@ -54,13 +54,11 @@ proc cmdLsFiles*(c: Ctx, args: seq[string]): int =
   let repo = c.repo
   let ps = parsePathspec(specs, repo.prefix, implicitPrefix = true)
   let idx = readIndex(repo.indexPath)
-  let terminator = if nulTerminated: '\0' else: '\n'
   var matched: seq[string]
 
   proc emit(shown: string) =
-    ## One name, NUL- or newline-terminated, quoted unless `-z`.
-    stdout.write(if nulTerminated: shown else: quotePath(shown))
-    stdout.write terminator
+    ## One name as an output field: `util.pathField` holds the `-z` rule.
+    stdout.write pathField(shown, nulTerminated)
 
   if showCached or showStage:
     for e in idx.entries:

@@ -90,6 +90,27 @@ proc quotePath*(path: string): string =
   if not needsQuote(path): return path
   "\"" & quoteBody(path) & "\""
 
+proc pathField*(path: string, nulTerminated: bool): string =
+  ## A path as an *output field*: the whole thing, terminator included.
+  ##
+  ## Every gittle command that prints paths obeys the same two rules, and they
+  ## are a pair -- `-z` makes the terminator a NUL **and** turns the quoting
+  ## off, because a NUL already delimits unambiguously and quoting on top of it
+  ## would only make the bytes harder to read back.  Keeping the pair in one
+  ## place is what stops a command from acquiring one half of `-z` and not the
+  ## other.
+  if nulTerminated: path & "\0" else: quotePath(path) & "\n"
+
+func hexVal*(c: char): int {.inline.} =
+  ## The value of one hex digit, or -1 for anything else.  Both cases are
+  ## wanted: an object ID is 40 of these and a `%xx` escape is two, and in both
+  ## places a non-digit is a parse failure the caller reports its own way.
+  case c
+  of '0'..'9': ord(c) - ord('0')
+  of 'a'..'f': ord(c) - ord('a') + 10
+  of 'A'..'F': ord(c) - ord('A') + 10
+  else: -1
+
 proc interpolate*(format: string, atom: proc (name: string): string): string =
   ## Expand a git-style format string.
   ##
@@ -112,16 +133,11 @@ proc interpolate*(format: string, atom: proc (name: string): string): string =
       i = close + 1
     else:
       failIf(i + 2 >= format.len, "unterminated % in format string")
-      var v = 0
-      for c in format[i+1 .. i+2]:
-        let d = case c
-                of '0'..'9': ord(c) - ord('0')
-                of 'a'..'f': ord(c) - ord('a') + 10
-                of 'A'..'F': ord(c) - ord('A') + 10
-                else: -1
-        failIf(d < 0, "bad %-escape '%" & format[i+1 .. i+2] & "' in format string")
-        v = v * 16 + d
-      result.add char(v)
+      let hi = hexVal(format[i+1])
+      let lo = hexVal(format[i+2])
+      failIf(hi < 0 or lo < 0,
+             "bad %-escape '%" & format[i+1 .. i+2] & "' in format string")
+      result.add char(hi shl 4 or lo)
       i += 3
 
 proc dateNow*(): int64 =
@@ -144,6 +160,26 @@ proc readWholeFile*(path: string): string =
     result = readFile(path)
   except IOError, OSError:
     fail("cannot read '" & path & "': " & getCurrentExceptionMsg())
+
+proc readIfExists*(path: string): string =
+  ## The file's contents, or the empty string when there is no such file.
+  ##
+  ## Most of the files gittle reads under `.git` are *optional*: there is no
+  ## `packed-refs` until something packs refs, no reflog until a ref moves, no
+  ## `objects/info/alternates` unless a clone was shared, and an absent config
+  ## file is an empty one.  Absence is the ordinary state, not an error, so
+  ## these are read through here rather than through `readWholeFile`.
+  ##
+  ## A file that disappears *between* the test and the read counts as absent
+  ## too.  That is a real race and not a theoretical one -- another process
+  ## running `git pack-refs` replaces a loose ref with an entry in
+  ## `packed-refs`, and git's own ref reader treats the resulting `ENOENT` the
+  ## same way (`refs/files-backend.c:parse_loose_ref_contents` callers).
+  if not fileExists(path): return ""
+  try:
+    readFile(path)
+  except IOError, OSError:
+    ""
 
 var tmpSeq = 0
 

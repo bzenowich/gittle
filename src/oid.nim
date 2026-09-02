@@ -59,14 +59,6 @@ func `$`*(o: Oid): string =
     result[i*2] = hexChars[int(o.b[i] shr 4)]
     result[i*2+1] = hexChars[int(o.b[i] and 0x0F)]
 
-func hexVal(c: char): int {.inline.} =
-  ## The value of a hex digit, or -1.
-  case c
-  of '0'..'9': ord(c) - ord('0')
-  of 'a'..'f': ord(c) - ord('a') + 10
-  of 'A'..'F': ord(c) - ord('A') + 10
-  else: -1
-
 func tryParseOid*(s: string, o: var Oid): bool =
   ## Strict: exactly 40 hex digits.
   if s.len != OidHexLen: return false

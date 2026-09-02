@@ -61,7 +61,6 @@ proc cmdLsTree*(c: Ctx, args: seq[string]): int =
   let root = repo.resolveTree(rest[0])
   let paths = rest[1 .. ^1]
   if abbrevLen < 0: abbrevLen = repo.autoAbbrev()
-  let terminator = if nulTerminated: '\0' else: '\n'
 
   # `-d -r` together imply `-t`, since otherwise they would print nothing.
   if dirsOnly and recurse: showTrees = true
@@ -88,9 +87,10 @@ proc cmdLsTree*(c: Ctx, args: seq[string]): int =
     if kind == otTree and descend(e) and not showTrees: continue
     if not matchesPaths(e.name, e.mode, paths): continue
 
-    let shown = if nulTerminated: e.name else: quotePath(e.name)
+    # `util.pathField` holds the `-z` rule: NUL terminator and no quoting.
+    let shown = pathField(e.name, nulTerminated)
     if nameOnly:
-      stdout.write shown, terminator
+      stdout.write shown
       continue
     stdout.write formatMode(e.mode), " ", $kind, " "
     stdout.write(if abbrevLen > 0: repo.uniqueAbbrev(e.oid, abbrevLen)
@@ -98,6 +98,6 @@ proc cmdLsTree*(c: Ctx, args: seq[string]): int =
     if long:
       let size = if kind == otBlob: $repo.objectInfo(e.oid).size else: "-"
       stdout.write " ", align(size, 7)
-    stdout.write "\t", shown, terminator
+    stdout.write "\t", shown
   stdout.flushFile()
   0

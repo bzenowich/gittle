@@ -48,7 +48,7 @@
 ## *not*: a tree comparison, not a diff.  Nothing here is phase 5.
 
 import std/[algorithm, heapqueue, sets, tables]
-import commitobj, oid, objects, pathspec, repository
+import commitobj, oid, objects, pathspec, repository, trees
 
 const slopSize = 5
   ## `revision.c:SLOP` -- how many uninteresting pops to keep going for
@@ -199,36 +199,33 @@ proc start*(w: RevWalk, o: Oid, uninteresting = false, left = false) =
 # *which objects are on this side and not on that one* -- so the two halves of
 # the answer live here rather than in any one of them.
 
-proc collectTree*(repo: Repository, root: Oid, seen: var HashSet[Oid]) =
-  ## Every tree and blob under `root`, marked as seen and not reported.  This
-  ## is the *excluded* side: what the other end already has.
-  if root in seen: return
-  seen.incl root
-  for e in treeEntries(repo.readObject(root).data):
-    if modeType(e.mode) == otTree: repo.collectTree(e.oid, seen)
-    elif modeType(e.mode) != otCommit: seen.incl e.oid
-
 proc walkObjects*(repo: Repository, root: Oid, path: string,
                   seen: var HashSet[Oid],
-                  emit: proc (o: Oid, p: string) {.closure.}) =
+                  emit: proc (o: Oid, p: string) {.closure.} = nil) =
   ## Pre-order, in tree-entry order: the tree itself, then each entry, a
   ## subtree fully before its next sibling (`list-objects.c:process_tree`).
   ##
   ## That order is not decorative.  Each object is reported with the **path it
   ## was found at**, and a packer reads the resulting sequence as a hint that
   ## neighbours will delta well against each other.
+  ##
+  ## `emit = nil` walks the *excluded* side: mark everything under `root` seen
+  ## and report none of it.  That is what `edgeTrees` wants -- "the other end
+  ## already has all of this" -- and it is the same traversal, so it is not a
+  ## second proc.  A gitlink is skipped either way: it names a commit in
+  ## another repository, which is not ours to send or to claim.
   if root in seen: return
   seen.incl root
-  emit(root, path)
+  if emit != nil: emit(root, path)
   for e in treeEntries(repo.readObject(root).data):
     let full = if path.len == 0: e.name else: path & "/" & e.name
     case modeType(e.mode)
     of otTree: repo.walkObjects(e.oid, full, seen, emit)
-    of otCommit: discard        # a gitlink names a commit in another repository
+    of otCommit: discard
     else:
       if e.oid notin seen:
         seen.incl e.oid
-        emit(e.oid, full)
+        if emit != nil: emit(e.oid, full)
 
 proc edgeTrees*(repo: Repository, w: RevWalk, commits: seq[Oid],
                 seen: var HashSet[Oid]) =
@@ -240,7 +237,7 @@ proc edgeTrees*(repo: Repository, w: RevWalk, commits: seq[Oid],
   for o in commits:
     for p in repo.readCommit(o).parents:
       if w.isUninteresting(p):
-        repo.collectTree(repo.readCommit(p).tree, seen)
+        repo.walkObjects(repo.readCommit(p).tree, "", seen)
 
 # ---------------------------------------------------------------------------
 # Comparing two trees under a pathspec
@@ -252,13 +249,13 @@ proc anyMatchingUnder(repo: Repository, tree: Oid, prefix: string,
   ## is a directory on one side and absent (or a file) on the other: the whole
   ## subtree appeared or vanished, and whether that counts depends on what is
   ## inside it.
-  for e in treeEntries(repo.readObject(tree).data):
-    let path = prefix & e.name
-    if modeType(e.mode) == otTree:
-      if ps.mightMatchDir(path) and repo.anyMatchingUnder(e.oid, path & "/", ps):
-        return true
-    elif ps.matches(path):
-      return true
+  ##
+  ## `walkTree` yields full paths and takes the descend decision as a
+  ## predicate, so the pruning is `mightMatchDir` and nothing else has to be
+  ## written: a directory the pathspec cannot reach into is never read.
+  for e in repo.walkTree(tree, prefix,
+                         proc (d: TreeEntry): bool = ps.mightMatchDir(d.name)):
+    if modeType(e.mode) != otTree and ps.matches(e.name): return true
 
 proc treesDiffer*(repo: Repository, a, b: Oid, ps: Pathspec,
                   prefix = ""): bool =
