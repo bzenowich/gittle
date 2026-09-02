@@ -205,21 +205,49 @@ explaining why `T` exists, which is the ratio this project says it wants.
 
 ## 5. Tier B — structural, the accepted precedents extended
 
-### B1. `grep` becomes `grep(1)` — **−190**
+### B1. `grep` becomes `grep(1)` — **REJECTED. Built, measured, reverted.**
 
-`regex.nim` (85) has exactly one consumer in the project: `cmd/grep.nim`
-(152). Building the tracked-path list from the index and exec'ing
-`grep -E` with it is about 45 lines.
+The premise was that `regex.nim` (85) has exactly one consumer, `cmd/grep.nim`
+(152), so exec'ing the system `grep` would turn 237 lines into ~45.
 
-This is the argument that already won for `diff` in the first pass
-(decision 4), and here it is *stronger*, because it is a fidelity gain
-rather than a stated loss: the user gets the POSIX ERE engine their shell
-has, instead of gittle's approximation of it. busybox has `grep -E`.
+**The premise was false.** `regex.nim` has *two* consumers: `src/cmd/log.nim`
+imports it for `--grep` / `--author` / `--committer`. The measurement that
+said otherwise missed it because the import sits on a *continuation line* of a
+multi-line `import`, so the line carries neither the word `import` nor
+`regex.`. `log`'s limiters need an in-process matcher, so the engine cannot
+go, and only the command could be converted.
 
-What it costs: `--cached` and tree-argument search need the blobs spilled to
-a temp directory before `grep` can see them (`$GIT_DIR` already has a
-temp-file helper, used for lock files), or those two forms get cut. 13 uses
-in the logs, and none of them is `--cached`.
+It was built anyway, and measured on all three greps. The result:
+
+| | |
+|---|---|
+| lines | `grep.nim` 152 → 186, `regex.nim` 85 → 49. **Net −2.** |
+| what the command's bulk actually is | the option table, option unpacking, and tree/index/pathspec blob selection — ~110 of 152 lines, untouched by the change |
+| new runtime dependency | `grep(1)`, a third after zlib and `diff(1)` |
+| new cost | one fork per invocation, and *every searched blob concatenated into one temp file* — the only portable way to keep paths out of grep's output, since `--null`/`-Z` is GNU-only. `gittle grep` over the reference repository writes 48 MB to disk |
+| new divergence | under ugrep, 6 of 20 ERE patterns disagree with git: empty-matching patterns (`a?`, `x*`, `a**`, `a|`) select every line under POSIX and only non-empty matches under ugrep, and ugrep rejects a bare `)` and `(|x)b`, which POSIX ERE accepts. No portable flag fixes it — `ugrep -Y` restores POSIX behaviour and both GNU and busybox reject `-Y` |
+
+−2 lines for a third dependency, a 48 MB temp file and an engine that gives
+different answers depending on which `grep` is installed. Rejected.
+
+**Kept from the attempt:** the `regex.nim` trim, 85 → 49 — `-w` was refused by
+both callers, so `Regex.word`, `wordChar` and the boundary test were
+unreachable, and `-F` folds into the compiler so there is one search routine
+rather than a regex one beside a memmem one. **−36, landed.**
+
+**What this says about the `diff(1)` precedent.** It does not transfer.
+`diff.nim`'s engine had no second consumer and its bulk *was* the algorithm;
+`grep.nim`'s bulk is option and blob-selection surface, and its engine is
+shared. "Exec the Unix tool" is worth testing case by case, not generalising:
+the deciding question is whether the engine is the bulk and whether anything
+else needs it in-process.
+
+**The portability requirement was worth imposing even so.** Testing against
+GNU 3.11, busybox 1.36 and ugrep is what surfaced the ERE divergence, the
+output-ordering hazard (ugrep searches in parallel and returns files out of
+order) and the three incompatible binary-file reports. Those are the facts
+that turned B1 from "−190" into "rejected", and none of them is visible from
+one implementation.
 
 ### B2. One transport version — **−90**
 
@@ -278,7 +306,9 @@ uses are `%(refname)`, `%(refname:short)` and `%(objectname)`). Keep those
 atoms inline, move `--contains`/`--merged` to a three-line `isAncestor`
 filter, drop `--sort` and the rest of the atom grammar.
 
-**Tier B total: −800.**
+**Tier B total: −800** as estimated; **−404 as landed** (B1 rejected at −36
+rather than −190, B2 −83, B3 −24, B5 −121, plus −140 of dead code and folds
+found along the way).
 
 ---
 
@@ -537,3 +567,85 @@ in every package, over less code in the later ones.
 Questions 3–6 are worth answering even under Package A: each is an
 independent scope judgement, and three of the four were taken the other way
 by a pass that had not yet re-measured the logs.
+
+---
+
+## 12. What landed (Package A, 2026-09-02)
+
+Measured the same way as everything above, from the 11,724 baseline. Six
+lanes, each in its own copy of the tree with disjoint file ownership, merged
+one at a time against a green oracle.
+
+| item | estimated | landed | notes |
+|---|---:|---:|---|
+| B2 transport v0 + A4 one ref report | −190 | **−155** | v2 gone, `pktline` folded in; `fetchFrom` 251 → 108 and `cmdPush` 273 → 95 |
+| B5 delete `reffilter.nim` | −150 | **−121** | the atom grammar and `--sort` cut; `--contains` kept amortised, 22 lines |
+| A3 one pattern matcher | −100 | **−47** | `glob.nim` was *already* the single matcher; `refname.nim` has no glob at all |
+| B1 `grep` → `grep(1)` | −190 | **−36** | rejected as specified (§B1); only the `regex.nim` trim survived |
+| A5 one status renderer | −60 | **−28** | the two renderers shared a skeleton, not their bytes |
+| B3 revision syntax | −120 | **−24** | §B3's figures were physical lines; `<ref>@{<n>}` kept because `stash@{1}` needs it |
+| dead code found on the way | — | **−16** | `clean -e`'s pattern list, the two refname strip helpers |
+| A1 §7.1 leftovers | −200 | *not started* | |
+| A2 one refusal one line | −250 | *not started* | |
+| B4 option surface | −250 | *not started* | |
+| A6 `diffcore` | ? | **−0** | audited; not where the lines are |
+| **total** | **−1,510** | **−423** | **11,724 → 11,301** |
+
+`tests/oracle.sh` 172 passed, 0 failed after every merge.
+
+### What the estimates got wrong, and it is one thing
+
+Four of the six lanes came in at a third to a half of estimate, for the same
+reason each time: **§4 and §5 counted the size of a subsystem, not the size of
+the duplication inside it.** `glob.nim` was already one matcher; `status`'s two
+renderers shared a skeleton and no bytes; `revision`'s figures were physical
+lines including their comments; `regex.nim` had a second consumer nobody
+looked for. The first pass's §9 recorded the same lesson in its own words —
+"every 'delete this' item also deletes the doc comments around it" — and this
+pass repeated it in a new form.
+
+The one lane that beat its own shape (B2/A4, −155) is the one where the
+duplication was real and structural: two protocol versions, and two report
+implementations.
+
+**Consequence for §7.** Tier A + Tier B was priced at −1,510 and Package A
+therefore at 10,214. On the evidence of the six lanes that estimate is
+optimistic by roughly a factor of two for the refactoring items, though the
+three untouched ones (A1, A2, B4) are the most mechanical and least likely to
+disappoint. A realistic Package A is **10,600–10,900**, not 10,214 — which
+makes §6.1's arithmetic worse, not better: 8,000 was already unreachable
+without cutting the merge, and it is further away than the document said.
+
+### Two oracle bugs, both the same shape
+
+Neither was in gittle; both were in the suite, and both had it reporting
+success for comparisons that never ran.
+
+1. **The fan-out helpers were defined below two of their callers.** `log path
+   limiting` (10 pathspecs) and `log --grep/--author` (12 combinations) called
+   them from ~line 1100 against a definition at 1618. bash resolves a function
+   at the point of call, so both loops failed with `command not found`,
+   compared nothing, and reported `ok`.
+2. **A selftest harness that does not compile reported `skipped (no nim)`.**
+   Deleting two genuinely-unused procs broke `tests/selftest.nim`, and the
+   suite silently dropped `sha1` (214 inputs), `glob engine` (27 cases) and
+   `zlib` (8 round trips) while still printing `0 failed`.
+
+Both are now assertions: `fanwait` fails a section that queued comparisons and
+collected none, and a harness that will not compile is a FAIL that prints the
+compiler error. The general lesson is worth keeping: **the suite reports what
+ran, not what didn't**, and every check it can silently stop running is a
+check that will eventually stop running.
+
+A third of the same kind was found by inspection rather than by failure: the
+oracle's `FT=refs/tags/v2.3` matched **nothing** — no trailing `*`, and a path
+prefix must end at a `/` — so `for-each-ref`'s four ancestry filters had
+asserted nothing since they were written.
+
+### One bug in gittle, found by cutting
+
+`looksLikeRev` answered "revision or path?" by resolving and catching
+`GittleError`, which swallowed *refusals* as well as failures to resolve:
+`gittle checkout :/one` reported a pathspec that matched nothing, naming a
+mistake the user had not made. A cut syntax must fail loudly and never resolve
+to something else.
