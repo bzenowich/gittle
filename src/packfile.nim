@@ -67,7 +67,7 @@ type
     packMap: MemFile
     idxMap: MemFile
     pack: ptr UncheckedArray[byte]
-    packLen*: int
+    packLen: int
     idx: ptr UncheckedArray[byte]
     idxLen: int
     nObjects*: int

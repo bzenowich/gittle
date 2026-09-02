@@ -2402,7 +2402,7 @@ fsck_after "$P7/f8" 'printf "1\nX\n3\n" > f; echo u > u; "$GITTLE" stash push -u
 #
 # Every test below runs the real wire protocol.  A local path is not a short
 # cut around it (src/transport.nim): `clone file:///path` forks
-# `git-upload-pack` and speaks pkt-line v2 to it exactly as
+# `git-upload-pack` and speaks pkt-line v0 to it exactly as
 # `clone ssh://host/path` would, so every line of the protocol code is
 # exercised without a server, an account or a network.  `git-upload-pack` and
 # `git-receive-pack` have to be findable by name, so the reference build goes
@@ -2624,6 +2624,34 @@ PREP="$REW"' && git -C '"$P8"'/$(basename $PWD | sed s/a/sa/;) log -1 >/dev/null
 PREP=
 [ $p8ok = 1 ] && { ok; report "push" "$p8n pushes, both ends compared"; } \
               || bad "push"
+
+# The options the transport commands no longer take (docs/minimize-2.md §B4).
+# `branch`, `tag` and `log` each have a trims block and these had none, which
+# is how `clone -v` survived as an option that did *nothing*: it set a field
+# that `remotes.nim` only ever read under `opt.report`, which a clone sets
+# false.  A cut option must refuse and name itself; silently accepting one on
+# a command that writes to someone else's repository is the worst outcome here.
+p8ok=1; p8n=0
+while read -r flag args; do
+  [ -n "$flag" ] || continue
+  p8n=$((p8n+1))
+  ( cd "$P8/a" && "$GITTLE" $args ) >/dev/null 2>"$WORK/p8trim.e" \
+    && { p8ok=0; echo "  $args was accepted"; }
+  grep -qF -- "$flag" "$WORK/p8trim.e" \
+    || { p8ok=0; printf '  %s: refusal does not name %s: %s\n' "$args" "$flag" \
+                 "$(head -1 "$WORK/p8trim.e")"; }
+done <<'TRIMS'
+-v clone -v nosuch
+--verbose clone --verbose nosuch
+--exec clone --exec /x nosuch
+--no-force-with-lease push --no-force-with-lease
+--depth fetch --depth 5
+--depth fetch --depth=5
+--filter fetch --filter=blob:none
+--deepen pull --deepen 2
+TRIMS
+[ $p8ok = 1 ] && { ok; report "transport trims" "$p8n trimmed options refuse by name"; } \
+              || bad "transport trims"
 
 # ------------------------------------------------------------------- pull
 p8ok=1; p8n=0

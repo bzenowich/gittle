@@ -261,8 +261,8 @@ type
     ## A live connection: the child process, the two pipes, and everything the
     ## server said before it was asked anything.
     pid: Pid
-    toRemote*, fromRemote*: Stream
-    caps*: Table[string, string]
+    toRemote, fromRemote: Stream
+    caps: Table[string, string]
     adverts*: seq[RemoteRef]  ## every ref the server has; see `handshake`
     url*: string
 
@@ -389,8 +389,8 @@ proc connect*(url: string, program: string): Conn =
   let u = parseUrl(url)
   case u.kind
   of urUnsupported:
-    fail("gittle speaks ssh and local paths only; '" & u.scheme &
-         "' is not supported\n  " & url)
+    fail("gittle speaks ssh and local paths only, so '" & u.scheme &
+         "' cannot be reached: " & url)
   of urLocal:
     failIf(u.path.len == 0, "no path in remote '" & url & "'")
   of urSsh:
@@ -473,9 +473,8 @@ proc handshake*(c: Conn) =
       # gittle was trying to do.  git's wording, because it is the message a
       # user is most likely to have seen before (`connect.c`).
       if first:
-        fail("Could not read from remote repository.\n\n" &
-             "Please make sure you have the correct access rights\n" &
-             "and the repository exists.")
+        fail("could not read from the remote repository '" & c.url &
+             "': check the access rights, and that the repository is there")
       raise
     if p.kind != pkData: break
     var line = p.data
@@ -486,7 +485,7 @@ proc handshake*(c: Conn) =
       # anyway, say so rather than failing later on an unparsable ref line.
       failIf(line.startsWith("version "),
              "the remote answered protocol '" & line["version ".len .. ^1] &
-             "'; gittle speaks v0 only\n  " & c.url)
+             "' and gittle speaks v0 only: " & c.url)
       # The first ref line carries the capabilities after a NUL.
       let nul = line.find('\0')
       if nul >= 0:
@@ -521,8 +520,8 @@ proc handshake*(c: Conn) =
   # capability is absent on servers old enough not to have the notion, which
   # means sha1 by definition.
   failIf(c.caps.getOrDefault("object-format", "sha1") != "sha1",
-         "the remote uses the '" & c.caps["object-format"] &
-         "' object format; gittle implements SHA-1 only\n  " & c.url)
+         "the remote's object format is '" & c.caps["object-format"] &
+         "' and gittle implements SHA-1 only: " & c.url)
 
 # ---------------------------------------------------------------------------
 # fetch

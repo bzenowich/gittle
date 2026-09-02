@@ -1,8 +1,11 @@
 ## `clone` -- a new repository from an existing one.
 ##
 ## In scope (docs/06): `<repository>`, `<directory>`, `-o`/`--origin`,
-## `-b`/`--branch`, `-n`/`--no-checkout`, `--bare`, `-q`, `-v`,
-## `-u`/`--upload-pack`.  Everything shallow, partial, submodule, template,
+## `-b`/`--branch`, `-n`/`--no-checkout`, `--bare`, `-q`,
+## `-u`/`--upload-pack`.  `-v` is cut and refused by name: a clone creates
+## every ref it writes, so there are no "already up to date" ones for a
+## verbose report to add, and the progress on screen is the *server's*, read
+## off the side band (docs/minimize-2.md §B4).  Everything shallow, partial, submodule, template,
 ## sparse or reference-borrowing is cut, and so is `--local`: gittle has one
 ## transport and uses it for local paths too
 ## ([transport.nim](../transport.nim) says why).
@@ -45,7 +48,7 @@ proc directoryFor(url: string): string =
   s
 
 proc cloneInto(c: Ctx, gitDir, dir, url, origin, branchArg, uploadPack: string,
-               bare, noCheckout, quiet, verbose: bool) =
+               bare, noCheckout, quiet: bool) =
   ## Everything after `init`: write the remote's configuration, fetch,
   ## point HEAD where the remote's points, and check out unless told not to.
   # The remote, before the fetch, so that the fetch reads its refspec from the
@@ -67,7 +70,7 @@ proc cloneInto(c: Ctx, gitDir, dir, url, origin, branchArg, uploadPack: string,
                    specs: @[parseRefspec(fetchSpec, forPush = false)])
   # A clone takes the tags too -- the refspec above covers branches only, and
   # every tag pointing into the history it brings comes along with it.
-  var opt = FetchOpts(quiet: quiet, verbose: verbose, uploadPack: uploadPack,
+  var opt = FetchOpts(quiet: quiet, uploadPack: uploadPack,
                       report: false, writeFetchHead: false, noReflog: true,
                       autoTags: true)
   let fetched = repo.fetchFrom(rem, opt)
@@ -154,9 +157,10 @@ const
     opt("-b|--branch", okValue, arg = "<name>", help = "check out this branch (or tag) instead of the remote's HEAD"),
     opt("-n|--no-checkout", help = "do not check out a working tree"),
     opt("--bare", help = "create a bare repository"),
-    opt("-u|--upload-pack|--exec", okValue, arg = "<exec>", help = "the command to run on the far end"),
+    opt("-u|--upload-pack", okValue, arg = "<exec>", help = "the command to run on the far end"),
     opt("-q|--quiet", help = "report nothing but errors"),
-    opt("-v|--verbose", help = "report more"),
+    opt("-v|--verbose", okRefused,
+        help = "a clone's progress is the server's, and every ref it writes is new"),
     opt("--mirror|--sparse|--separate-git-dir|--template|--reference|--dissociate|" &
         "--recurse-submodules|--single-branch|--no-single-branch|-l|--local|--no-hardlinks|" &
         "-s|--shared|--revision|--ref-format|--bundle-uri", okRefused, help = "docs/06"),
@@ -174,7 +178,6 @@ proc cmdClone*(c: Ctx, args: seq[string]): int =
   let bare = c.bare or o.has "bare"
   let noCheckout = o.has "no-checkout"
   let quiet = o.has "quiet"
-  let verbose = o.has "verbose"
   let positional = o.args
   failIf(positional.len == 0 or positional.len > 2, o.use)
   failIf(not isValidRefname(refsPrefix & "remotes/" & origin & "/x"),
@@ -204,7 +207,7 @@ proc cmdClone*(c: Ctx, args: seq[string]): int =
   # calls this its "junk" and removes it the same way.
   try:
     cloneInto(c, gitDir, dir, url, origin, branchArg, uploadPack,
-              bare, noCheckout, quiet, verbose)
+              bare, noCheckout, quiet)
   except CatchableError:
     removeDir(gitDir)
     if madeDir: removeDir(dir)

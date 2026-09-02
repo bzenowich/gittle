@@ -18,7 +18,7 @@
 ##   git does.
 
 import std/[sequtils, strutils]
-import ../cli, ../refspec, ../remotes, ../util
+import ../cli, ../refspec, ../remotes
 
 const
   synopsis = "[<options>] [<repository> [<refspec>…]]"
@@ -32,15 +32,13 @@ const
     opt("-v|--verbose", help = "also report refs that were already up to date"),
     opt("--all|--multiple|--atomic|--dry-run|--porcelain|--refetch|--unshallow|" &
         "--set-upstream|--append|-a", okRefused, help = "docs/05"),
-    opt("--depth|--deepen|--shallow-since|--shallow-exclude|--filter", okValue,
-        key = "shallow"),
+    opt("--depth|--deepen|--shallow-since|--shallow-exclude|--filter", okRefused,
+        help = "gittle has no shallow or partial clone (plan.md §1)"),
   ]
 
 proc applyFetchOpts*(o: Opts, opt: var FetchOpts) =
   ## The fetch half of a parse; `pull` parses `fetchOptions` alongside its
   ## own and hands the result here.
-  failIf(o.has "shallow",
-         "shallow and partial clones are out of scope for gittle (plan.md §1)")
   opt.tags = o.has "tags"
   opt.noTags = o.has "no-tags"
   opt.force = o.has "force"

@@ -50,14 +50,18 @@ proc cmdPull*(c: Ctx, args: seq[string]): int =
   let repo = c.repo
   failIf(readWholeFile(repo.gitDir / "FETCH_HEAD").splitLines[0]
            .contains("not-for-merge"),
-         "no candidate for merging in FETCH_HEAD: this branch has no " &
-         "upstream, and no <refspec> was given")
+         "nothing to merge: this branch has no upstream, so name one as " &
+         "'gittle pull <repository> <refspec>'")
   let head = repo.refs.resolveRef(headRef).oid
   let other = repo.resolveRevish("FETCH_HEAD")
   if not chosen and head != nullOid and not repo.isAncestor(head, other) and
      not repo.isAncestor(other, head):
-    stderr.write "hint: set pull.rebase, or pass --rebase or --no-rebase, " &
-                 "to say whether to rebase or merge\n"
+    # Two lines and not one, deliberately.  git's own remedy is four `hint:`
+    # paragraphs above the same last sentence, and a `hint:` line is what the
+    # oracle drops on both sides -- so the sentence has to stay git's, word
+    # for word, and the remedy has to ride on a line that is thrown away.
+    stderr.write "hint: pass --rebase or --no-rebase, or set pull.rebase, " &
+                 "to say which to do\n"
     fail("Need to specify how to reconcile divergent branches.")
   let quiet = if opt.quiet: @["-q"] else: @[]
   # `--rebase` with nothing of our own to replay is a fast-forward, and git

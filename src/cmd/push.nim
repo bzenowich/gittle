@@ -3,8 +3,10 @@
 ## In scope (docs/08): `<repository>`, `<refspec>`, `--tags`, `-d`/`--delete`,
 ## `-f`/`--force`, `--force-with-lease`, `-n`/`--dry-run`,
 ## `--receive-pack`/`--exec`, `-u`/`--set-upstream`, `-q`, `-v`.  `--all`,
-## `--mirror`, `--prune`, `--atomic`, `--porcelain`, `--thin` and the signing
-## and hook options are cut.
+## `--mirror`, `--prune`, `--atomic`, `--porcelain`, `--thin`, the signing and
+## hook options and `--no-force-with-lease` are cut -- that last because it
+## exists to take back a `--force-with-lease` an *alias* supplied, and gittle
+## has no aliases (docs/minimize-2.md §B4).
 ##
 ## ## What is safe to overwrite is decided *here*, not by the server
 ##
@@ -20,11 +22,13 @@
 ## * a deletion is spelled `:<ref>` (or `--delete`) and never happens by
 ##   accident.
 ##
-## Each refusal carries the one sentence that says how to get past it, and the
-## last one wins: git prints a paragraph of `hint:` lines per reason
+## Each refusal carries **one sentence** naming the cause and the way past it,
+## and the last one wins: git prints a paragraph of `hint:` lines per reason
 ## (`transport.c:transport_push`, `advise_pull_before_push` and siblings) and
-## the minimization pass kept the cause and the way out (docs/minimize.md §3,
-## tier 3).
+## the minimization passes kept the cause and the remedy and nothing else
+## (docs/minimize.md §3 tier 3, docs/minimize-2.md §A2).  git also varies the
+## words by whether the ref is the current branch; gittle does not, because
+## the report line directly above already names the ref.
 ##
 ## The one thing the client cannot check is a hook on the far side saying no;
 ## that comes back in the status report and is printed as `[remote rejected]`.
@@ -55,7 +59,8 @@ const
     opt("-d|--delete", help = "delete the named refs on the remote"),
     opt("-f|--force", help = "allow a non-fast-forward update"),
     opt("--force-with-lease", okOptValue, help = "force only if the remote is where we last saw it"),
-    opt("--no-force-with-lease"),
+    opt("--no-force-with-lease", okRefused,
+        help = "gittle has no aliases, so there is no --force-with-lease to take back"),
     opt("-n|--dry-run", help = "do everything except send"),
     opt("--receive-pack|--exec", okValue, arg = "<exec>", help = "the command to run on the far end"),
     opt("-u|--set-upstream", help = "record the pushed branch as this branch's upstream"),
@@ -82,16 +87,13 @@ proc pushSpecs(repo: Repository, positional: seq[string], name, head: string,
   if pushTags: result.add parseRefspec("refs/tags/*:refs/tags/*", forPush = true)
   if result.len > 0: return
   failIf(not head.startsWith("refs/heads/"),
-         "You are not currently on a branch.\n" &
-         "  To push the history leading to the current (detached HEAD)\n" &
-         "  state now, use\n\n    gittle push " & name & " HEAD:<name-of-remote-branch>\n")
+         "HEAD is detached, so there is no branch to push: name the ref, as " &
+         "'gittle push " & name & " HEAD:<branch>'")
   let upstream = repo.cfg.get("branch." &
                               head["refs/heads/".len .. ^1] & ".merge")
   failIf(upstream.len > 0 and upstream != head,
-         "The upstream branch of your current branch does not match\n" &
-         "  the name of your current branch.  To push to the upstream " &
-         "branch\n  on the remote, use\n\n    gittle push " & name & " " &
-         "HEAD:" & upstream & "\n")
+         "this branch's upstream has a different name, so which push you meant " &
+         "is ambiguous: say 'gittle push " & name & " HEAD:" & upstream & "'")
   result.add parseRefspec(head & ":" & head, forPush = true)
 
 proc remoteRefNamed(advertised: seq[RemoteRef], n: string): string =
@@ -140,7 +142,7 @@ proc resolveUpdates(repo: Repository, specs: seq[Refspec],
     result.add Update(src: found.full, dst: dst, shown: s.src,
                       newOid: found.oid, force: s.force)
 
-proc decidePush(repo: Repository, u: Update, force: bool, head: string):
+proc decidePush(repo: Repository, u: Update, force: bool):
     tuple[code: char, summary, reason, advice: string] =
   ## What one update becomes: the three fields the report prints, and the
   ## sentence to print afterwards if it was refused.  `=` means already there,
@@ -168,10 +170,8 @@ proc decidePush(repo: Repository, u: Update, force: bool, head: string):
               "the tag already exists in the remote; push with --force to replace it")
     if not repo.isAncestor(u.oldOid, u.newOid):
       return ('!', "[rejected]", "non-fast-forward",
-              (if u.src == head: "the tip of your current branch"
-               else: "a pushed branch tip") &
-              " is behind its remote counterpart; 'gittle pull' first, " &
-              "or push with --force")
+              "the remote branch has commits yours does not; " &
+              "'gittle pull' first, or push with --force")
   if u.oldOid.isNull:
     return ('*', (if u.dst.startsWith("refs/tags/"): "[new tag]"
                   elif u.dst.startsWith("refs/heads/"): "[new branch]"
@@ -224,11 +224,9 @@ proc cmdPush*(c: Ctx, args: seq[string]): int =
   var lease = false
   for (k, v) in o.occurrences:
     if k == "force-with-lease":
-      failIf(v.len > 0, "gittle implements --force-with-lease only in its bare form,\n" &
-             "  which compares the remote against this repository's " &
-             "remote-tracking ref (docs/08)")
+      failIf(v.len > 0, "gittle's --force-with-lease has no <ref>:<expect> form; " &
+             "bare, it compares the remote against our remote-tracking ref (docs/08)")
       lease = true
-    elif k == "no-force-with-lease": lease = false
   let force = o.has "force"
   let dryRun = o.has "dry-run"
   let quiet = o.has "quiet"
@@ -278,7 +276,7 @@ proc cmdPush*(c: Ctx, args: seq[string]): int =
   var lines: seq[Line]
   var advice = ""
   for u in ups:
-    let d = decidePush(repo, u, force, head)
+    let d = decidePush(repo, u, force)
     if d.code == '=':
       if verbose: lines.add (d.code, d.summary, d.reason, u.shown, u.dst)
       continue

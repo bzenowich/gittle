@@ -124,8 +124,8 @@ proc verifyChecksum(path: string): Oid =
   var got: Oid
   for i in 0 ..< OidLen: got.b[i] = byte(tail[i])
   failIf(got != want,
-         "pack checksum mismatch in " & path & "\n  header says " & $got &
-         ", contents hash to " & $want)
+         "pack checksum mismatch in " & path & ": it ends with " & $got &
+         " and its contents hash to " & $want)
   want
 
 proc remap(ix: Indexer) =
@@ -290,10 +290,8 @@ proc resolve(ix: Indexer, fixThin: bool,
     # What is left is a thin pack: deltas against objects the sender assumed
     # we already had.  Collect the ones we do have and append them.
     failIf(not fixThin or findExternal == nil,
-           "packfile has " & $pending & " unresolved delta" &
-           (if pending == 1: "" else: "s") & "\n" &
-           "  it is a thin pack; index it with --fix-thin inside a repository " &
-           "that has the bases")
+           "this is a thin pack (" & $pending & " deltas against objects it did " &
+           "not send): index it with --fix-thin, in a repository that has the bases")
     var wanted: seq[Oid]
     var seen: Table[Oid, bool]
     for e in ix.entries:
@@ -359,7 +357,7 @@ proc writeIdx(ix: Indexer, idxPath: string, packHash: Oid) =
 # The entry point
 # ---------------------------------------------------------------------------
 
-proc indexPack*(packPath, idxPath: string, fixThin: bool,
+proc indexPack(packPath, idxPath: string, fixThin: bool,
                 findExternal: proc (o: Oid): GitObject = nil):
     tuple[hash: Oid, nObjects: int] =
   ## Check `packPath`, resolve every delta in it, and write `idxPath`.
