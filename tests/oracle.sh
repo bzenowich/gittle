@@ -71,6 +71,44 @@ check(){ # check <name> <expected> <actual>
 }
 report(){ printf '%-28s %s\n' "$1" "$2"; }
 
+# ---------------------------------------------------------------- fan-out
+# The comparisons over the reference repository are the bulk of the suite's
+# running time, and every one of them only *reads* one repository: they share
+# nothing, so they are the part that can use the other seven cores.  A
+# background subshell cannot raise `p6ok` in the parent, so each job writes
+# what it printed to a file and `fanwait` collects them.
+#
+# The forms still run in the order they were queued as far as the report is
+# concerned, so a failure reads the same as it did serially.
+JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+fann=0; fandir=""
+# `fanjob` keeps the section counters, and the sections that use it are not all
+# the ones that declare them; under `set -u` an undeclared counter is a hard
+# error rather than a silent zero, so they start here.
+p6ok=1; p6n=0
+fanstart(){ fandir="$WORK/fan"; rm -rf "$fandir"; mkdir -p "$fandir"; fann=0; }
+fanjob(){  # fanjob <fn> <args...> -- one comparison, on another core
+  fann=$((fann+1)); p6n=$((p6n+1))
+  ( "$@" >"$fandir/$(printf %05d $fann).out" 2>&1 ) &
+  while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
+}
+fanwait(){
+  wait
+  local f n=0
+  for f in "$fandir"/*.out; do [ -e "$f" ] && n=$((n+1)); done
+  # A section that queued jobs and collected no results compared nothing and
+  # would otherwise report `ok`.  That is how the helpers being defined below
+  # their first caller went unnoticed: the loop bodies failed with `command
+  # not found` and the section still passed.
+  [ "$n" = "$fann" ] || { p6ok=0
+    printf '  fan-out lost %d of %d comparisons\n' $((fann - n)) "$fann"; }
+  for f in "$fandir"/*.out; do
+    [ -s "$f" ] || continue
+    p6ok=0; cat "$f"
+  done
+  rm -rf "$fandir"
+}
+
 command -v git >/dev/null || { echo "no git on PATH"; exit 1; }
 [ -x "$GITTLE" ] || { echo "no gittle binary at $GITTLE"; exit 1; }
 [ -d "$REFREPO/.git" ] || { echo "no reference repository at $REFREPO"; exit 1; }
@@ -1604,32 +1642,6 @@ p6ro(){
   [ -z "$out" ] || { p6ok=0; printf '%s\n' "$out"; }
 }
 
-# ---------------------------------------------------------------- fan-out
-# The comparisons over the reference repository are the bulk of the suite's
-# running time, and every one of them only *reads* one repository: they share
-# nothing, so they are the part that can use the other seven cores.  A
-# background subshell cannot raise `p6ok` in the parent, so each job writes
-# what it printed to a file and `fanwait` collects them.
-#
-# The forms still run in the order they were queued as far as the report is
-# concerned, so a failure reads the same as it did serially.
-JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
-fann=0; fandir=""
-fanstart(){ fandir="$WORK/fan"; rm -rf "$fandir"; mkdir -p "$fandir"; fann=0; }
-fanjob(){  # fanjob <fn> <args...> -- one comparison, on another core
-  fann=$((fann+1)); p6n=$((p6n+1))
-  ( "$@" >"$fandir/$(printf %05d $fann).out" 2>&1 ) &
-  while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
-}
-fanwait(){
-  wait
-  local f
-  for f in "$fandir"/*.out; do
-    [ -s "$f" ] || continue
-    p6ok=0; cat "$f"
-  done
-  rm -rf "$fandir"
-}
 
 # Everything a command could have written, as text.  Works on a bare
 # repository too, which phase 8 needs: a push has to be judged by what it did
