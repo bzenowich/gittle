@@ -123,8 +123,17 @@ proc cmdRevParse*(c: Ctx, args: seq[string]): int =
       shortLen = clamp(shortLen, minAbbrev, OidHexLen)
       continue
     if arg.startsWith("--abbrev-ref"):
+      # git's default here is *strict*, not loose: `abbrev_ref_strict` is
+      # initialised from `warn_ambiguous_refs`, which `core.warnAmbiguousRefs`
+      # leaves true (`builtin/rev-parse.c`).  So with both a branch and a tag
+      # named `dup`, `--abbrev-ref refs/tags/dup` prints `tags/dup` -- the
+      # shortest name that still resolves to the ref asked about.
+      #
+      # This must be defaulted here and not in `refs.shortenRef`, whose loose
+      # default is what `branch`, `worktree` and `status` listings want, as
+      # git's do.
       abbrevRef = true
-      strictRef = arg.endsWith("=strict")
+      strictRef = not arg.endsWith("=loose")
       continue
 
     if arg.len > 1 and arg[0] == '-':

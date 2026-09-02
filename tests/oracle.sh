@@ -1842,6 +1842,34 @@ p6dir="$P6/fix"
 [ $p6ok = 1 ] && { ok; report "revision grammar" "$p6n expressions and rev-parse forms"; } \
               || bad "revision grammar"
 
+# `--abbrev-ref` only has an answer to give when a name is ambiguous, and the
+# shared fixture has no ambiguous name -- so this gets its own repository with
+# a branch and a tag both called `dup`.  git defaults the flag to *strict*
+# (`abbrev_ref_strict` comes from `warn_ambiguous_refs`, true by default), and
+# gittle defaulted it to loose: it answered `dup` where git answers `tags/dup`,
+# i.e. a name that resolves to the *other* ref.  Nothing in the suite could
+# see it, because nothing in the suite had two refs with one name.
+#
+# Every form here names a ref in full.  `--abbrev-ref dup`, the *short*
+# ambiguous name, is deliberately not compared: git answers it from its
+# ambiguity diagnostics (`error: refname 'dup' is ambiguous`, from
+# core.warnAmbiguousRefs) and those were cut in the first pass
+# (docs/minimize.md §3 tier 3), so gittle shortens the ref the dwim rules
+# picked instead.  That is a known divergence about a cut feature, not about
+# strict-versus-loose, which is what this block is for.
+AMB="$WORK/amb"; git init -q "$AMB"
+( cd "$AMB" && echo x > f && git add f && git commit -qm one \
+  && git branch dup && git tag dup ) >/dev/null 2>&1
+p6ok=1; p6n=0; p6dir="$AMB"; p6what="rev-parse"
+for a in "--abbrev-ref refs/tags/dup" "--abbrev-ref refs/heads/dup" \
+         "--abbrev-ref=strict refs/tags/dup" "--abbrev-ref=loose refs/tags/dup" \
+         "--abbrev-ref=loose refs/heads/dup" "--abbrev-ref HEAD" \
+         "--symbolic-full-name refs/tags/dup"; do
+  p6ro rev-parse $a
+done
+[ $p6ok = 1 ] && { ok; report "abbrev-ref, ambiguous" "$p6n forms over a branch and a tag named alike"; } \
+              || bad "abbrev-ref, ambiguous"
+
 # ------------------------------------------------------------- merge-base
 # Over the reference repository, because a merge base is only interesting on
 # history with real criss-crosses in it.
