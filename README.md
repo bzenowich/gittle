@@ -10,18 +10,18 @@ share a repository with real git, and plausible in a busybox-class environment.
   pushes to a git host, and does not host one.
 - **One static binary**, busybox-style `argv[0]` dispatch. Only external
   dependency is the system zlib.
-- **Small enough to read in an afternoon** — 12.8 kloc of Nim today, and
-  ~13 projected for the whole of v1.
+- **Small enough to read in an afternoon** — 13.9 kloc of Nim, all of v1.
 
 ## Status
 
-**Phases 1–8 complete: the object store, refs and config, the index and
-trees, the first commit, diff, history, merge, and the transport.**
-Forty-four commands work and agree with real git. `gittle init`, `gittle add .`, `gittle commit` produces a
-repository real git continues in without noticing — identical commit objects,
-reflogs and index — and `gittle log` reproduces git's output over 20,000
-commits of the repository next door. `git fsck --strict` is clean after
-everything gittle writes.
+**v1 is feature-complete.** All nine phases are built — the object store,
+refs and config, the index and trees, the first commit, diff, history, merge,
+the transport, and housekeeping. **All 53 commands** work and agree with real
+git, checked by 187 differential tests. `gittle init`, `gittle add .`,
+`gittle commit` produces a repository real git continues in without noticing
+— identical commit objects, reflogs and index — and `gittle log` reproduces
+git's output over 20,000 commits of the repository next door. `git fsck
+--strict` is clean after everything gittle writes.
 
 The diff engine is a reimplementation of git's `xdiff/` in the configuration
 `--minimal` selects, including the indent heuristic that decides where a hunk
@@ -66,15 +66,35 @@ repository next door, a 318 MiB pack. And R2 — never search for a delta, only
 pass on one you were given — makes `pack-objects` 54 lines and still
 **reuses 28,284 deltas** when packing two thousand commits of that history.
 
+Phase 10 is the housekeeping: `check-ignore`, `rm`, `mv`, `clean`, `worktree`
+and `gc`, plus `stage`. No new engine — every one of them is a command over
+something an earlier phase built, which is what makes `check-ignore` 45 lines
+and `stage` zero. Two rules carry the phase. **`clean -x` means "there are no
+ignore files", not "delete ignored files too"** — read the other way,
+`clean -fdx -e '*.log'` deletes the logs it was told to keep. And **`gc` is
+additive** (plan.md R2a): loose objects are folded into a new pack and the
+packs that were already there are never rewritten, because rewriting one means
+re-deltifying it and gittle does not search for deltas — a 304 MiB clone would
+come back as 3.1 GiB. A real `git gc` in the same repository restores git's
+own layout; the only thing gittle must never do is undo it.
+
+`worktree` is the largest command in the project, and it is a second copy of
+the repository abstraction rather than an option surface: a linked worktree
+*is* a `Repository` with a different `gitDir`. One invariant runs through
+four commands — a branch is checked out in at most one worktree — so
+`worktree add`, `checkout`, `switch` and `branch` all ask the same question,
+and `branch -v` marks the answer with `+`.
+
 `grep` and `log --grep` use libc's POSIX regex rather than a vendored engine —
 which is what git itself does, and what turned a 500-line budget line into 45.
 
-12,852 lines of code so far, against an original sketch of ~9,000 for the whole
-of v1. That sketch is now a measurement rather than a limit: the server was cut
-(it is the one phase with no client-side benefit), the rest is accepted at an
-estimated ~13,000, and an optimisation and refactoring pass comes once v1 is
-feature-complete. [`docs/plan.md`](docs/plan.md) §5.1 and §5.2 have the
-numbers.
+13,872 lines of code, against an original sketch of ~8,700 for the whole of
+v1. That sketch was always a measurement rather than a limit, and across four
+phases it missed for four different reasons — none of them the option
+combinations it counts: shared output formatting, state machines,
+compatibility surface, and a second copy of the repository abstraction.
+[`docs/plan.md`](docs/plan.md) §5.1–§5.4 have the numbers and the reasoning.
+The optimisation and refactoring pass comes next.
 
 - [`docs/plan.md`](docs/plan.md) — goals, the eight design rules, scope,
   budget, the ten decisions, build order. **Read this first.**
@@ -83,7 +103,8 @@ numbers.
 - [`docs/phase-1.md`](docs/phase-1.md), [`docs/phase-2.md`](docs/phase-2.md),
   [`docs/phase-3.md`](docs/phase-3.md), [`docs/phase-4.md`](docs/phase-4.md),
   [`docs/phase-5.md`](docs/phase-5.md), [`docs/phase-6.md`](docs/phase-6.md),
-  [`docs/phase-7.md`](docs/phase-7.md), [`docs/phase-8.md`](docs/phase-8.md) —
+  [`docs/phase-7.md`](docs/phase-7.md), [`docs/phase-8.md`](docs/phase-8.md),
+  [`docs/phase-10.md`](docs/phase-10.md) —
   the finished phases: what was built, what it was verified against, what was
   left for later, and where the budget stands.
 - [`docs/README.md`](docs/README.md) — index to the feature inventory

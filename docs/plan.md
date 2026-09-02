@@ -3,9 +3,15 @@
 A minimal git in Nim: small enough to read in an afternoon, compatible enough to
 share a repository with real git, and plausible in a busybox-class environment.
 
-Status: **scoping.** No code yet. This document records the goals, the design
-rules that follow from them, and a recommended starting scope. The per-command
-selections live in `01`–`15`; this file explains *why* they are what they are.
+Status: **v1 feature-complete (2026-09-02).** All nine phases of §7 are built
+(nine is empty, cut with the server); all 53 commands of §4 work and are
+compared against real git by `tests/oracle.sh`. 13,872 lines of code — §5.4.
+What remains is the optimisation and refactoring pass §5 defers to this point,
+and the v2 backlog in §8.
+
+This document records the goals, the design rules that follow from them, and
+the scope. The per-command selections live in `01`–`15`; this file explains
+*why* they are what they are.
 
 ---
 
@@ -224,6 +230,8 @@ into a new pack and leave inherited packs alone. The pack a server sent at clone
 time is optimally deltified; rewriting it is the one action that would turn a
 304 MiB repository into a 3 GiB one. Real `git gc`, if ever run in the same
 repository, restores full optimality — gittle must never undo it.
+*Built in phase 10, and tested by packing with git, committing with gittle,
+running `gittle gc`, and asserting the inherited pack is still there.*
 
 **R2b — ~~serving a full clone should reuse whole packs~~.** Withdrawn with the
 server (§6 decision 2): whole-pack reuse only ever mattered for `upload-pack`,
@@ -340,7 +348,8 @@ shares the same matcher.
 
 A sketch, not an estimate, and — since the end of phase 6 — **a measurement
 rather than a limit**. The figures below are what the work was expected to
-cost; §5.1 is what it actually cost. The discipline that matters is recording
+cost; §5.1–§5.4 are what it actually cost, phase by phase, and §5.4 is the
+final figure. The discipline that matters is recording
 the number at the end of every phase and explaining the over-runs, not hitting
 it: a smaller number bought by cramming is not the goal, and an optimisation
 and refactoring pass is planned once v1 is feature-complete.
@@ -481,6 +490,40 @@ Eight of the fifteen commands left after phase 7 have now cost 860.  The seven
 remaining — `gc`, `worktree`, `clean`, `check-ignore`, `mv`, `rm`, and `stage`
 as an alias of `add` — are phase 10 and are mostly small.  The estimate is
 **unchanged: v1 lands near 13,000**.
+
+### 5.4 After phase 10 — v1 complete
+
+**13,872 lines**, all nine phases done (nine is empty), all 53 commands built.
+Phase 10 cost 1,020 — [phase-10.md](phase-10.md) has the breakdown:
+
+| | budgeted | actual |
+|---|---:|---:|
+| gc, worktree, clean, check-ignore | 300 | **694** |
+| `mv`, `rm`, `stage` | — | **215** |
+| what the earlier engines had to expose | — | 111 |
+
+The 300 was wrong by a factor of two and a bit, and the cause is a **fourth**
+distinct one — which is the finding, not the number.  Across four phases §5's model has
+now missed for four different reasons, and none of them is option
+combinations, which is what §5 counts:
+
+| phase | what over-ran | why |
+|---|---|---|
+| 6 | shared output formatting | it belongs to no one command |
+| 7 | `stash`, `rebase` | **state machines**: a directory of files to write, read back and remove correctly under four verbs |
+| 8 | `push`, `remotes.nim` | **compatibility surface**: rules reproduced because someone else's output already defines them |
+| 10 | `worktree` | **a second copy of the repository abstraction**: a linked worktree *is* a `Repository` with a different `gitDir`, and every verb constructs one, validates the pair of files that make it real, and then asks the other repository about it |
+
+The rest of phase 10 came in at or under.  `check-ignore` is 45 lines because
+the engine has existed since phase 4; `stage` is zero, because it is a second
+name in a `case` statement.  What a command costs is not what it does but how
+much of what it needs did not exist yet — and by phase 10 nearly everything
+did.
+
+**Final: 13,872**, 6.7% over the 13,000 projected after phase 8 and 60% over
+the original 8,680 sketch.  Recorded, not cut against (§5's own rule); the
+optimisation and refactoring pass that plan.md defers to feature-completeness
+now has a baseline and four named things to look at.
 
 ---
 
@@ -772,7 +815,9 @@ create state with one tool, verify with the other, in both directions.
 9. ~~**Serving.**~~ **Cut (2026-09-01)**, with decision 2. It was `argv[0]`
    dispatch and the `git-*` symlinks, then `upload-pack`, `receive-pack` and
    `git-shell`.
-10. **Housekeeping.** `gc`, `worktree`, `clean`, `check-ignore`.
+10. **Housekeeping.** `gc`, `worktree`, `clean`, `check-ignore`, plus `mv`,
+    `rm` and `stage`.
+    *Done: [phase-10.md](phase-10.md).*  **v1 is feature-complete.**
 
 The numbering is not renumbered, and deliberately so: "phase 10" names the
 housekeeping phase in six other documents, in the test suite and in a source

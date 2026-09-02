@@ -11,7 +11,7 @@
 ## For one path, in this order, and the **first list with any matching pattern
 ## decides** (`dir.c:last_matching_pattern_from_lists`):
 ##
-## 1. patterns given on the command line (`clean -e`) -- phase 10;
+## 1. patterns given on the command line (`clean -e`);
 ## 2. the `.gitignore` in the path's own directory, then its parent's, and so
 ##    on up to the working-tree root -- *deepest first*;
 ## 3. `$GIT_COMMON_DIR/info/exclude` -- the *common* directory, so linked
@@ -53,6 +53,14 @@
 ## Ignore rules apply only to **untracked** paths.  A tracked file stays
 ## tracked whatever any `.gitignore` says; that is the caller's business, and
 ## why `add` asks this engine about its second pass only.
+##
+## ## Two things only `clean` and `check-ignore` need
+##
+## `check-ignore -v` prints *which pattern decided* and where it came from, so
+## `decide` returns the pattern rather than a boolean and `isIgnored` is a
+## wrapper over it.  And `clean -x` means "there are no ignore files" rather
+## than "delete ignored files too" -- `newEmptyIgnore` is that: an engine with
+## the `-e` patterns and nothing behind them.
 
 import std/[os, strutils, tables]
 import glob, repository, util
@@ -63,21 +71,32 @@ type
     negated: bool
     mustBeDir: bool
     noDir: bool       ## no `/` in it, so it matches a basename at any depth
+    lineNo: int       ## where it was written, for `check-ignore -v`
 
   PatternList = object
     base: string      ## root-relative directory, "" or ending in `/`
+    src: string       ## the file it was read from, as `check-ignore -v` names it
     patterns: seq[Pattern]
 
   Ignore* = ref object
     workTree: string
+    noFiles: bool                 ## `clean -x`: consult no pattern file at all
+    cmdline: PatternList          ## `clean -e`, which outranks every file
     fileLists: seq[PatternList]   ## excludesFile, then info/exclude
     dirLists: Table[string, PatternList]
 
-  Decision = object
+  Decision* = object
     ## What the first list with an opinion said.  `found` and `ignored` are
     ## different questions: "no pattern matched" is not "a `!` matched".
-    found: bool
-    ignored: bool
+    ##
+    ## The three fields after them are the pattern itself, which only
+    ## `check-ignore -v` wants -- but it wants the *deciding* one, and by the
+    ## time a `bool` has come back out of here that is no longer recoverable.
+    found*: bool
+    ignored*: bool
+    src*: string      ## the pattern file
+    lineNo*: int      ## 1-based, counting every line including blanks
+    text*: string     ## as written, `!` and trailing `/` restored
 
 # ---------------------------------------------------------------------------
 # Reading a pattern file
@@ -115,16 +134,21 @@ proc parsePattern(raw: string): Pattern =
   result.noDir = not p.contains('/')
   result.pat = p
 
-proc readPatternList(path, base: string): PatternList =
+proc readPatternList(path, base, src: string): PatternList =
   result.base = base
+  result.src = src
   if not fileExists(path): return
+  var lineNo = 0
   for rawLine in readWholeFile(path).split('\n'):
     var line = rawLine
+    inc lineNo
     if line.endsWith("\r"): line.setLen(line.len - 1)
     if line.len == 0 or line[0] == '#': continue
     line = trimTrailingSpaces(line)
     if line.len == 0: continue
-    result.patterns.add parsePattern(line)
+    var p = parsePattern(line)
+    p.lineNo = lineNo
+    result.patterns.add p
 
 # ---------------------------------------------------------------------------
 # Matching
@@ -149,7 +173,11 @@ func lastMatchIn(pl: PatternList, path: string, isDir: bool): Decision =
     if p.mustBeDir and not isDir: continue
     let hit = if p.noDir: globMatch(p.pat, base, {})
               else: matchPathname(p.pat, path, pl.base)
-    if hit: return Decision(found: true, ignored: not p.negated)
+    if hit:
+      return Decision(found: true, ignored: not p.negated,
+                      src: pl.src, lineNo: p.lineNo,
+                      text: (if p.negated: "!" else: "") & p.pat &
+                            (if p.mustBeDir: "/" else: ""))
 
 # ---------------------------------------------------------------------------
 # The stack
@@ -167,15 +195,41 @@ proc newIgnore*(repo: Repository): Ignore =
                    else: getEnv("HOME") / ".config" / "git" / "ignore"
   elif excludesFile.startsWith("~/"):
     excludesFile = getEnv("HOME") / excludesFile[2 .. ^1]
+  # `check-ignore -v` prints the file a pattern came from, and git prints it
+  # the way a command run at the top of the working tree would spell it --
+  # `.git/info/exclude`, not the absolute path it opened.
+  var infoExclude = repo.commonDir / "info" / "exclude"
+  if repo.workTree.len > 0 and infoExclude.startsWith(repo.workTree & "/"):
+    infoExclude = infoExclude[repo.workTree.len + 1 .. ^1]
   # Order matters: scanned in reverse, so `info/exclude` is consulted before
   # the user's global file, which is the precedence plan.md §4 specifies.
-  result.fileLists.add readPatternList(excludesFile, "")
-  result.fileLists.add readPatternList(repo.commonDir / "info" / "exclude", "")
+  result.fileLists.add readPatternList(excludesFile, "", excludesFile)
+  result.fileLists.add readPatternList(repo.commonDir / "info" / "exclude", "",
+                                       infoExclude)
+
+proc newEmptyIgnore*(repo: Repository): Ignore =
+  ## An engine with no files behind it at all.  `clean -x` is the one caller:
+  ## it says "there are no ignore rules", so the standard files are not read
+  ## and only `-e` patterns remain.
+  Ignore(workTree: repo.workTree, noFiles: true,
+         dirLists: initTable[string, PatternList]())
+
+proc addCommandLinePatterns*(ig: Ignore, pats: openArray[string]) =
+  ## `clean -e <pattern>`: the highest-precedence list, consulted before any
+  ## file.  git numbers these `-(i+1)` in `check-ignore -v` output; nothing in
+  ## v1 prints them, so they are numbered in order like everything else.
+  ig.cmdline.src = "--exclude option"
+  for i, raw in pats:
+    var p = parsePattern(raw)
+    p.lineNo = -(i + 1)
+    ig.cmdline.patterns.add p
 
 proc listFor(ig: Ignore, dir: string): PatternList =
   ## The `.gitignore` sitting in `dir` (root-relative, "" or ending in `/`).
+  if ig.noFiles: return PatternList(base: dir)
   if not ig.dirLists.hasKey(dir):
-    ig.dirLists[dir] = readPatternList(ig.workTree / (dir & ".gitignore"), dir)
+    ig.dirLists[dir] = readPatternList(ig.workTree / (dir & ".gitignore"), dir,
+                                       dir & ".gitignore")
   ig.dirLists[dir]
 
 proc lastMatch(ig: Ignore, path: string, isDir: bool): Decision =
@@ -190,6 +244,8 @@ proc lastMatch(ig: Ignore, path: string, isDir: bool): Decision =
   ## a shallower list has a more specific pattern -- that is what "deeper files
   ## override shallower ones" means.
   if ig == nil: return
+  result = ig.cmdline.lastMatchIn(path, isDir)
+  if result.found: return
   var dir = path
   while true:
     let slash = dir.rfind('/')
@@ -202,16 +258,22 @@ proc lastMatch(ig: Ignore, path: string, isDir: bool): Decision =
     result = ig.fileLists[i].lastMatchIn(path, isDir)
     if result.found: return
 
-proc isIgnored*(ig: Ignore, path: string, isDir: bool): bool =
-  ## Is this path excluded, taking its ancestors into account?
+proc decide*(ig: Ignore, path: string, isDir: bool): Decision =
+  ## Which pattern settles this path, taking its ancestors into account?
   ##
   ## Top down, because an excluded directory settles every path beneath it and
   ## no `!` in a deeper file can undo that -- git would never have descended
-  ## far enough to read it.
+  ## far enough to read it.  An ancestor only decides when it is *excluded*: a
+  ## `!` matching a directory says nothing about what is inside it, which is
+  ## why `dir.c:prep_exclude` drops a negative match before returning.
   var at = 0
   while true:
     let slash = path.find('/', at)
     if slash < 0: break
-    if ig.lastMatch(path[0 ..< slash], true).ignored: return true
+    let d = ig.lastMatch(path[0 ..< slash], true)
+    if d.ignored: return d
     at = slash + 1
-  ig.lastMatch(path, isDir).ignored
+  ig.lastMatch(path, isDir)
+
+proc isIgnored*(ig: Ignore, path: string, isDir: bool): bool =
+  ig.decide(path, isDir).ignored

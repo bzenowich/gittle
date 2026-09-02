@@ -559,13 +559,30 @@ proc releaseAfterDelete(l: var RefLock) =
 
 # -- packed-refs and leftovers ----------------------------------------------
 
+proc writePackedRefs(s: RefStore, text: string) =
+  ## Replace `packed-refs` wholesale, under its own `.lock`.
+  ##
+  ## The lock is the point: `packed-refs` is one file holding every shared
+  ## ref, so two writers that merely wrote it atomically would still lose one
+  ## of the two sets of changes.  `O_EXCL` never waits, so a second writer
+  ## fails outright rather than blocking -- which is what git does, and what
+  ## makes a concurrent `git pack-refs` an error instead of a silent rewind.
+  let path = s.packedRefsPath
+  let lockPath = path & lockSuffix
+  let fd = open(lockPath.cstring, O_WRONLY or O_CREAT or O_EXCL, 0o666.Mode)
+  if fd < 0:
+    if errno == EEXIST: fail("cannot lock " & path & ": it is already locked")
+    fail("cannot lock " & path & ": " & $strerror(errno))
+  discard close(fd)
+  try:
+    writeFile(lockPath, text)
+    moveFile(lockPath, path)
+  except CatchableError:
+    discard tryRemoveFile(lockPath)
+    raise
+
 proc rewritePackedRefsWithout(s: RefStore, names: seq[string]) =
   ## Remove `names` from `packed-refs`, rewriting the file under its own lock.
-  ##
-  ## The header is regenerated and deliberately does *not* claim `peeled` or
-  ## `fully-peeled`.  gittle copies through the peel lines it finds but never
-  ## computes one, so claiming every tag is peeled would be a lie a later
-  ## reader is entitled to act on.
   s.loadPackedRefs()
   var keep: seq[Ref]
   var removedAny = false
@@ -574,24 +591,15 @@ proc rewritePackedRefsWithout(s: RefStore, names: seq[string]) =
     else: keep.add r
   if not removedAny: return
 
-  let path = s.packedRefsPath
-  let lockPath = path & lockSuffix
-  let fd = open(lockPath.cstring, O_WRONLY or O_CREAT or O_EXCL, 0o666.Mode)
-  if fd < 0:
-    if errno == EEXIST: fail("cannot lock " & path & ": it is already locked")
-    fail("cannot lock " & path & ": " & $strerror(errno))
-  discard close(fd)
-
+  # The header deliberately does *not* claim `peeled` or `fully-peeled`: this
+  # writer copies through the peel lines it finds and never computes one, so
+  # claiming every tag is peeled would be a lie a later reader is entitled to
+  # act on.  `packRefs` does compute them, and does claim it.
   var text = "# pack-refs with: sorted \n"
   for r in keep:
     text.add $r.oid & " " & r.name & "\n"
     if r.hasPeeled: text.add "^" & $r.peeled & "\n"
-  try:
-    writeFile(lockPath, text)
-    moveFile(lockPath, path)
-  except CatchableError:
-    discard tryRemoveFile(lockPath)
-    raise
+  s.writePackedRefs(text)
   s.packed = keep
 
 proc pruneEmptyRefDirs(s: RefStore, name: string) =
@@ -607,6 +615,60 @@ proc pruneEmptyRefDirs(s: RefStore, name: string) =
     except CatchableError:
       break
     dir = parentDir(dir)
+
+proc packRefs*(s: RefStore, peel: proc (o: Oid): Oid {.closure.}) =
+  ## Fold every loose shared ref into `packed-refs`, then delete the loose
+  ## files.  This is `pack-refs --all --prune`, which is the half of `gc` that
+  ## is about refs rather than objects.
+  ##
+  ## Three things are deliberately left out of the packed file:
+  ##
+  ## * **per-worktree refs** (HEAD, `refs/bisect/…`) -- `packed-refs` is
+  ##   shared, so packing one would make every worktree see it;
+  ## * **symbolic refs** (`refs/remotes/origin/HEAD`) -- the format has no way
+  ##   to say "points at another ref", so git leaves them loose too
+  ##   (`refs/files-backend.c:files_pack_refs`);
+  ## * nothing else.  Unlike git's `--prune`, there is no `--no-prune` form
+  ##   here: a loose ref left beside its packed copy is not wrong, but it is
+  ##   the entire point of the exercise.
+  ##
+  ## Because the peels are computed rather than copied through, the header can
+  ## claim `fully-peeled` -- a claim `rewritePackedRefsWithout` does not make,
+  ## which is safe in that direction: a reader that is not told the file is
+  ## peeled simply peels the tag itself.
+  s.loadPackedRefs()
+  var keep: seq[Ref]
+  var loose: seq[Ref]
+  for r in s.allRefs(refsPrefix):
+    if isPerWorktreeRef(r.name) or r.isSymbolic: continue
+    var packedRef = Ref(name: r.name, oid: r.oid, packed: true)
+    packedRef.peeled = peel(r.oid)
+    packedRef.hasPeeled = not packedRef.peeled.isNull
+    keep.add packedRef
+    if not r.packed: loose.add r
+
+  # No packed refs at all is spelled by the file's absence, not by an empty
+  # file: a stray empty one is parsed on every read for nothing.
+  if keep.len == 0:
+    discard tryRemoveFile(s.packedRefsPath)
+  else:
+    var text = "# pack-refs with: peeled fully-peeled sorted \n"
+    for r in keep:
+      text.add $r.oid & " " & r.name & "\n"
+      if r.hasPeeled: text.add "^" & $r.peeled & "\n"
+    s.writePackedRefs(text)
+  s.packed = keep
+
+  # Only after the packed file is in place, and only when the loose file
+  # still says what was packed: a ref somebody else moved in between must not
+  # be silently rewound to the packed value.
+  for r in loose:
+    let p = s.refPath(r.name)
+    try:
+      if readWholeFile(p).strip() != $r.oid: continue
+    except CatchableError: continue
+    discard tryRemoveFile(p)
+    s.pruneEmptyRefDirs(r.name)
 
 # -- the transaction --------------------------------------------------------
 
@@ -837,7 +899,8 @@ template withTransaction(store: RefStore, tx, body: untyped) =
 
 proc updateRef*(s: RefStore, name: string, newOid: Oid, oldOid = nullOid,
                 checkOld = false, msg = "", logOld = nullOid,
-                haveLogOld = false, noDeref = false, forceLog = false) =
+                haveLogOld = false, noDeref = false, forceLog = false,
+                noLog = false) =
   ## Point `name` at `newOid`, following it if it is a symbolic ref.
   ##
   ## `noDeref` is what detaches HEAD: writing an object ID *into* HEAD rather
@@ -846,7 +909,7 @@ proc updateRef*(s: RefStore, name: string, newOid: Oid, oldOid = nullOid,
     tx.add RefUpdate(kind: ruSet, name: name, newOid: newOid,
                      oldOid: oldOid, haveOldOid: checkOld, msg: msg,
                      logOld: logOld, haveLogOld: haveLogOld, noDeref: noDeref,
-                     forceLog: forceLog)
+                     forceLog: forceLog, noLog: noLog)
 
 proc deleteRef*(s: RefStore, name: string, oldOid = nullOid, checkOld = false,
                 noDeref = false, msg = "") =

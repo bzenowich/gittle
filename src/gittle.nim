@@ -29,6 +29,10 @@ import cmd/grep as cmdgrep
 import cmd/indexpack, cmd/clone, cmd/fetch, cmd/lsremote
 import cmd/packobjects, cmd/push as cmdpush, cmd/remote as cmdremote
 import cmd/pull as cmdpull
+import cmd/checkignore, cmd/rm as cmdrm, cmd/mv as cmdmv
+import cmd/clean as cmdclean
+import cmd/worktree as cmdworktree
+import cmd/gc as cmdgc
 
 const
   version = "gittle version 0.1.0"
@@ -48,8 +52,10 @@ Commands:
    add                   stage content into the index
    branch                list, create, rename and delete branches
    cat-file              inspect objects
+   check-ignore          say why a path is ignored
    checkout              switch branches, or restore files
    cherry-pick           replay existing commits onto this branch
+   clean                 delete untracked files
    clone                 copy a repository into a new directory
    commit                record the staged content as a new commit
    commit-tree           create a commit object
@@ -57,6 +63,7 @@ Commands:
    diff                  show changes between trees, index and working tree
    fetch                 download objects and refs from a remote
    for-each-ref          list refs through a format string
+   gc                    pack loose objects and refs, and prune
    grep                  search tracked content
    hash-object           compute, and optionally store, an object ID
    index-pack            build a .idx for a packfile
@@ -68,6 +75,7 @@ Commands:
    merge                 join another history into this one
    merge-base            find the common ancestor of two commits
    merge-file            three-way merge of three files
+   mv                    move or rename a tracked path
    pack-objects          create a packfile
    pull                  fetch from a remote and integrate
    push                  send refs and objects to a remote
@@ -79,15 +87,18 @@ Commands:
    restore               restore working-tree and index files
    rev-list              walk history and list the objects it reaches
    rev-parse             resolve revisions and report repository layout
+   rm                    remove files from the working tree and the index
    revert                undo commits with new commits
    show                  display objects
    stash                 set aside uncommitted work
+   stage                 stage content into the index (an alias of add)
    status                report working tree state
    switch                change branches
    symbolic-ref          read and write symbolic refs
    tag                   create, list and delete tags
    update-index          modify the index
    update-ref            create, update and delete refs
+   worktree              manage linked working trees
    write-tree            write the index out as a tree
    version               print the version"""
 
@@ -95,8 +106,9 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   case verb
   of "hash-object": cmdHashObject(c, args)
   of "cat-file": cmdCatFile(c, args)
+  of "check-ignore": cmdCheckIgnore(c, args)
   of "init": cmdInit(c, args)
-  of "add": cmdAdd(c, args)
+  of "add", "stage": cmdAdd(c, args)
   of "branch": cmdBranch(c, args)
   of "checkout": cmdCheckout(c, args)
   of "switch": cmdSwitch(c, args)
@@ -113,12 +125,15 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   of "diff": cmddiff.cmdDiff(c, args)
   of "stash": cmdstash.cmdStash(c, args)
   of "status": cmdstatus.cmdStatus(c, args)
+  of "gc": cmdgc.cmdGc(c, args)
   of "grep": cmdgrep.cmdGrep(c, args)
   of "commit-tree": cmdCommitTree(c, args)
   of "index-pack": cmdIndexPack(c, args)
+  of "clean": cmdclean.cmdClean(c, args)
   of "clone": cmdClone(c, args)
   of "fetch": cmdFetch(c, args)
   of "ls-remote": cmdLsRemote(c, args)
+  of "mv": cmdmv.cmdMv(c, args)
   of "pack-objects": cmdPackObjects(c, args)
   of "push": cmdpush.cmdPush(c, args)
   of "pull": cmdpull.cmdPull(c, args)
@@ -128,10 +143,12 @@ proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
   of "merge-file": cmdMergeFile(c, args)
   of "rev-list": cmdRevList(c, args)
   of "rev-parse": cmdRevParse(c, args)
+  of "rm": cmdrm.cmdRm(c, args)
   of "update-ref": cmdUpdateRef(c, args)
   of "symbolic-ref": cmdSymbolicRef(c, args)
   of "for-each-ref": cmdForEachRef(c, args)
   of "ls-tree": cmdLsTree(c, args)
+  of "worktree": cmdworktree.cmdWorktree(c, args)
   of "write-tree": cmdWriteTree(c, args)
   of "read-tree": cmdReadTree(c, args)
   of "update-index": cmdUpdateIndex(c, args)

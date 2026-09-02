@@ -1,14 +1,15 @@
 # gittle — git feature inventory
 
-`gittle` is a minimal reimplementation of git in Nim (target: < 10 kloc), which
-keeps compatibility with git's on-disk repository format, speaks the git wire
+`gittle` is a minimal reimplementation of git in Nim (13.9 kloc as built,
+against a ~10 kloc target — see [plan.md](plan.md) §5), which keeps
+compatibility with git's on-disk repository format, speaks the git wire
 protocol over ssh only, and implements only the subset of that protocol needed
 by the commands we choose to ship.
 
-These documents are the **menu**: a complete enumeration of what upstream git
-does today, so that features can be selected in or out deliberately rather than
-by accident. Nothing here is a commitment — it is the superset we are cutting
-down from.
+These documents were the **menu**: a complete enumeration of what upstream git
+does today, so that features could be selected in or out deliberately rather
+than by accident. v1 is now built, so they are also the **record** — see
+[Where this stands](#where-this-stands).
 
 ## Source of this inventory
 
@@ -36,11 +37,11 @@ can be marked up in place.
 | `` `[log]` `` | Seen in the agent tool-call logs; 177 entries, 169 of them kept |
 | **CUT from v1** | Section banner: every option below it is out of scope, reason inline |
 
-Current recommendation: **53 of 161 commands, 447 of 2,341 option entries.**
-Forty-six of them are built (phases 1–8); the seven left are phase 10's.
-The reasoning, the design rules behind it, the budget, and eight open questions
-are in **[plan.md](plan.md)** — read that before revising the marks. All ten open questions
-are now decided; §6 is a decision record.
+The selection: **53 of 161 commands, 447 of 2,341 option entries.**
+**All fifty-three are built** (phases 1–10) and compared against real git by
+`tests/oracle.sh`. The reasoning, the design rules behind it, the budget and
+the ten decisions are in **[plan.md](plan.md)** — read that before revising
+the marks; §6 is a decision record and nothing in the scope is still open.
 
 Useful greps:
 
@@ -73,7 +74,8 @@ implementing anything.
 | `13-pure-helpers.md` | Pure helpers (`mailinfo`, `check-attr`, `hook`, …). |
 | `14-foreign-scm.md` | Foreign SCM bridges (`svn`, `p4`, `cvs*`, `send-email`, …). |
 | `15-non-command-docs.md` | Guides, file formats, and user interfaces that are documentation, not commands. |
-| `plan.md` | Goals, design rules, recommended scope with rationale, budget, open questions, build order. |
+| `plan.md` | Goals, design rules, recommended scope with rationale, budget, decisions, build order. |
+| `phase-1.md` … `phase-8.md`, `phase-10.md` | The finished phases: what was built, what it was verified against, what was left for later, and where the budget stands. |
 | `git-tool-calls-*.md` | Raw evidence: every `git` call from two projects' agent sessions. |
 
 ## Notation
@@ -87,9 +89,13 @@ implementing anything.
   `03`–`05` instead of repeating hundreds of lines per command.
 - A trailing `[experimental]` marks commands git itself labels EXPERIMENTAL.
 
-## Suggested next steps
+## Where this stands
 
-1. Read `plan.md`, especially §6 (open questions) — a few of those change scope.
-2. Revise the `[x]` marks in `01-command-index.md`, then in the option files.
-3. Only then derive the required object-store, ref-store, and wire-protocol
-   surface — that surface is a consequence of the selections, not an input.
+The marks were the input to the build and the build is finished, so these
+documents are now a *record* rather than a menu: every `- [x]` is
+implemented and tested, and every `- [ ]` is a deliberate omission with the
+reason inline. What each phase actually left undone, and which document cuts
+it, is at the end of the phase notes — `phase-10.md` has the last of them.
+
+To revise the scope for v2, start from `plan.md` §8 (the backlog, in the order
+it would be restored) rather than from the marks here.

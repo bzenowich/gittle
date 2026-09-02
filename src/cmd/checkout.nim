@@ -32,7 +32,7 @@
 
 import std/[strutils, tables]
 import ../cli, ../diffcore, ../index, ../objects, ../pathspec,
-       ../refname,
+       ../refname, ../worktrees,
        ../refs, ../repository, ../revision, ../revwalk, ../status, ../util,
        ../worktree
 import branch as cmdbranch
@@ -93,6 +93,14 @@ proc doSwitch(c: Ctx, target: string, newBranch: string, forceBranch: bool,
     destRef = heads & newBranch
   elif not detach and d.found and d.full.startsWith(heads):
     destRef = d.full
+  # A branch in use in another worktree cannot be checked out here
+  # (worktrees.nim).  Switching to the branch this worktree is already on is
+  # exempt -- it makes nothing worse -- and so is `-b`, whose branch is new.
+  if destRef.len > 0 and destRef != repo.headRefName and
+     (newBranch.len == 0 or forceBranch):
+    let where = repo.checkedOutAt(destRef)
+    failIf(where.len > 0, "'" & destRef[heads.len .. ^1] &
+           "' is already used by worktree at '" & where & "'")
 
   let head = repo.refs.resolveRef(headRef)
   let idx = readIndex(repo.indexPath)

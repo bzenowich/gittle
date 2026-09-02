@@ -7,7 +7,7 @@
 #   tests/oracle.sh [--full]
 #
 # Without --full the object sweeps are sampled; with it they run over every
-# object in the reference repository (420k objects, ~1 minute).
+# object in the reference repository (420k objects, ~12 minutes for the lot).
 #
 # GITTLE   path to the binary under test   (default ./build/gittle)
 # REFREPO  the repository used as the oracle (default the git checkout above)
@@ -32,7 +32,8 @@ else
   GIT=git
 fi
 # Automatic maintenance would run at unpredictable moments and write to the
-# stderr this suite compares; gittle has no such thing (`gc` is phase 10).
+# stderr this suite compares.  gittle has no `--auto` at all (docs/07 cuts it),
+# so this only pins git's side.
 git() { "$GIT" -c gc.auto=0 -c maintenance.auto=false "$@"; }
 
 # Tests that write refs need an identity for the reflog, and must not depend on
@@ -1739,6 +1740,11 @@ p6state(){
     find . -path ./.git -prune -o \( -type f -o -type l \) -print | sort |
       while read -r f; do
         if [ -L "$f" ]; then printf '%s -> %s\n' "$f" "$(readlink "$f")"
+        elif [ "${f##*/}" = .git ]; then
+          # A linked worktree's `.git` is a *file* holding an absolute path,
+          # so its hash says only which copy it is in.  Print the content and
+          # let the caller normalise the path.
+          printf '%s: %s\n' "$f" "$(cat "$f")"
         else printf '%s %s %s\n' "$f" \
              "$(sha1sum <"$f" | cut -d' ' -f1)" "$([ -x "$f" ] && echo x || echo -)"
         fi
@@ -1770,7 +1776,11 @@ p6mut(){
   [ "$(printf '%s\n' "$ao" | p6norm | sed "s|$P6/[ab]|REPO|g")" \
   = "$(printf '%s\n' "$bo" | p6norm | sed "s|$P6/[ab]|REPO|g")" ] || this=0
   [ "$as" = "$bs" ] || this=0
-  sa=$(p6state "$P6/a"); sb=$(p6state "$P6/b")
+  # The two copies live at different paths, and a file that records one --
+  # a linked worktree's `.git`, which holds an absolute `gitdir:` -- would
+  # differ for that reason alone.
+  sa=$(p6state "$P6/a" | sed "s|$P6/[ab]|REPO|g")
+  sb=$(p6state "$P6/b" | sed "s|$P6/[ab]|REPO|g")
   [ "$sa" = "$sb" ] || this=0
   local oa ob
   oa=$(p6own "$GIT" "$P6/a"); ob=$(p6own "$GITTLE" "$P6/b")
@@ -2749,6 +2759,362 @@ rm -rf "$P8/sf"; cp -a "$P8/src" "$P8/sf"
 fsck8 "$P8/sf" "what a gittle push left on the server"
 [ $fsck8_ok = 1 ] && { ok; report "git fsck after gittle" "$fsck8_n cloned, fetched and pushed states"; } \
                   || bad "git fsck after gittle (phase 8)"
+
+# =========================================================================
+# Phase 10 -- housekeeping
+# =========================================================================
+#
+# `check-ignore`, `rm`, `mv`, `clean`, `worktree` and `gc`.  Four of the six
+# change the working tree, so they are compared the way phases 6 and 7
+# compared theirs: run in two identical copies and diff every ref, reflog,
+# config line, index entry and file either tool wrote.  `worktree` needs more
+# than that -- what it writes is mostly *under* `.git`, in a directory
+# `p6state` does not look at -- so it gets a comparison of its own.
+
+P10="$WORK/p10"; mkdir -p "$P10"
+
+# ------------------------------------------------------------- check-ignore
+#
+# One `.gitignore` of each documented shape, plus `info/exclude` and a global
+# excludes file, because `-v` prints which file a pattern came from and
+# getting the precedence right is most of what the engine does.
+rm -rf "$P10/ig"; mkdir -p "$P10/ig"
+( cd "$P10/ig"
+  git init -q -b main .
+  printf '*.log\n!keep.log\n\nbuild/\n/root-only.txt\nsub/deep.txt\n**/anywhere.bin\n' > .gitignore
+  mkdir -p sub/nested build tracked
+  printf 'local.tmp\n!*.log\n' > sub/.gitignore
+  touch a.log keep.log root-only.txt sub/deep.txt sub/local.tmp sub/x.log \
+        build/out.o sub/nested/anywhere.bin plain.txt tracked/t.txt info-ex.txt
+  printf 'info-ex.txt\n' > .git/info/exclude
+  git add .gitignore sub/.gitignore tracked/t.txt >/dev/null 2>&1 )
+printf 'global-ig.txt\n' > "$P10/globalignore"
+touch "$P10/ig/global-ig.txt"
+
+p6ok=1; p6n=0; p6dir="$P10/ig"; p6what="check-ignore"
+for f in "" "-v"; do
+  for p in a.log keep.log root-only.txt sub/deep.txt sub/local.tmp sub/x.log \
+           build build/out.o sub/nested/anywhere.bin plain.txt sub .gitignore \
+           tracked tracked/t.txt info-ex.txt; do
+    p6ro check-ignore $f -- "$p"
+  done
+done
+p6ro check-ignore -v a.log plain.txt sub/x.log
+p6ro check-ignore a.log plain.txt
+p6ro check-ignore -q a.log
+p6ro check-ignore -q plain.txt
+p6ro check-ignore -q a.log b.log
+p6ro check-ignore
+p6ro check-ignore -q -v a.log
+p6ro -c core.excludesFile="$P10/globalignore" check-ignore -v global-ig.txt
+p6dir="$P10/ig/sub"; p6ro check-ignore -v deep.txt; p6ro check-ignore -v ../a.log
+[ $p6ok = 1 ] && { ok; report "check-ignore" "$p6n paths, four pattern sources"; } \
+              || bad "check-ignore"
+
+# ------------------------------------------------------------------ rm, mv
+#
+# One fixture for both: a file, a subdirectory two deep, a symlink and an
+# empty directory, so that "not under version control", "destination exists"
+# and "source directory is empty" all have something to name.
+rm -rf "$P10/fix"; mkdir -p "$P10/fix"
+( cd "$P10/fix"
+  git init -q -b main .
+  mkdir -p sub/deep other emptydir
+  echo a > a.txt; echo b > b.txt; echo s > sub/s.txt; echo d > sub/deep/d.txt
+  echo o > other/o.txt; ln -s a.txt link; echo u > sub/untracked.txt
+  git add a.txt b.txt sub/s.txt sub/deep/d.txt other/o.txt link >/dev/null
+  git commit -qm one
+  # gittle detects no renames (plan.md's cut; docs/phase-5.md), and `mv` is
+  # the one command that makes one on purpose -- so git's `status` would say
+  # "renamed:" where gittle says a delete and an add.  Configured in the
+  # fixture rather than passed to git alone, so that both copies read the
+  # same file and the divergence is *tested* rather than merely absent.
+  git config status.renames false )
+
+P6=$P10; P6FIX="$P10/fix"; p6ok=1; p6n=0
+for f in "" "-n" "-q" "--cached"; do p6mut rm $f a.txt; done
+p6mut rm sub
+p6mut rm -r sub
+p6mut rm 'sub/*'
+p6mut rm sub/deep
+p6mut rm -r sub/deep
+p6mut rm nosuch.txt
+p6mut rm .
+p6mut rm -r .
+p6mut rm
+p6mut rm a.txt b.txt
+p6mut rm link
+PREP='echo mod >> a.txt' p6mut rm a.txt
+PREP='echo mod >> a.txt' p6mut rm -f a.txt
+PREP='echo mod >> a.txt' p6mut rm --cached a.txt
+PREP='echo mod >> a.txt; $GITX add a.txt' p6mut rm a.txt
+PREP='echo mod >> a.txt; $GITX add a.txt; echo more >> a.txt' p6mut rm a.txt
+PREP='echo mod >> a.txt; $GITX add a.txt; echo more >> a.txt' p6mut rm --cached a.txt
+PREP='rm a.txt' p6mut rm a.txt
+PREP='echo x >> a.txt; echo y >> b.txt' p6mut rm a.txt b.txt
+[ $p6ok = 1 ] && { ok; report "rm" "$p6n removals, refusals and dry runs"; } || bad "rm"
+
+p6ok=1; p6n=0
+p6mut mv a.txt c.txt
+p6mut mv -v a.txt c.txt
+p6mut mv -n a.txt c.txt
+p6mut mv a.txt b.txt
+p6mut mv -f a.txt b.txt
+p6mut mv -f -v a.txt b.txt
+p6mut mv a.txt sub
+p6mut mv a.txt sub/
+p6mut mv a.txt b.txt sub
+p6mut mv a.txt b.txt c.txt
+p6mut mv sub newsub
+p6mut mv -v sub newsub
+p6mut mv -n sub newsub
+p6mut mv sub newsub/
+p6mut mv sub other
+p6mut mv sub sub2/x
+p6mut mv emptydir newempty
+p6mut mv nosuch.txt x.txt
+p6mut mv a.txt a.txt
+p6mut mv sub sub/inner
+p6mut mv a.txt nosuchdir/x
+p6mut mv a.txt nosuchdir/
+p6mut mv link newlink
+p6mut mv a.txt link
+p6mut mv -f a.txt link
+p6mut mv other/o.txt .
+p6mut mv a.txt emptydir
+p6mut mv sub other/o.txt
+p6mut mv sub/s.txt sub/deep
+p6mut mv sub sub/deep/x
+p6mut mv sub/deep newdeep
+p6mut mv sub/s.txt sub/deep/d.txt
+p6mut mv a.txt other/o.txt
+[ $p6ok = 1 ] && { ok; report "mv" "$p6n renames and refusals"; } || bad "mv"
+
+# ------------------------------------------------------------------- clean
+#
+# The fixture exists to exercise the collapse rule (src/cmd/clean.nim): a
+# directory with tracked content, one with none, one holding an ignored file,
+# one that is entirely ignored, one that is a repository of its own, and an
+# ignored directory.
+rm -rf "$P10/cl"; mkdir -p "$P10/cl"
+( cd "$P10/cl"
+  git init -q -b main .
+  printf '*.log\nignoredir/\n' > .gitignore
+  mkdir -p tracked untracked/deep mixed ignoredir nested wholeign
+  echo t > tracked/t.txt; echo m > mixed/m.txt
+  git add .gitignore tracked/t.txt mixed/m.txt >/dev/null; git commit -qm one
+  echo u > u.txt; echo l > u.log
+  echo x > untracked/x.txt; echo y > untracked/deep/y.txt; echo z > untracked/deep/z.log
+  echo n > mixed/new.txt; echo il > mixed/i.log
+  echo ig > ignoredir/a.txt
+  echo w > wholeign/a.log; echo w2 > wholeign/b.log
+  ( cd nested && git init -q . && echo n > n.txt ) )
+
+P6FIX="$P10/cl"; p6ok=1; p6n=0
+for f in "" -n -f -fd -fdx -fdX -fx -fX -nd -ndx -ndX -ffd -ffdx -qfd -nx; do
+  p6mut clean $f
+done
+p6mut clean -fd untracked
+p6mut clean -fd mixed
+p6mut clean -f mixed
+p6mut clean -fd wholeign
+p6mut clean -fdx wholeign
+p6mut clean -fd nested
+p6mut clean -ffd nested
+p6mut clean -fdX ignoredir
+p6mut clean -f u.txt
+p6mut clean -fd untracked/deep
+p6mut clean -nfd nosuch
+p6mut clean -fd -e '*.txt'
+p6mut clean -fdx -e '*.log'
+p6mut clean -fdx -e untracked
+p6mut clean -fdX -e '*.txt'
+p6mut clean -f -e '*.txt'
+p6mut clean -fdxX
+p6mut -c clean.requireForce=false clean -d
+[ $p6ok = 1 ] && { ok; report "clean" "$p6n forms over the collapse rule"; } || bad "clean"
+
+# ---------------------------------------------------------------- worktree
+#
+# `p6state` looks at the refs, the reflogs, the config and the files -- and
+# almost everything `worktree` writes is somewhere else: `worktrees/<id>/`,
+# the `.git` file in the new checkout, and the pair of paths that point at
+# each other.  So this compares the two repositories *whole*, contents
+# included, with only the packfiles and the index skipped (a pack gittle
+# writes is not byte-identical to git's -- R2 -- and the index is compared
+# through `ls-files -s` instead).
+rm -rf "$P10/wt"; mkdir -p "$P10/wt"
+( cd "$P10/wt"
+  git init -q -b main .
+  echo a > a.txt; git add a.txt >/dev/null; git commit -qm one
+  git branch side; git tag v1 )
+
+p10n=0; p10ok=1
+p10state(){
+  ( cd "$1" 2>/dev/null || return
+    find . -print | sort | while read -r f; do
+      case "$f" in *.pack|*.idx|*/index|*/objects/*) echo "$f"; continue;; esac
+      if [ -f "$f" ]; then printf '%s: %s\n' "$f" "$(cat "$f" 2>/dev/null)"
+      else echo "$f"; fi
+    done
+    git ls-files -s )
+}
+# p10 <args...> -- run in two copies, compare output, status and everything
+# on disk.  $PREP runs first with $GITX bound to the tool under test.
+p10(){
+  local ao as bo bs this=1 sa sb
+  rm -rf "$P10/a" "$P10/b"; cp -a "$P10/wt" "$P10/a"; cp -a "$P10/wt" "$P10/b"
+  ( cd "$P10/a" && GITX="$GIT"    && eval "${PREP:-true}" ) >/dev/null 2>&1
+  ( cd "$P10/b" && GITX="$GITTLE" && eval "${PREP:-true}" ) >/dev/null 2>&1
+  ao=$( cd "$P10/a" && git "$@" 2>&1 ); as=$?
+  bo=$( cd "$P10/b" && "$GITTLE" "$@" 2>&1 ); bs=$?
+  p10n=$((p10n+1))
+  local n='s|'"$P10"'/[ab]|REPO|g'
+  [ "$(printf '%s\n' "$ao" | p6norm | sed "$n")" \
+  = "$(printf '%s\n' "$bo" | p6norm | sed "$n")" ] || this=0
+  [ "$as" = "$bs" ] || this=0
+  sa=$(p10state "$P10/a" | sed "$n"); sb=$(p10state "$P10/b" | sed "$n")
+  [ "$sa" = "$sb" ] || this=0
+  if [ $this = 0 ]; then
+    p10ok=0
+    printf '  %s%s  [git %d / gittle %d]\n' "${PREP:+($PREP) }" "$*" "$as" "$bs"
+    diff <(printf '%s\n' "$ao"|p6norm|sed "$n") <(printf '%s\n' "$bo"|p6norm|sed "$n") | head -5
+    diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -8
+  fi
+}
+PREP=true
+p10 worktree add wt1
+p10 worktree add wt1 side
+p10 worktree add --detach wt1 HEAD
+p10 worktree add --detach wt1 v1
+p10 worktree add -b nb wt1
+p10 worktree add -B nb wt1
+p10 worktree add -b nb wt1 side
+p10 worktree add wt1 v1
+p10 worktree add wt1 nosuch
+p10 worktree add wt1 main
+p10 worktree add -q wt1
+p10 worktree add -b side wt1
+p10 worktree list
+p10 worktree prune
+p10 worktree remove wt1
+p10 worktree move wt1 wt2
+# Everything below starts from a repository that already has a worktree, and
+# `$GITX` makes each tool continue a state it built itself.
+PREP='$GITX worktree add wt1 side'
+p10 worktree list
+p10 worktree remove wt1
+p10 worktree remove -f wt1
+p10 worktree remove nosuch
+p10 worktree remove .
+p10 worktree move wt1 wt2
+p10 worktree move . x
+p10 worktree move wt1 wt1/inner
+p10 worktree prune
+p10 worktree add wt1
+p10 worktree add wt2
+p10 worktree add wt2 side
+p10 worktree add -f wt2 side
+p10 branch -d side
+p10 branch -D side
+p10 branch -f side main
+p10 branch -v
+p10 branch -vv
+p10 checkout side
+p10 switch side
+p10 checkout main
+PREP='$GITX worktree add wt1 side; echo dirty >> wt1/a.txt'
+p10 worktree remove wt1
+p10 worktree remove -f wt1
+PREP='$GITX worktree add wt1 side; echo new > wt1/untracked.txt'
+p10 worktree remove wt1
+PREP='$GITX worktree add wt1 side; rm -rf wt1'
+p10 worktree list
+p10 worktree prune
+p10 worktree remove wt1
+p10 worktree add wt1
+p10 worktree add -f wt1
+PREP='$GITX worktree add wt1 side; $GITX worktree add --detach wt2 main'
+p10 worktree list
+p10 worktree prune
+p10 worktree remove wt2
+PREP='mkdir -p sub'
+p10 -C sub worktree add wt1
+p10 -C sub worktree list
+p10 -C sub worktree add ../wt2
+PREP=
+[ $p10ok = 1 ] && { ok; report "worktree" "$p10n forms, both repositories compared whole"; } \
+               || bad "worktree"
+
+# ---------------------------------------------------------------------- gc
+#
+# `gc` is additive (plan.md R2a), so the packs it leaves are *not* git's and
+# cannot be compared.  What can be compared is everything a later command
+# reads: the refs, the reflogs, the index, the working tree, and whether
+# every object still reachable is still there.  `git fsck --strict` after it
+# is the other half of the claim.
+#
+# git is told `gc.reflogExpire=never`: gittle does not expire reflogs, which
+# is a deliberate cut (src/cmd/gc.nim), and without this the comparison would
+# be of that and nothing else -- the fixture's commits are dated 2023 and the
+# suite pins "now" to 2027.
+rm -rf "$P10/gc"; mkdir -p "$P10/gc"
+( cd "$P10/gc"
+  git init -q -b main .
+  for i in 1 2 3; do echo $i > f$i.txt; git add f$i.txt >/dev/null; git commit -qm "c$i"; done
+  git branch side; git tag -m ann v1; git tag light
+  echo dead > u.txt; git add u.txt >/dev/null; git commit -qm dead
+  git reset -q --hard HEAD~1
+  git config gc.reflogExpire never
+  git config gc.reflogExpireUnreachable never )
+
+P6FIX="$P10/gc"; p6ok=1; p6n=0
+p6mut gc --quiet
+p6mut gc -q --prune=now
+p6mut gc -q --no-prune
+p6mut gc -q --prune=never
+p6mut gc -q --prune=all
+PREP='$GITX worktree add wt1 side' p6mut gc --quiet
+PREP='$GITX worktree add wt1 side' p6mut gc -q --prune=now
+PREP='$GITX worktree add wt1 side; rm -rf wt1' p6mut gc --quiet
+PREP='echo staged > s.txt; $GITX add s.txt' p6mut gc -q --prune=now
+PREP='echo x | $GITX hash-object -w --stdin' p6mut gc -q --prune=now
+PREP='echo x | $GITX hash-object -w --stdin' p6mut gc -q
+[ $p6ok = 1 ] && { ok; report "gc" "$p6n runs, refs, reflogs and objects compared"; } || bad "gc"
+
+# The claim `gc` actually makes: loose objects end up in a pack, unreachable
+# ones older than the expiry are gone, and git is still happy afterwards.
+gc_ok=1
+rm -rf "$P10/g1"; cp -a "$P10/gc" "$P10/g1"
+dangling=$( cd "$P10/g1" && echo dangling | git hash-object -w --stdin )
+before=$( find "$P10/g1/.git/objects" -type f -name '*' -not -path '*/pack/*' -not -path '*/info/*' | wc -l )
+( cd "$P10/g1" && "$GITTLE" gc -q --prune=now )
+after=$( find "$P10/g1/.git/objects" -type f -not -path '*/pack/*' -not -path '*/info/*' | wc -l )
+[ "$before" -gt 0 ] && [ "$after" = 0 ] || { gc_ok=0; echo "  loose objects: $before before, $after after"; }
+( cd "$P10/g1" && git cat-file -e "$dangling" 2>/dev/null ) && { gc_ok=0; echo "  unreachable object survived --prune=now"; }
+# ... and the reflog is a root, so what `reset --hard` moved off is kept.
+kept=$( cd "$P10/g1" && git rev-parse HEAD@{1} )
+( cd "$P10/g1" && git cat-file -e "$kept" 2>/dev/null ) || { gc_ok=0; echo "  a commit named by the reflog was pruned"; }
+# ... and a ref's own object survives, not merely what it peels to: an
+# annotated tag is a root *and* an object, and keeping only the commit it
+# names leaves the ref dangling.
+tagobj=$( cd "$P10/g1" && git rev-parse refs/tags/v1 )
+( cd "$P10/g1" && git cat-file -e "$tagobj" 2>/dev/null ) || { gc_ok=0; echo "  an annotated tag object was pruned"; }
+git -C "$P10/g1" fsck --strict --no-progress >/dev/null 2>&1 || { gc_ok=0; echo "  fsck not clean after gc"; }
+# The refs are packed, and nothing is left loose beside them.
+[ -f "$P10/g1/.git/packed-refs" ] || { gc_ok=0; echo "  no packed-refs after gc"; }
+[ -z "$(find "$P10/g1/.git/refs" -type f)" ] || { gc_ok=0; echo "  loose refs left after gc"; }
+diff <( cd "$P10/gc" && git for-each-ref ) <( cd "$P10/g1" && git for-each-ref ) >/dev/null \
+  || { gc_ok=0; echo "  refs changed across gc"; }
+# R2a: a pack that was already here is not rewritten.
+rm -rf "$P10/g2"; cp -a "$P10/gc" "$P10/g2"
+( cd "$P10/g2" && git gc -q )
+inherited=$( ls "$P10"/g2/.git/objects/pack/*.pack )
+( cd "$P10/g2" && echo more > m.txt && "$GITTLE" add m.txt && "$GITTLE" commit -qm more && "$GITTLE" gc -q ) >/dev/null 2>&1
+[ -f "$inherited" ] || { gc_ok=0; echo "  gc rewrote an inherited pack (R2a)"; }
+[ $gc_ok = 1 ] && { ok; report "gc, what it claims" "additive, reflogs are roots, fsck clean"; } \
+               || bad "gc, what it claims"
+
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

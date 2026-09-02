@@ -618,9 +618,9 @@ type RevInput* = object
 
 proc initRevInput*(): RevInput = RevInput(maxCount: -1)
 
-proc parseDate(s: string): int64 =
-  ## `--since` / `--until`.  A raw seconds count, or an ISO-8601 date with an
-  ## optional time and zone.
+proc parseTimestamp*(s: string): int64 =
+  ## `--since` / `--until`, and `gc --prune=<date>`.  A raw seconds count, or
+  ## an ISO-8601 date with an optional time and zone.
   ##
   ## Not approxidate: "2 weeks ago" is a 1,200-line parser of English behind
   ## one option, which is R6's case exactly (plan.md §3).  Refusing by name
@@ -678,8 +678,8 @@ proc parseWalkOpt*(w: RevWalk, ri: var RevInput, a: string,
     if pseudo: return
     if name == "--max-count" or a == "-n": ri.maxCount = parseInt(valueFor(a, ""))
     elif name == "--skip": ri.skip = parseInt(valueFor(a, ""))
-    elif name in ["--since", "--after"]: w.maxAge = parseDate(valueFor(a, ""))
-    elif name in ["--until", "--before"]: w.minAge = parseDate(valueFor(a, ""))
+    elif name in ["--since", "--after"]: w.maxAge = parseTimestamp(valueFor(a, ""))
+    elif name in ["--until", "--before"]: w.minAge = parseTimestamp(valueFor(a, ""))
     elif a == "--no-walk" or name == "--no-walk":
       w.noWalk = true
       w.noWalkSorted = pattern != "unsorted"

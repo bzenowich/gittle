@@ -26,7 +26,8 @@
 
 import std/[os, strutils]
 import ../cli, ../config, ../reffilter, ../refname, ../refs,
-       ../repository, ../revision, ../revwalk, ../sequencer, ../util
+       ../repository, ../revision, ../revwalk, ../sequencer, ../util,
+       ../worktrees
 import foreachref
 
 const usageText = """usage: gittle branch [<options>] [<pattern>…]
@@ -162,6 +163,12 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
     if verbose == 0: return
     var row = r
     result.add " " & repo.uniqueAbbrev(row.self.oid, repo.autoAbbrev) & " "
+    # `-vv` names the other worktree a branch is checked out in, just after
+    # the object ID: it is the reason `+` was printed and the reason a
+    # `checkout` of it will be refused.
+    if verbose > 1 and not row.isHead:
+      let wtPath = repo.checkedOutAt(row.rf.name)
+      if wtPath.len > 0: result.add "(" & wtPath & ") "
     if verbose > 1 and repo.upstreamRef(row.rf.name).len > 0:
       let up = repo.refs.shortenRef(repo.upstreamRef(row.rf.name))
       let t = trackText(repo, row.rf.name, brackets = false)
@@ -175,15 +182,20 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
     echo line("* ", detached, RefRow(self: ObjInfo(
                 oid: repo.refs.resolveRef(headRef).oid)), "")
   for i in 0 ..< rows.len:
-    echo line((if rows[i].isHead: "* " else: "  "), shownName(rows[i]),
-              rows[i], rows[i].rf.symTarget)
+    # `+` marks a branch some *other* worktree has checked out, which is a
+    # branch this one may not move (worktrees.nim).  git spells the same rule
+    # as `%(if)%(HEAD)%(then)*%(else)%(if)%(worktreepath)%(then)+`.
+    let mark = if rows[i].isHead: "* "
+               elif repo.checkedOutAt(rows[i].rf.name).len > 0: "+ "
+               else: "  "
+    echo line(mark, shownName(rows[i]), rows[i], rows[i].rf.symTarget)
   0
 
 # ---------------------------------------------------------------------------
 # Creating, deleting, renaming
 # ---------------------------------------------------------------------------
 
-proc createBranch(c: Ctx, name, startPoint: string, force, quiet, track: bool,
+proc createBranch*(c: Ctx, name, startPoint: string, force, quiet, track: bool,
                   trackGiven: bool) =
   let repo = c.repo
   failIf(not isValidRefname(heads & name, {}),
@@ -192,9 +204,12 @@ proc createBranch(c: Ctx, name, startPoint: string, force, quiet, track: bool,
   let existing = repo.refs.readRef(full)
   failIf(existing.found and not force,
          "a branch named '" & name & "' already exists")
-  failIf(existing.found and full == repo.headRefName,
-         "cannot force update the branch '" & name &
-         "' checked out at '" & repo.workTree & "'")
+  # Any worktree, not only this one: two checkouts of one branch would let a
+  # commit in either move the ref under the other (worktrees.nim).
+  if existing.found:
+    let where = repo.checkedOutAt(full)
+    failIf(where.len > 0, "cannot force update the branch '" & name &
+           "' used by worktree at '" & where & "'")
 
   # With no start point the reflog records the *branch* the new one came from,
   # not the word "HEAD" -- that is what makes the entry readable a year later.
@@ -223,11 +238,12 @@ proc deleteBranches(c: Ctx, names: seq[string], force, quiet, remote: bool): int
       stderr.write "error: branch '" & name & "' not found\n"
       result = 1
       continue
-    if full == repo.headRefName:
+    let usedAt = if remote: "" else: repo.checkedOutAt(full)
+    if usedAt.len > 0:
       # An `error:` and exit 1, not a fatal: `branch -d a b c` goes on to the
       # others, which is why every refusal in this loop is reported this way.
       stderr.write "error: cannot delete branch '" & name &
-                   "' used by worktree at '" & repo.workTree & "'\n"
+                   "' used by worktree at '" & usedAt & "'\n"
       result = 1
       continue
     if not force:

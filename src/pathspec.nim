@@ -44,6 +44,11 @@ type
     items: seq[PathspecItem]
     prefix*: string      ## the current directory, root-relative, "" or "sub/"
 
+  PathMatch* = enum
+    ## How an item matched, in git's own order: a stronger match on any one
+    ## path outranks a weaker one on another (`ce_path_match` keeps the max).
+    pmNone, pmRecursive, pmFnmatch, pmExact
+
 const wildcardChars = {'*', '?', '[', '\\'}
 
 func firstWildcard(s: string): int =
@@ -72,6 +77,14 @@ proc applyPrefix(pattern, prefix: string, top: bool): string =
   failIf(result == ".." or result.startsWith("../"),
          "'" & pattern & "' is outside the repository")
   if result == ".": result = ""
+
+proc inPrefix*(path, prefix: string): string =
+  ## A plain path name, as typed in the directory `prefix`, made root-relative.
+  ##
+  ## Not everything that takes a path takes a *pathspec*: `mv`, `rm`'s working
+  ## tree half and `check-ignore` all name files outright, and they resolve
+  ## `..` the same way a pathspec does (`prefix_path`).
+  applyPrefix(path, prefix, false)
 
 proc parseItem(spec, prefix: string): PathspecItem =
   result.raw = spec
@@ -137,24 +150,33 @@ func globFlags(it: PathspecItem): set[GlobFlag] =
   if it.globMagic: result.incl gfPathname
   if it.icase: result.incl gfIgnoreCase
 
-func matchesItem(it: PathspecItem, path: string): bool =
-  ## One item against one root-relative path.
+func matchItem(it: PathspecItem, path: string): PathMatch =
+  ## One item against one root-relative path, and *how* it matched.
   ##
   ## The subtree rule ("a directory name matches everything under it") applies
   ## to the default and literal forms.  Under `:(glob)` it does not: that magic
   ## exists to say "match exactly this shape", and the subtree rule would
   ## silently widen it again.
-  if it.pattern.len == 0: return true    # the whole tree
+  ##
+  ## Which of the three kinds it was is not decoration.  `rm` refuses a
+  ## directory named without `-r`, and the only thing that distinguishes
+  ## `rm dir` from `rm 'dir/*'` -- both of which name the same files -- is
+  ## that the first matched them *recursively* and the second by wildcard
+  ## (`dir.c:match_pathspec_item`).
+  if it.pattern.len == 0: return pmRecursive    # the whole tree
   let eq = if it.icase: cmpIgnoreCase(path, it.pattern) == 0 else: path == it.pattern
-  if eq: return true
+  if eq: return pmExact
   if not it.globMagic:
     let dirPrefix = it.pattern & "/"
     if path.len > dirPrefix.len and
        (if it.icase: cmpIgnoreCase(path[0 ..< dirPrefix.len], dirPrefix) == 0
         else: path.startsWith(dirPrefix)):
-      return true
-  if it.literal: return false
-  globMatch(it.pattern, path, it.globFlags)
+      return pmRecursive
+  if it.literal: return pmNone
+  if globMatch(it.pattern, path, it.globFlags): pmFnmatch else: pmNone
+
+func matchesItem(it: PathspecItem, path: string): bool =
+  it.matchItem(path) != pmNone
 
 func matches*(ps: Pathspec, path: string): bool =
   ## An empty pathspec matches everything -- that is what makes `gittle add -A`
@@ -217,6 +239,20 @@ func firstUnmatched*(ps: Pathspec, paths: openArray[string]): string =
         break
     if not hit: return it.raw
   ""
+
+func itemCount*(ps: Pathspec): int = ps.items.len
+func itemRaw*(ps: Pathspec, i: int): string = ps.items[i].raw
+
+proc matchKinds*(ps: Pathspec, paths: openArray[string]): seq[PathMatch] =
+  ## For each item, the strongest way it matched any of `paths`.  `rm` needs
+  ## it per item and not per path: the question it asks is "did this argument
+  ## name a directory", and only the argument can answer that.
+  result = newSeq[PathMatch](ps.items.len)
+  for i, it in ps.items:
+    if it.exclude: continue
+    for path in paths:
+      let m = it.matchItem(path)
+      if m > result[i]: result[i] = m
 
 proc relativeTo*(path, prefix: string): string =
   ## A root-relative path as the user should see it: relative to the directory

@@ -71,7 +71,7 @@ proc versionOf*(idx: Index, path: string): Version =
   if k >= 0: Version(mode: canonMode(idx.entries[k].mode), oid: idx.entries[k].oid)
   else: Version()
 
-proc workingMatches(repo: Repository, idx: Index, path: string): bool =
+proc workingMatches*(repo: Repository, idx: Index, path: string): bool =
   ## Is the working file what the index says it is?  The stat cache answers
   ## almost always; a racily-clean entry falls through to reading the content,
   ## which is what the zeroed size in the index is asking for (see index.nim).
