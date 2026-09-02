@@ -1,9 +1,13 @@
 ## `merge` -- join another history into this one.
 ##
-## In scope (docs/07, docs/05 `merge-options`): `<commit>`, `-m`,
-## `--ff`/`--no-ff`/`--ff-only`, `--commit`/`--no-commit`,
-## `-e`/`--edit`/`--no-edit`, `-s`/`--signoff`, `-q`/`-v`, and the three
+## In scope (docs/07, docs/05 `merge-options`): `<commit>`, `-m`, `--no-ff`,
+## `--ff-only`, `--no-commit`, `-e`/`--edit`/`--no-edit`, `-q`, and the three
 ## state verbs `--abort`, `--quit`, `--continue`.
+##
+## The second minimisation pass (docs/minimize-2.md B4) refused four options
+## that only restated a default -- `--ff`, `--commit`, `-v` -- and `-s`, which
+## was worse than unused: git spells `--strategy` `-s`, so `gittle merge -s
+## ort` would have signed off a merge rather than naming a strategy.
 ##
 ## ## The three outcomes, and why fast-forward is not a merge
 ##
@@ -21,7 +25,7 @@
 ##
 ## ## What is cut
 ##
-## `-s`/`-X` (only `ort` exists here -- R4), `--squash`, `--log`,
+## `--strategy`/`-X` (only `ort` exists here -- R4), `--squash`, `--log`,
 ## `--autostash`, `--allow-unrelated-histories`, `--verify-signatures`, `-F`,
 ## and the octopus case: a second `<commit>` is refused rather than merged.
 ## No hook fires, here or anywhere but `commit` (plan.md decision 1), so
@@ -83,7 +87,7 @@ proc defaultMessage(repo: Repository, target: string, oid: Oid): string =
       result.add "\n" & body
 
 proc commitMerge(repo: Repository, idx: Index, parents: seq[Oid],
-                 msg0: string, useEditor, signoff: bool,
+                 msg0: string, useEditor: bool,
                  reflogPrefix: string, reflogTail = ""): tuple[oid: Oid,
                  msg: string] =
   ## Write the merge commit and move HEAD.  Shared by the clean-merge path and
@@ -93,7 +97,7 @@ proc commitMerge(repo: Repository, idx: Index, parents: seq[Oid],
   ## subject when no tail is given: `merge` records what it *did* ("Merge made
   ## by the 'ort' strategy."), and a merge concluded by hand records what the
   ## user said.
-  result.msg = repo.finalMessage(msg0, useEditor, signoff, editTemplate)
+  result.msg = repo.finalMessage(msg0, useEditor, signoff = false, editTemplate)
   result.oid = repo.commitOnHead(idx, parents, getIdent(repo.cfg, irAuthor),
     result.msg,
     reflogPrefix & (if reflogTail.len > 0: reflogTail else: result.msg.subject))
@@ -107,23 +111,22 @@ proc printStat(repo: Repository, oldTree, newTree: Oid) =
   stdout.flushFile()
 
 const
-  synopsis = "[-m <msg>] [--ff|--no-ff|--ff-only] [--[no-]commit] [-e|--no-edit] [-s] [-q|-v] <commit>\n--abort | --quit | --continue"
+  synopsis = "[-m <msg>] [--no-ff|--ff-only] [--no-commit] [-e|--no-edit] [-q] <commit>\n--abort | --quit | --continue"
   options = [
     opt("-m|--message", okValue, arg = "<msg>", help = "the merge commit's message"),
-    opt("--ff", help = "fast-forward when possible (the default)"),
     opt("--no-ff", help = "always make a merge commit"),
     opt("--ff-only", help = "refuse anything but a fast-forward"),
-    opt("--commit", help = "commit the result (the default)"),
     opt("--no-commit", help = "stop before committing"),
     opt("-e|--edit", help = "open the editor on the message"),
     opt("--no-edit", help = "never open the editor"),
-    opt("-s|--signoff", help = "add a Signed-off-by trailer"),
-    opt("--no-signoff"),
     opt("-q|--quiet", help = "print no summary"),
-    opt("-v|--verbose", help = "print the summary (the default)"),
     opt("--abort", help = "undo an unfinished merge"),
     opt("--quit", help = "forget an unfinished merge, keeping the tree as it is"),
     opt("--continue", help = "conclude a merge whose conflicts are resolved"),
+    opt("--ff|--commit|-v|--verbose", okRefused,
+        help = "each only restates a default: fast-forward when possible, commit, print the summary"),
+    opt("-s|--signoff|--no-signoff", okRefused,
+        help = "sign off in 'gittle commit -s'; git spells --strategy -s, and gittle has one strategy"),
     opt("-F|--file|--into-name|--overwrite-ignore|--no-overwrite-ignore|--cleanup|" &
         "--strategy|-X|--strategy-option|--squash|--no-squash|--log|--no-log|--stat|-n|" &
         "--no-stat|--compact-summary|--summary|--no-summary|--verify|--no-verify|" &
@@ -137,20 +140,9 @@ proc cmdMerge*(c: Ctx, argv: seq[string]): int =
   ## merge the target: fast-forward when allowed, else the three-way
   ## merge and a commit unless `--no-commit` or a conflict stops it.
   let o = parse(options, argv, "merge", synopsis)
-  var ff = ffAuto
-  var noCommit, signoff, quiet = false
-  for (k, _) in o.occurrences:        # each pair: the last one given wins
-    case k
-    of "ff": ff = ffAuto
-    of "no-ff": ff = ffNever
-    of "ff-only": ff = ffOnly
-    of "commit": noCommit = false
-    of "no-commit": noCommit = true
-    of "signoff": signoff = true
-    of "no-signoff": signoff = false
-    of "quiet": quiet = true
-    of "verbose": quiet = false
-    else: discard
+  let ff = if o.has "no-ff": ffNever elif o.has "ff-only": ffOnly else: ffAuto
+  let noCommit = o.has "no-commit"
+  let quiet = o.has "quiet"
   let messages = o.vals "message"
   let forceEdit = o.has "edit"
   let noEdit = o.has "no-edit"
@@ -185,7 +177,7 @@ proc cmdMerge*(c: Ctx, argv: seq[string]): int =
       if e.stage != 0: repo.dieResolveConflict("commit", idx)
     let made = commitMerge(repo, idx, @[head.oid] & repo.mergeHeads,
                            repo.readState("MERGE_MSG"),
-                           useEditor = not noEdit, signoff = signoff,
+                           useEditor = not noEdit,
                            reflogPrefix = "commit (merge): ")
     if not quiet: repo.summarizeCommit(made.oid)
     return 0
@@ -193,8 +185,7 @@ proc cmdMerge*(c: Ctx, argv: seq[string]): int =
   repo.refuseIfInProgress(idx, "merge")
   failIf(targets.len == 0, "no commit specified\n" & o.use)
   failIf(targets.len > 1,
-         "merging more than one commit at a time is out of scope for " &
-         "gittle v1 (docs/05 cuts the octopus strategy)")
+         "merge one commit at a time: the octopus strategy is cut (docs/05)")
   failIf(not head.found, "merge into an unborn branch is out of scope for " &
          "gittle v1; use 'gittle checkout' or 'gittle reset'")
   let target = targets[0]
@@ -237,11 +228,9 @@ proc cmdMerge*(c: Ctx, argv: seq[string]): int =
     return 0
   if ff == ffOnly:
     if repo.cfg.getBool("advice.diverging", true):
-      stderr.write "hint: Diverging branches can't be fast-forwarded, you " &
-        "need to either:\nhint:\nhint: \tgittle merge --no-ff\nhint:\n" &
-        "hint: or:\nhint:\nhint: \tgittle rebase\nhint:\n" &
-        "hint: Disable this message with \"gittle config set " &
-        "advice.diverging false\"\n"
+      stderr.write "hint: Diverging branches cannot be fast-forwarded: " &
+        "use 'gittle merge --no-ff' or 'gittle rebase' " &
+        "(advice.diverging false turns this off)\n"
     fail("Not possible to fast-forward, aborting.")
 
   # ---- the real thing
@@ -276,7 +265,6 @@ proc cmdMerge*(c: Ctx, argv: seq[string]): int =
   # strategy line is the reflog entry and the subject is not.
   let newOid = commitMerge(repo, idx, @[ours, theirs], msg,
                            useEditor = forceEdit and not noEdit,
-                           signoff = signoff,
                            reflogPrefix = (if c.reflogAction.len > 0: c.reflogAction
                                            else: "merge " & target) & ": ",
                            reflogTail = made).oid

@@ -2,7 +2,10 @@
 ##
 ## In scope (docs/06): `<pathspec>…`, `-a`, `-m`, `-F`, `-e`/`--no-edit`,
 ## `-s`/`--signoff`, `--author`, `--date`, `--amend`, `--allow-empty`,
-## `-n`/`--no-verify`, `-q`, `--`.
+## `-n`/`--no-verify`, `-q`, `--`.  `--verify` and `--no-signoff` were cut in
+## the second minimisation pass (docs/minimize-2.md B4): they negate flags that
+## are already off, so nothing but a script that had already said `-s` or `-n`
+## could want them, and no such script exists in either tool-call log.
 ##
 ## ## The order of operations, and why it is that order
 ##
@@ -34,9 +37,9 @@
 ## prints alongside it.
 
 import std/os
-import ../cli, ../commitobj, ../diffcore, ../dir, ../hooks, ../ident, ../index,
-       ../oid, ../pathspec, ../pretty, ../repository, ../sequencer, ../status,
-       ../trees, ../util
+import ../cli, ../commitobj, ../dir, ../hooks, ../ident, ../index,
+       ../oid, ../pathspec, ../repository, ../sequencer, ../status,
+       ../trees, ../util, ../worktree
 
 
 const editTemplate = """
@@ -54,9 +57,8 @@ proc identFor(cfg: Config, role: IdentRole, override, dateOverride: string,
   result = if haveFallback: fallback else: getIdent(cfg, role)
   if override.len > 0:
     let o = parseIdentLine(override)
-    failIf(o.email.len == 0,
-           "malformed --author '" & override & "'\n" &
-           "  it must look like: A U Thor <author@example.com>")
+    failIf(o.email.len == 0, "malformed --author '" & override &
+           "': it must look like A U Thor <author@example.com>")
     result.name = o.name
     result.email = o.email
     if o.when0 != 0:
@@ -72,19 +74,53 @@ proc stageOrRemove(repo: Repository, into: Index, path: string) =
   ## entry when the file is gone.
   if not stageWorkingPath(repo, into, path): discard into.removePath(path)
 
-proc partialTree(repo: Repository, idx: Index, paths: seq[string],
-                 headTree: Oid, haveHead: bool): tuple[oid: Oid, index: Index] =
+proc partialCommit(repo: Repository, idx: Index, ps: Pathspec, headTree: Oid,
+                   haveHead: bool): tuple[oid: Oid, index: Index,
+                                          paths: seq[string]] =
   ## `gittle commit <pathspec>` commits *the working tree* for those paths and
   ## HEAD's content for everything else -- deliberately ignoring whatever else
   ## is staged.  So the tree is built from a scratch index seeded with HEAD,
-  ## not from the real one.
+  ## not from the real one, and that scratch index is what the hooks are shown.
   ##
   ## Only tracked paths can be named this way; git refuses an untracked one
-  ## rather than quietly adding it, and so does the caller.
+  ## rather than quietly adding it, and refuses it *before* writing anything.
+  for e in idx.entries:
+    if e.stage == 0 and ps.matches(e.path): result.paths.add e.path
+  let missed = ps.firstUnmatched(result.paths)
+  failIf(missed.len > 0,
+         "pathspec '" & missed & "' did not match any file(s) known to gittle")
   result.index = Index(version: 2)
   if haveHead: repo.readTreeInto(result.index, headTree)
-  for path in paths: repo.stageOrRemove(result.index, path)
+  for path in result.paths: repo.stageOrRemove(result.index, path)
   result.oid = repo.writeTree(result.index)
+
+proc reportNothingToCommit(repo: Repository, idx: Index): int =
+  ## git prints the whole of `status` here, not a one-line refusal: the
+  ## question the user is about to ask is "then what *is* changed?", and the
+  ## answer is already computed (`builtin/commit.c:prepare_to_commit`).
+  let st = computeStatus(repo, idx, parsePathspec(@[], repo.prefix), umNormal)
+  stdout.write longStatus(st, umNormal,
+    (if repo.cfg.getBool("status.relativePaths", true): repo.prefix else: ""))
+  stdout.flushFile()
+  1
+
+proc prepareMessage(repo: Repository, messages: seq[string], op: Operation,
+                    amended: string, signoff, useEditor: bool): string =
+  ## Step 2: assemble the message and put it where `commit-msg` can rewrite it.
+  ##
+  ## The sources, in order: `-m`/`-F`, then the message the operation in
+  ## progress already prepared (`MERGE_MSG`), then the commit being amended.
+  ## Returns the *file*, not the text, because the hook runs on the file next
+  ## and the caller reads it back afterwards.
+  var msg = joinMessages(messages)
+  if msg.len == 0 and op != opNone: msg = repo.readState("MERGE_MSG")
+  if msg.len == 0: msg = amended
+  if signoff:
+    msg = appendSignoff(cleanupMessage(msg, dropComments = false),
+                        getIdent(repo.cfg, irCommitter))
+  result = repo.gitDir / "COMMIT_EDITMSG"
+  writeFile(result, msg & (if useEditor: editTemplate else: ""))
+  if useEditor: launchEditor(repo.cfg, result)
 
 const
   synopsis = "[-a] [-m <msg>] [-F <file>] [--amend] [--author=<author>] [--date=<date>]\n[-s] [-q] [--allow-empty] [--no-verify] [-e|--no-edit] [--] [<pathspec>…]"
@@ -95,14 +131,14 @@ const
     opt("--amend", help = "replace the tip commit"),
     opt("--allow-empty", help = "record a commit with no change"),
     opt("-s|--signoff", help = "add a Signed-off-by trailer"),
-    opt("--no-signoff"),
     opt("-q|--quiet", help = "print no summary"),
     opt("-n|--no-verify", help = "skip the pre-commit and commit-msg hooks"),
-    opt("--verify"),
     opt("-e|--edit", help = "open the editor even when a message was given"),
     opt("--no-edit", help = "never open the editor"),
     opt("--author", okValue, arg = "<author>", help = "override the author, `A U Thor <a@b>`"),
     opt("--date", okValue, arg = "<date>", help = "override the author date"),
+    opt("--verify|--no-signoff", okRefused,
+        help = "nothing to negate: the hooks run and no trailer is added unless -n or -s says so"),
     opt("-p|--patch|-i|--include|-o|--only|-v|--verbose|--dry-run|--short|--porcelain|" &
         "-C|--reuse-message|--fixup|--squash|--cleanup|--reset-author", okRefused, help = "docs/06"),
   ]
@@ -113,32 +149,20 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
   ## through the hooks and the editor, and write the commit.
   let o = parse(options, argv, "commit", synopsis)
   var messages: seq[string]
-  var signoff, noVerify = false
   for (k, v) in o.occurrences:        # -m and -F accumulate, in order
-    case k
-    of "message": messages.add v
-    of "file": messages.add(if v == "-": readAll(stdin) else: readWholeFile(v))
-    of "signoff": signoff = true
-    of "no-signoff": signoff = false
-    of "no-verify": noVerify = true
-    of "verify": noVerify = false
-    else: discard
+    if k == "message": messages.add v
+    elif k == "file": messages.add(if v == "-": readAll(stdin)
+                                   else: readWholeFile(v))
   let all = o.has "all"
   let amend = o.has "amend"
-  let allowEmpty = o.has "allow-empty"
   let quiet = o.has "quiet"
-  let forceEdit = o.has "edit"
-  let noEdit = o.has "no-edit"
-  let authorOpt = o.val "author"
-  let dateOpt = o.val "date"
+  let noVerify = o.has "no-verify"
   let specs = o.args
   let repo = c.repo
   failIf(repo.workTree.len == 0,
          "cannot commit in a bare repository: there is no working tree")
-  failIf(all and specs.len > 0,
-         "paths with -a does not make sense\n" &
-         "  -a stages every tracked change; naming paths commits those " &
-         "paths only")
+  failIf(all and specs.len > 0, "paths with -a does not make sense: -a stages " &
+         "every tracked change, naming paths commits those paths only")
 
   let idx = readIndex(repo.indexPath)
   for e in idx.entries:
@@ -154,11 +178,10 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
   # the commit being made *is* that commit, replayed
   # (`builtin/commit.c` reuses `CHERRY_PICK_HEAD` as its author-message).
   var pickedAuthor: Ident
-  var havePicked = false
-  if op == opCherryPick:
+  let havePicked = op == opCherryPick
+  if havePicked:
     pickedAuthor = parseCommit(
       repo.readObject(repo.stateOid("CHERRY_PICK_HEAD")).data).author
-    havePicked = true
 
   var parents: seq[Oid]
   var oldCommit: Commit
@@ -176,20 +199,8 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
   elif head.found:
     parents = @[head.oid] & extraParents
 
-  # `-a` is the index pass of `add` over the whole tree: every tracked path is
-  # restaged, and one whose file has gone is removed.  Untracked files are not
-  # touched, which is the entire difference between `commit -a` and `add -A`.
-  var indexDirty = false
-  if all:
-    var tracked: seq[string]
-    for e in idx.entries: tracked.add e.path
-    for path in tracked:
-      let before = idx.entries[idx.find(path)].oid
-      if not stageWorkingPath(repo, idx, path):
-        discard idx.removePath(path)
-        indexDirty = true
-      elif idx.entries[idx.find(path)].oid != before:
-        indexDirty = true
+  # `-a` is `add`'s index pass over the whole tree (worktree.nim), in place.
+  var indexDirty = all and repo.restageTracked(idx, idx, parsePathspec(@[]))
 
   let ps = parsePathspec(specs, repo.prefix)
   var treeOid: Oid
@@ -198,19 +209,11 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
   # is the real one unless a pathspec sent us through a scratch index.
   var effective = idx
   if specs.len > 0:
-    for e in idx.entries:
-      if e.stage == 0 and ps.matches(e.path): partialPaths.add e.path
-    # Only a tracked path can be committed this way; naming an untracked one is
-    # a mistake rather than a request to add it.
-    let missed = ps.firstUnmatched(partialPaths)
-    failIf(missed.len > 0,
-           "pathspec '" & missed & "' did not match any file(s) known to gittle")
     let headTree = if haveOld: oldCommit.tree
                    elif head.found: parseCommit(repo.readObject(head.oid).data).tree
                    else: nullOid
-    let partial = partialTree(repo, idx, partialPaths, headTree, head.found)
-    treeOid = partial.oid
-    effective = partial.index
+    let partial = partialCommit(repo, idx, ps, headTree, head.found)
+    (treeOid, effective, partialPaths) = partial
   else:
     treeOid = repo.writeTree(idx)
 
@@ -220,20 +223,13 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
   # A merge whose result happens to equal the first parent's tree is still a
   # merge worth recording -- the second parent is the point of it -- so the
   # empty check is skipped there as it is for `--amend`.
-  if not allowEmpty and not amend and extraParents.len == 0:
+  if not o.has("allow-empty") and not amend and extraParents.len == 0:
     let parentTree = if parents.len == 1:
                        parseCommit(repo.readObject(parents[0]).data).tree
                      else: nullOid
-    # git prints the whole of `status` here, not a one-line refusal: the
-    # question the user is about to ask is "then what *is* changed?", and the
-    # answer is already computed (`builtin/commit.c:prepare_to_commit`).
     if (parents.len == 1 and parentTree == treeOid) or
        (parents.len == 0 and repo.readObject(treeOid).data.len == 0):
-      let st = computeStatus(repo, idx, parsePathspec(@[], repo.prefix), umNormal)
-      stdout.write longStatus(st, umNormal, (if repo.cfg.getBool("status.relativePaths", true):
-                                 repo.prefix else: ""))
-      stdout.flushFile()
-      return 1
+      return reportNothingToCommit(repo, idx)
 
   # The hooks are shown the index that is being committed.  Under `-a` or a
   # pathspec that is not the file on disk, so it is written out beside it and
@@ -251,17 +247,10 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
     if rc != 0: return rc
 
   # 2. the message.
-  var msg = joinMessages(messages)
-  let useEditor = (messages.len == 0 and not noEdit) or forceEdit
-  if msg.len == 0 and op != opNone: msg = repo.readState("MERGE_MSG")
-  if msg.len == 0 and haveOld: msg = oldCommit.message
-  if signoff:
-    msg = appendSignoff(cleanupMessage(msg, dropComments = false),
-                        getIdent(repo.cfg, irCommitter))
-
-  let msgFile = repo.gitDir / "COMMIT_EDITMSG"
-  writeFile(msgFile, msg & (if useEditor: editTemplate else: ""))
-  if useEditor: launchEditor(repo.cfg, msgFile)
+  let useEditor = (messages.len == 0 and not o.has("no-edit")) or o.has("edit")
+  let msgFile = prepareMessage(repo, messages, op,
+                               (if haveOld: oldCommit.message else: ""),
+                               o.has("signoff"), useEditor)
 
   # 3. commit-msg, which may rewrite the file.
   if not noVerify:
@@ -269,16 +258,15 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
     if rc != 0: return rc
 
   # 4. read back and clean up.
-  msg = cleanupMessage(readWholeFile(msgFile), dropComments = useEditor)
+  let msg = cleanupMessage(readWholeFile(msgFile), dropComments = useEditor)
   failIf(msg.len == 0, "Aborting commit due to empty commit message.")
 
   # 5. the commit, then the ref.
-  let author = identFor(repo.cfg, irAuthor, authorOpt, dateOpt,
+  let author = identFor(repo.cfg, irAuthor, o.val "author", o.val "date",
                         (if haveOld: oldCommit.author else: pickedAuthor),
                         haveOld or havePicked)
-  let committer = getIdent(repo.cfg, irCommitter)
   let newOid = repo.writeObject(otCommit,
-                                buildCommit(treeOid, parents, author, committer, msg))
+    buildCommit(treeOid, parents, author, getIdent(repo.cfg, irCommitter), msg))
 
   # git names the operation in the reflog only for the two it recognises as
   # "in progress" -- a revert concluded by hand records a plain `commit:`.
@@ -304,33 +292,13 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
     indexDirty = true
   if indexDirty: idx.writeIndex()
 
+  # The `[main abc1234] subject` line and the counts under it, which
+  # `cherry-pick`, `rebase --continue` and `merge --continue` all print too:
+  # one renderer, in sequencer.nim.  A commit made on a detached HEAD or with
+  # an author who is not the committer says so, and an amended or replayed
+  # commit prints its date because that date is *not* this moment
+  # (`builtin/commit.c:author_date_is_interesting`).
   if not quiet:
-    let hr = repo.refs.readRef(headRef)
-    let branch = if hr.found and hr.isSymbolic: shortenRefname(hr.symTarget)
-                 else: "detached HEAD"
-    var line = "[" & branch & (if parents.len == 0: " (root-commit)" else: "") &
-               " " & repo.uniqueAbbrev(newOid, repo.autoAbbrev) & "] " &
-               subject(msg)
-    if author.name != committer.name or author.email != committer.email:
-      line.add "\n Author: " & author.name & " <" & author.email & ">"
-    # The date is worth printing exactly when it is not this moment: an
-    # amended commit keeps its original one, and a cherry-pick concluded here
-    # keeps the picked commit's (`builtin/commit.c:author_date_is_interesting`).
-    if amend or havePicked:
-      line.add "\n Date: " &
-               formatDate(author.when0, author.tzOffset, DateMode(kind: dkDefault),
-                          author.when0)
-    echo line
-    # The counts and the creations, deletions and mode changes: what changed
-    # structurally, which the subject line does not say.  A merge commit gets
-    # none of it: the summary is a diff against the first parent, and git's
-    # default for a merge is to show no diff at all (`log_tree_commit` with
-    # `diff-merges` off), so there is nothing to count.
-    if parents.len < 2:
-      let parentTree = if parents.len == 1:
-                         parseCommit(repo.readObject(parents[0]).data).tree
-                       else: nullOid
-      stdout.write commitSummary(repo,
-        pairsTreeTree(repo, parentTree, treeOid, parsePathspec(@[], "")))
-      stdout.flushFile()
+    repo.summarizeCommit(newOid, rootCommit = parents.len == 0,
+                         showDate = amend or havePicked)
   0

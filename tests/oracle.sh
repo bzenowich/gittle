@@ -2080,6 +2080,46 @@ p6mut tag v1;                    p6mut tag newtag v1
 [ $p6ok = 1 ] && { ok; report "tag" "$p6n creates and deletes, annotated and light"; } \
               || bad "tag"
 
+# The options the second minimisation pass cut (docs/minimize-2.md §B4).  Each
+# must refuse *by name*: a silently-ignored option on a command that writes
+# produces a wrong repository with no message.  `merge -s` is why this block
+# exists -- git spells --strategy as -s, so `gittle merge -s ort` used to sign
+# the merge off and swallow `ort` as the commit to merge.
+p6ok=1; p6n=0
+while read -r cmd o; do
+  [ -n "$cmd" ] || continue
+  p6n=$((p6n+1))
+  ( cd "$P6/fix" && "$GITTLE" "$cmd" "$o" ) >/dev/null 2>"$WORK/p6.eb" \
+    && { p6ok=0; echo "  $cmd $o was accepted"; }
+  grep -q -- "$o" "$WORK/p6.eb" \
+    || { p6ok=0; printf '  %s %s: refusal does not name it: %s\n' "$cmd" "$o" \
+                 "$(head -1 "$WORK/p6.eb")"; }
+done <<'TRIMS'
+commit --verify
+commit --no-signoff
+checkout -t
+checkout --track
+checkout --no-track
+restore -W
+restore --worktree
+merge --ff
+merge --commit
+merge -v
+merge --verbose
+merge -s
+merge --signoff
+merge --no-signoff
+cherry-pick -e
+cherry-pick --edit
+cherry-pick --no-signoff
+revert -e
+revert --edit
+revert --no-signoff
+stash --no-include-untracked
+TRIMS
+[ $p6ok = 1 ] && { ok; report "commit/merge/pick trims" "$p6n trimmed options refuse by name"; } \
+              || bad "commit/merge/pick trims"
+
 # ------------------------------------------- checkout, switch and restore
 # The dangerous ones.  Every case is run against a *dirty* starting state as
 # well as a clean one, because the whole safety property is what happens when

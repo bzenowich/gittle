@@ -139,19 +139,12 @@ proc workTree(repo: Repository, idx: Index, ps: Pathspec): tuple[oid: Oid,
   ## The working tree as a tree object: the index with every tracked file's
   ## current content stood in for it.  A path the pathspec does not reach
   ## keeps its indexed content, which is what makes `stash push <path>` a
-  ## partial stash.
+  ## partial stash -- so the snapshot is built in a scratch index seeded from
+  ## the real one, which `restageTracked` then updates in place.
   let scratch = Index(version: 2)
   for e in idx.entries:
-    if e.stage != 0: continue
-    scratch.addEntry e
-  for e in idx.entries:
-    if e.stage != 0 or not ps.matches(e.path): continue
-    let before = e.oid
-    if not stageWorkingPath(repo, scratch, e.path):
-      discard scratch.removePath(e.path)
-      result.dirty = true
-    elif scratch.entries[scratch.find(e.path)].oid != before:
-      result.dirty = true
+    if e.stage == 0: scratch.addEntry e
+  result.dirty = repo.restageTracked(idx, scratch, ps)
   result.oid = repo.writeTree(scratch)
 
 proc doPush(c: Ctx, message: string, includeUntracked, quiet: bool,
@@ -305,9 +298,10 @@ const
   synopsis = "[push] [-u] [-q] [-m <message>] [--] [<pathspec>…]\nlist\n(pop|apply|drop) [<stash>]\nclear"
   options = [
     opt("-u|--include-untracked", help = "stash untracked files as well"),
-    opt("--no-include-untracked"),
     opt("-q|--quiet", help = "say nothing"),
     opt("-m|--message", okValue, arg = "<message>", help = "the stash's description"),
+    opt("--no-include-untracked", okRefused,
+        help = "untracked files stay in the working tree unless -u says otherwise"),
     opt("-k|--keep-index|--no-keep-index", okRefused, help = "docs/minimize.md §3.5"),
     opt("-p|--patch|-S|--staged|-a|--all|--only-untracked|--index|--label-ours|" &
         "--label-theirs|--label-base|--print|--to-ref|--pathspec-from-file|--pathspec-file-nul",
@@ -317,10 +311,7 @@ const
 proc cmdStash*(c: Ctx, argv: seq[string]): int =
   ## Entry point: parse, find the sub-verb, dispatch.
   let o = parse(options, argv, "stash", synopsis)
-  var includeUntracked = false
-  for (k, _) in o.occurrences:
-    if k == "include-untracked": includeUntracked = true
-    elif k == "no-include-untracked": includeUntracked = false
+  let includeUntracked = o.has "include-untracked"
   let quiet = o.has "quiet"
   let message = o.val "message"
   # The sub-verb is the first positional, unless it came after `--`.
@@ -332,7 +323,7 @@ proc cmdStash*(c: Ctx, argv: seq[string]): int =
     rest.delete(0)
   let repo = c.repo
   failIf(repo.workTree.len == 0, "stash is not possible in a bare repository")
-  if sub.len == 0: sub = (if rest.len == 0: "push" else: "push")
+  if sub.len == 0: sub = "push"      # `stash` and `stash -- <path>` are pushes
 
   case sub
   of "push": return c.doPush(message, includeUntracked, quiet, rest)

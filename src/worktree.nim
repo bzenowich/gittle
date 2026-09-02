@@ -37,7 +37,7 @@
 ## what `checkout -f`, `switch --discard-changes` and `reset --hard` are for.
 
 import std/[algorithm, os, sets, strutils, tables]
-import index, objects, oid, pathspec, repository, trees
+import dir, index, objects, oid, pathspec, repository, trees
 
 type
   Version* = object
@@ -308,6 +308,32 @@ proc refreshIndex*(repo: Repository, idx: Index): seq[string] =
       idx.entries[i].fillStat(st)
     else:
       result.add path
+
+proc restageTracked*(repo: Repository, src, dst: Index, ps: Pathspec): bool =
+  ## The other direction from `resetWorkTree`: bring `dst` up to what the
+  ## working tree now holds, for every tracked path in `src` the pathspec
+  ## reaches, and record a path whose file has gone as removed.  Untracked
+  ## files are never touched -- that is the whole difference between
+  ## `commit -a` and `add -A`.
+  ##
+  ## True when something actually changed, which is the question both callers
+  ## ask: `commit -a` uses it to decide whether the index file has to be
+  ## rewritten, and `stash push` to decide whether there is anything to stash.
+  ##
+  ## `src` and `dst` are the same index for `commit -a` and different ones for
+  ## `stash`, which builds the working-tree snapshot in a scratch index and
+  ## leaves the real one alone.  The path list is therefore taken from `src`
+  ## first: staging mutates the entry list underneath the loop.
+  var paths: seq[string]
+  for e in src.entries:
+    if e.stage == 0 and ps.matches(e.path): paths.add e.path
+  for path in paths:
+    let before = versionOf(dst, path).oid
+    if not stageWorkingPath(repo, dst, path):
+      discard dst.removePath(path)
+      result = true
+    elif versionOf(dst, path).oid != before:
+      result = true
 
 proc resetIndexTo*(repo: Repository, idx: Index, tree: TreeMap) =
   ## Replace the index with a tree, carrying over the stat data of every entry

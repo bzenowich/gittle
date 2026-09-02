@@ -119,11 +119,13 @@ proc finish(repo: Repository, st: State, quiet: bool): int =
                  (if st.headName.len > 0: st.headName else: "HEAD") & ".\n"
   0
 
-proc conflictAdvice(repo: Repository) =
-  ## The `hint:` block git prints when a pick stops on a conflict.
-  if not repo.cfg.getBool("advice.mergeConflict", true): return
-  stderr.write "hint: fix the conflicts and \"gittle add\" them, then \"gittle " &
-               "rebase --continue\"; or --skip this commit, or --abort\n"
+proc writeTodo(repo: Repository, st: State) =
+  ## `git-rebase-todo` and what is already `done`.  One shape twice: whole
+  ## lines, newline-terminated, and an *empty* file rather than a missing one
+  ## when the list is empty -- `status` distinguishes the two.
+  for (name, lines) in [("git-rebase-todo", st.todo), ("done", st.done)]:
+    repo.writeState(rebaseDir / name,
+                    lines.join("\n") & (if lines.len > 0: "\n" else: ""))
 
 proc stopHere(repo: Repository, st: State, pick: Oid, line: string,
               msg: string, author: Ident) =
@@ -133,10 +135,7 @@ proc stopHere(repo: Repository, st: State, pick: Oid, line: string,
   ## comes from the pick machinery, which does not know it is inside a rebase,
   ## and the `Could not apply` from the rebase loop, which quotes the todo
   ## line rather than the subject.
-  repo.writeState(rebaseDir / "git-rebase-todo", st.todo.join("\n") &
-                  (if st.todo.len > 0: "\n" else: ""))
-  repo.writeState(rebaseDir / "done", st.done.join("\n") &
-                  (if st.done.len > 0: "\n" else: ""))
+  repo.writeTodo(st)
   repo.writeState(rebaseDir / "message", msg)
   # And in `MERGE_MSG` as well: a user who resolves the conflict and runs
   # `commit` rather than `rebase --continue` gets the same message.
@@ -152,7 +151,7 @@ proc stopHere(repo: Repository, st: State, pick: Oid, line: string,
   stderr.write "error: could not apply " &
                repo.uniqueAbbrev(pick, repo.autoAbbrev) & "... " &
                subject(msg) & "\n"
-  repo.conflictAdvice()
+  repo.conflictAdvice("rebase")
   stderr.write "Could not apply " & repo.uniqueAbbrev(pick, repo.autoAbbrev) &
                "... " & line.todoRest & "\n"
 
@@ -307,9 +306,8 @@ proc cmdRebase*(c: Ctx, argv: seq[string]): int =
   var upstreamName = if rest.len > 0: rest[0] else: ""
   if upstreamName.len == 0:
     let up = repo.upstreamRef(repo.headRefName)
-    failIf(up.len == 0,
-           "There is no tracking information for the current branch.\n" &
-           "Please specify which branch you want to rebase against.")
+    failIf(up.len == 0, "there is no tracking information for the current " &
+           "branch: name the <upstream> to rebase against")
     upstreamName = up
   let upstream = repo.resolveCommittish(upstreamName)
   let ontoName = if onto.len > 0: onto else: upstreamName
@@ -371,8 +369,6 @@ proc cmdRebase*(c: Ctx, argv: seq[string]): int =
   repo.writeState(rebaseDir / "interactive", "")
   repo.writeState(rebaseDir / "end", $st.todo.len & "\n")
   repo.writeState(rebaseDir / "msgnum", "0\n")
-  repo.writeState(rebaseDir / "git-rebase-todo", st.todo.join("\n") &
-                  (if st.todo.len > 0: "\n" else: ""))
-  repo.writeState(rebaseDir / "done", "")
+  repo.writeTodo(st)
   if quiet: repo.writeState(rebaseDir / "quiet", "")
   c.replay(st, quiet, verbose)

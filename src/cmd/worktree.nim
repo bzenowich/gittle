@@ -352,7 +352,8 @@ proc rename(oldPath, newPath: cstring): cint {.importc, header: "<stdio.h>".}
 
 proc forceAndPaths(args: seq[string], want: int):
     tuple[force: int, rest: seq[string]] =
-  ## `rename(2)`, for moving a worktree directory in one step.
+  ## `move` and `remove` take the same options -- `-f`, countable, so that
+  ## `-ff` can mean "even though it is locked" -- and a fixed number of paths.
   let o = parse(forceOption, args, "worktree", synopsis)
   failIf(o.args.len != want, o.use)
   (o.count "force", o.args)

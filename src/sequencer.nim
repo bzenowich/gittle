@@ -130,9 +130,8 @@ proc dieResolveConflict*(repo: Repository, me: string, idx: Index = nil) =
   stderr.write "error: " & what &
                " is not possible because you have unmerged files.\n"
   if repo.cfg.getBool("advice.resolveConflict", true):
-    stderr.write "hint: Fix them up in the work tree, and then use " &
-                 "'gittle add/rm <file>'\nhint: as appropriate to mark " &
-                 "resolution and make a commit.\n"
+    stderr.write "hint: Fix them up in the work tree, then 'gittle add/rm " &
+                 "<file>' to mark them resolved, and commit.\n"
   fail("Exiting because of an unresolved conflict.")
 
 proc refuseIfInProgress*(repo: Repository, idx: Index, verb: string) =
@@ -209,6 +208,15 @@ proc applyThreeWay*(repo: Repository, idx: Index, baseTree, theirTree: Oid,
                          repo.flatten(theirTree),
                          MergeOpts(labelOurs: "HEAD", labelTheirs: labelTheirs),
                          verb)
+
+proc conflictAdvice*(repo: Repository, verb: string) =
+  ## The `hint:` block every replay prints when it stops on a conflict: the
+  ## three ways forward, spelled out because a user who has never seen this
+  ## has no way to guess them.  `cherry-pick`, `revert` and `rebase` print the
+  ## same three and differ only in the verb (`sequencer.c:print_advice`).
+  if not repo.cfg.getBool("advice.mergeConflict", true): return
+  stderr.write "hint: fix the conflicts and \"gittle add\" them, then \"gittle " &
+               verb & " --continue\"; or --skip this commit, or --abort\n"
 
 proc reportMerge*(res: MergeResult) =
   ## Everything the merge decided, in path order, which is the order git

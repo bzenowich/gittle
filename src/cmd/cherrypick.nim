@@ -13,8 +13,12 @@
 ## file names the commit in progress.
 ##
 ## In scope (docs/06, docs/08, docs/05 `sequencer`): `<commit>…` and ranges,
-## `-e`/`--edit`/`--no-edit`, `-x`, `-n`/`--no-commit`, `-s`/`--signoff`, and
-## `--continue`/`--skip`/`--quit`/`--abort`.  Cut: `-m` (picking a merge
+## `--no-edit`, `-x`, `-n`/`--no-commit`, `-s`/`--signoff`, and
+## `--continue`/`--skip`/`--quit`/`--abort`.  `-e` and `--no-signoff` were
+## refused in the second minimisation pass (docs/minimize-2.md B4): `revert`
+## opens the editor by default and `cherry-pick` never does, so `-e` only ever
+## restated one of those, and `--no-signoff` only ever undid a `-s` on the same
+## command line.  Cut: `-m` (picking a merge
 ## relative to a parent), `--ff`, `--allow-empty`, `--empty=`, `--cleanup`,
 ## `--strategy`/`-X`, `--reference`, and rerere.
 ##
@@ -72,16 +76,12 @@ proc todoLine(repo: Repository, k: Kind, oid: Oid, msg: string): string =
   (if k == pkCherry: "pick " else: "revert ") &
   repo.uniqueAbbrev(oid, repo.autoAbbrev) & " " & subject(msg) & "\n"
 
-proc conflictAdvice(repo: Repository, k: Kind, oid: Oid, subj: string) =
-  ## What git says when a pick stops.  The `error:` line names the commit that
-  ## could not be applied; the hints are the three ways forward, and they are
-  ## printed because a user who has never seen this has no way to guess them.
-  let v = k.verb
+proc reportStopped(repo: Repository, k: Kind, oid: Oid, subj: string) =
+  ## What git says when a pick stops: an `error:` line naming the commit that
+  ## could not be applied, then the advice every replay shares (sequencer.nim).
   stderr.write "error: could not " & (if k == pkCherry: "apply " else: "revert ") &
                repo.uniqueAbbrev(oid, repo.autoAbbrev) & "... " & subj & "\n"
-  if repo.cfg.getBool("advice.mergeConflict", true):
-    stderr.write "hint: fix the conflicts and \"gittle add\" them, then \"gittle " &
-                 v & " --continue\"; or --skip this commit, or --abort\n"
+  repo.conflictAdvice(k.verb)
 
 proc writeTodo(repo: Repository, k: Kind, todo: seq[Oid], from0: int) =
   ## The remaining picks, current one first.  Absent when only one is left to
@@ -176,7 +176,7 @@ proc replay(c: Ctx, todo: seq[Oid], k: Kind, recordOrigin, noCommit, signoff,
         repo.writeTodo(k, todo, i)
         repo.writeState(sequencerDir / "abort-safety", $head.oid & "\n")
       if res.conflicts == 0: return 0        # `-n`: applied, not committed
-      repo.conflictAdvice(k, pick, subject(cm.message))
+      repo.reportStopped(k, pick, subject(cm.message))
       return 1
 
     let author = if k == pkCherry: cm.author else: getIdent(repo.cfg, irAuthor)
@@ -186,14 +186,15 @@ proc replay(c: Ctx, todo: seq[Oid], k: Kind, recordOrigin, noCommit, signoff,
   if seq0: repo.removeState(sequencerDir)
 
 const
-  synopsis = "[-e|--no-edit] [-x] [-n] [-s] <commit>…\n--continue | --skip | --quit | --abort"
+  synopsis = "[--no-edit] [-x] [-n] [-s] <commit>…\n--continue | --skip | --quit | --abort"
   options = [
     opt("-x", help = "append `(cherry picked from commit …)` to the message"),
     opt("-n|--no-commit", help = "apply to the index and tree, do not commit"),
     opt("-s|--signoff", help = "add a Signed-off-by trailer"),
-    opt("--no-signoff"),
-    opt("-e|--edit", help = "open the editor on each message"),
     opt("--no-edit", help = "never open the editor"),
+    opt("-e|--edit", okRefused,
+        help = "revert opens the editor and cherry-pick never does; --no-edit is the only override"),
+    opt("--no-signoff", okRefused, help = "no Signed-off-by is added unless -s says so"),
     opt("--continue", help = "go on after resolving conflicts"),
     opt("--skip", help = "drop the current commit and go on"),
     opt("--quit", help = "forget the operation, keeping the tree as it is"),
@@ -209,13 +210,9 @@ proc run(c: Ctx, argv: seq[string], k: Kind): int =
   ## continue/skip/quit/abort a stopped operation or start replaying the
   ## named commits.
   let o = parse(options, argv, k.verb, synopsis)
-  var signoff = false
-  for (key, _) in o.occurrences:
-    if key == "signoff": signoff = true
-    elif key == "no-signoff": signoff = false
+  let signoff = o.has "signoff"
   let recordOrigin = o.has "x"
   let noCommit = o.has "no-commit"
-  let forceEdit = o.has "edit"
   let noEdit = o.has "no-edit"
   let cont = o.has "continue"
   let skip = o.has "skip"
@@ -229,7 +226,6 @@ proc run(c: Ctx, argv: seq[string], k: Kind): int =
 
   # ---- the four state verbs, none of which takes a commit
   if cont or skip or quit0 or abort:
-    let wanted = if k == pkCherry: opCherryPick else: opRevert
     if quit0:
       # `--quit` never complains: forgetting an operation that is not running
       # has already achieved what it asked for.
@@ -291,8 +287,7 @@ proc run(c: Ctx, argv: seq[string], k: Kind): int =
   # An editor by default for `revert` and never for `cherry-pick`, and only
   # when there is a terminal to open one on
   # (`builtin/revert.c` asks `isatty` for its default).
-  let useEditor = forceEdit or
-                  (k == pkRevert and not noEdit and isTty() and isatty(0) != 0)
+  let useEditor = k == pkRevert and not noEdit and isTty() and isatty(0) != 0
   c.replay(repo.collect(specs), k, recordOrigin, noCommit, signoff, useEditor)
 
 # Entry point for `cherry-pick`.

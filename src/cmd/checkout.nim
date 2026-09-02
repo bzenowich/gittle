@@ -18,6 +18,12 @@
 ## | `restore --staged <paths>` | no | from HEAD | no |
 ## | `restore -s <tree> <paths>` | no | with `--staged` | yes |
 ##
+## `-t`/`--no-track` and `-W`/`--worktree` were refused in the second
+## minimisation pass (docs/minimize-2.md B4).  What is left of tracking is the
+## rule nobody spells out anyway -- a branch created from a remote-tracking one
+## tracks it -- and `restore` writes the working tree unless `--staged` says
+## otherwise, so `-W` only ever restated that.
+##
 ## The switching half is `worktree.nim`'s two-way update, which refuses rather
 ## than overwrites.  The restoring half does not check anything: the user
 ## named the paths, so replacing them is the request.
@@ -65,7 +71,7 @@ Turn off this advice by setting config variable advice.detachedHead to false
 type Mode = enum mCheckout, mSwitch, mRestore
 
 proc doSwitch(c: Ctx, target: string, newBranch: string, forceBranch: bool,
-              detach, force, quiet, track, trackGiven: bool): int =
+              detach, force, quiet: bool): int =
   ## Move HEAD, and bring the index and the working tree with it.
   let repo = c.repo
   let oid = repo.resolveCommittish(target)
@@ -136,9 +142,10 @@ proc doSwitch(c: Ctx, target: string, newBranch: string, forceBranch: bool,
     branchExisted = repo.refs.readRef(destRef).found
     repo.refs.updateRef(destRef, oid, msg =
       (if branchExisted: "branch: Reset to " else: "branch: Created from ") & target)
-    if trackGiven and track or (not trackGiven and d.found and
-       d.full.startsWith(refsPrefix & "remotes/")):
-      if d.found: cmdbranch.setBranchUpstream(c, newBranch, d.full, quiet)
+    # A branch created from a remote-tracking one tracks it.  `-t`/`--no-track`
+    # are cut (docs/minimize-2.md B4), so this is the whole of the rule.
+    if d.found and d.full.startsWith(refsPrefix & "remotes/"):
+      cmdbranch.setBranchUpstream(c, newBranch, d.full, quiet)
 
   if destRef.len > 0:
     let already = repo.headRefName == destRef
@@ -256,20 +263,21 @@ const
   synopses: array[Mode, string] = [
     "[<options>] <branch>\n[<options>] [<commit>] [--] <pathspec>…\n-b|-B <new-branch> [<start-point>]",
     "[<options>] <branch>\n-c|-C <new-branch> [<start-point>]\n-d <commit>",
-    "[-s <tree-ish>] [-S] [-W] [--ours | --theirs] [--] <pathspec>…"]
+    "[-s <tree-ish>] [-S] [--ours | --theirs] [--] <pathspec>…"]
   options = [
     opt("-f|--force|--discard-changes", help = "throw away local changes in the way"),
     opt("-q|--quiet", help = "say nothing"),
     opt("-d|--detach", help = "detach HEAD at the commit"),
-    opt("-t|--track", help = "set up upstream tracking from the start point"),
-    opt("--no-track", help = "do not set up tracking"),
     opt("-b|-c|--create", okValue, arg = "<branch>", help = "create a branch first"),
     opt("-B|-C|--force-create", okValue, arg = "<branch>", help = "create or reset a branch first"),
     opt("-s|--source", okValue, arg = "<tree-ish>", help = "restore from this tree"),
     opt("-S|--staged", help = "restore the index"),
-    opt("-W|--worktree", help = "restore the working tree (the default)"),
     opt("--ours", help = "take our side of a conflict"),
     opt("--theirs", help = "take their side of a conflict"),
+    opt("-t|--track|--no-track", okRefused,
+        help = "a branch created from a remote-tracking one tracks it; there is no other rule"),
+    opt("-W|--worktree", okRefused,
+        help = "restore writes the working tree unless --staged says otherwise"),
     opt("-m|--merge|-p|--patch|--orphan|--overlay|--no-overlay|--conflict|--guess|--no-guess",
         okRefused, help = "docs/06"),
   ]
@@ -280,20 +288,15 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
   ## the mode's synopsis, decide whether the positionals are a branch or
   ## paths, and hand off to the branch switch or the path restore.
   let o = parse(options, args, names[mode], synopses[mode])
-  var track, trackGiven = false
+  # `--ours` is stage 2 and `--theirs` stage 3; naming both is nonsense, and
+  # the one written last is the one git acts on.
   var stage = 0
   for (k, _) in o.occurrences:
-    case k
-    of "track": (track = true; trackGiven = true)
-    of "no-track": (track = false; trackGiven = true)
-    of "ours": stage = 2
-    of "theirs": stage = 3
-    else: discard
+    if k in ["ours", "theirs"]: stage = (if k == "ours": 2 else: 3)
   let force = o.has "force"
   let quiet = o.has "quiet"
   let detach = o.has "detach"
   let staged = o.has "staged"
-  let worktreeGiven = o.has "worktree"
   let forceBranch = o.has "force-create"
   var newBranch = if forceBranch: o.val "force-create" else: o.val "create"
   var sourceGiven = o.has "source"
@@ -317,8 +320,7 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
       sourceGiven = true
     # `restore` is the no-overlay one: a path with no such stage is removed
     # rather than reported.
-    return c.doRestore(source, sourceGiven, specs,
-                       toWorktree = worktreeGiven or not staged,
+    return c.doRestore(source, sourceGiven, specs, toWorktree = not staged,
                        toIndex = staged, stage = stage, overlay = false)
 
   # `checkout` has to decide, per invocation, whether it was asked to switch
@@ -362,8 +364,7 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
       if d2.found and what.startsWith("commit"): what = "'" & d2.full & "'"
       fail("a branch is expected, got " & what & "\nhint: If you want to " &
            "detach HEAD at the commit, try again with the --detach option.")
-  c.doSwitch(target, newBranch, forceBranch, detach, force, quiet,
-             track, trackGiven)
+  c.doSwitch(target, newBranch, forceBranch, detach, force, quiet)
 
 # Entry point for `checkout`.
 proc cmdCheckout*(c: Ctx, args: seq[string]): int = run(c, args, mCheckout)
