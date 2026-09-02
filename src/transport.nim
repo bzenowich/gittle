@@ -1,4 +1,5 @@
-## Talking to a remote repository: URLs, the child process, and protocol v2.
+## Talking to a remote repository: the framing, the URL, the child process and
+## the protocol.
 ##
 ## ## There is only one transport
 ##
@@ -24,24 +25,42 @@
 ##
 ## `git://`, `http://` and `https://` are refused with a message that says so.
 ##
-## ## Two protocol versions, because the server picks
+## ## ...and only one protocol version: v0
 ##
-## The version is not gittle's to choose.  A v2 request is made by putting
-## `GIT_PROTOCOL=version=2` in the server's environment -- over ssh, by asking
-## the ssh client to forward it -- and an `sshd` whose `AcceptEnv` does not
-## list `GIT_PROTOCOL` simply drops it.  The server then answers in v0 and a
-## client that cannot read v0 is a client that fails against an ordinary
-## `sshd`.  So both are here, and they differ less than they look:
+## git speaks two wire protocols over that pipe, and the client chooses by
+## putting `GIT_PROTOCOL=version=2` in the server's environment.  gittle does
+## not choose: it *unsets* that variable and speaks the original protocol,
+## called v0, to everything.  R4, "one of everything", applied to the wire.
 ##
-## | | v0 | v2 |
-## |---|---|---|
-## | first thing the server says | every ref, with capabilities on line one | `version 2` and its capabilities |
-## | listing refs | already done, and unfiltered | a `ls-refs` request, with prefixes |
-## | asking for objects | `want`/`have` lines, then `done` | `command=fetch`, same lines inside |
-## | pushing | `<old> <new> <ref>` lines, then a pack | the same: `receive-pack` has no v2 |
+## v0 is the version that cannot be refused.  Over ssh the variable only
+## reaches the server if the client forwards it (`-o SendEnv=GIT_PROTOCOL`)
+## *and* `sshd` allows it through (`AcceptEnv`); an ordinary `sshd` does not,
+## drops it, and the server answers v0 regardless.  So a client that speaks v0
+## works everywhere and a client that only speaks v2 does not -- which is why
+## the version that survived the cut is the older one.
 ##
-## Push is v0 in both columns because git's `receive-pack` has no v2 form at
-## all; the version negotiation happens and then the same protocol is spoken.
+## What v0 costs, and it is the only thing it costs: **there is no way to ask
+## for a subset of the refs.**  v2 has an `ls-refs` command that takes
+## `ref-prefix` arguments; v0 has no request at all -- the server states every
+## ref it has the moment the connection opens, before it is asked anything.
+## On a repository the size of git.git that is about a thousand pkt-lines read
+## and thrown away, once per connection, and on a repository with a hundred
+## thousand tags it is a hundred thousand of them.  Milliseconds either way,
+## and in exchange there is one code path from `connect` to the packfile.
+##
+## Push would have been v0 whatever was decided here: `receive-pack` has no v2
+## form at all (`Documentation/gitprotocol-v2.adoc` defines exactly two
+## commands, `ls-refs` and `fetch`).
+##
+## ## The shape of a v0 session
+##
+## | | |
+## |---|---|
+## | the server opens with | every ref, one per pkt-line, capabilities NUL-separated on the first |
+## | fetch asks | `want` lines carrying the capabilities, `have` lines, `done` |
+## | and gets back | `ACK`/`NAK`, then the packfile down side band 1 |
+## | push asks | `<old> <new> <ref>` lines, then a packfile |
+## | and gets back | `unpack ok`, then `ok <ref>` or `ng <ref> <why>` per ref |
 ##
 ## ## Negotiation, in one round
 ##
@@ -54,12 +73,12 @@
 ## an incremental fetch cheap; further rounds only shave the tail, and each
 ## costs a round trip.
 ##
-## Reference: `Documentation/gitprotocol-v2.adoc`,
-## `Documentation/gitprotocol-pack.adoc`, `connect.c`, `fetch-pack.c`,
-## `send-pack.c`.
+## Reference: `Documentation/gitprotocol-pack.adoc`,
+## `Documentation/gitprotocol-common.adoc`, `connect.c`, `upload-pack.c`,
+## `fetch-pack.c`, `send-pack.c`.
 
 import std/[os, posix, streams, strutils, tables]
-import oid, pktline, util
+import oid, util
 
 const
   agent = "gittle/0.1.0"
@@ -67,6 +86,160 @@ const
     ## How many commits one negotiation round offers.  git's is 16 per round
     ## with many rounds; one round of 256 costs the same bytes and no round
     ## trips.
+
+# ---------------------------------------------------------------------------
+# pkt-line: the framing under everything below
+# ---------------------------------------------------------------------------
+#
+# Everything git sends over a connection -- ref advertisements, wants and
+# haves, packfiles, error messages -- is a sequence of *pkt-lines*.  One is
+# four hexadecimal digits giving the total length including those four digits,
+# then that many bytes minus four:
+#
+#     0009hello\n        a 9-byte packet carrying "hello\n"
+#     0000               flush-pkt -- end of a section or of a request
+#
+# Length 0 is therefore *not* an empty packet, it is that marker; 1 and 2 are
+# the two v2 added (delim-pkt and response-end) and a v0 server that sends one
+# is broken, so they are refused here rather than given a name.  A length of 4
+# is a genuinely empty data packet, which the specification permits and gittle
+# passes through as an empty string.  The maximum is 65520 bytes of payload
+# (`LARGE_PACKET_MAX` minus the header), which is the only reason the packfile
+# arrives in slices at all.
+#
+# Reference: `Documentation/gitprotocol-common.adoc`, `pkt-line.c`.
+
+const
+  maxPayload = 65516
+    ## `LARGE_PACKET_MAX` (65520) less the four-digit header.  git will not
+    ## send more in one packet and neither does gittle.
+
+type
+  PktKind = enum
+    pkData, pkFlush
+
+  Pkt = object
+    kind: PktKind
+    data: string   ## with its trailing newline, if the sender wrote one
+
+  Sideband = enum
+    sbData = 1, sbProgress = 2, sbError = 3
+
+func hexDigit(c: char): int =
+  ## The value of a hex digit, or -1.
+  case c
+  of '0'..'9': int(c) - int('0')
+  of 'a'..'f': int(c) - int('a') + 10
+  of 'A'..'F': int(c) - int('A') + 10
+  else: -1
+
+proc readExactly(s: Stream, n: int): string =
+  ## `readStr` on a pipe can come back short; a packet header that arrives in
+  ## two reads is not an error, and treating it as one produces a transport
+  ## that works on a fast link and not on a slow one.
+  result = newString(n)
+  var got = 0
+  while got < n:
+    let k = s.readData(addr result[got], n - got)
+    failIf(k <= 0, "the remote end hung up unexpectedly")
+    got += k
+
+proc readPkt(s: Stream): Pkt =
+  ## One packet: the four-digit length, then the payload.  Length 0 is the
+  ## flush-pkt; 1, 2 and 3 are not payload lengths at all.
+  let head = readExactly(s, 4)
+  var n = 0
+  for c in head:
+    let d = hexDigit(c)
+    failIf(d < 0, "protocol error: bad line length character: " & head)
+    n = n * 16 + d
+  case n
+  of 0: return Pkt(kind: pkFlush)
+  of 1, 2, 3: fail("protocol error: bad line length " & $n)
+  else: discard
+  failIf(n - 4 > maxPayload, "protocol error: line too long (" & $n & ")")
+  Pkt(kind: pkData, data: readExactly(s, n - 4))
+
+proc readPktLine(s: Stream): Pkt =
+  ## A data packet with its trailing newline removed, which is how every
+  ## textual line of the protocol is meant to be read (`packet_read_line`).
+  result = readPkt(s)
+  if result.kind == pkData and result.data.len > 0 and
+     result.data[^1] == '\n':
+    result.data.setLen(result.data.len - 1)
+
+func pktHeader(n: int): string =
+  ## The four hex digits of a packet length.
+  const hex = "0123456789abcdef"
+  result = newString(4)
+  for i in 0 .. 3:
+    result[3 - i] = hex[(n shr (i * 4)) and 15]
+
+proc writePkt(s: Stream, data: string) =
+  ## One data packet.  Payloads longer than the maximum are split, which is
+  ## only ever the packfile on a push.
+  var at = 0
+  while at < data.len:
+    let n = min(maxPayload, data.len - at)
+    s.write pktHeader(n + 4)
+    s.writeData(unsafeAddr data[at], n)
+    at += n
+  if data.len == 0:
+    s.write "0004"
+
+proc writePktLine(s: Stream, line: string) =
+  ## A textual packet.  git terminates these with a newline and several
+  ## servers require it, so it is added here rather than at each call site.
+  writePkt(s, line & "\n")
+
+proc writeFlush(s: Stream) = s.write "0000"
+  ## The flush-pkt, `0000`: end of a request, or of a section of a response.
+
+# ## The side band
+#
+# A packfile cannot simply follow the last pkt-line, because the server also
+# wants to send progress text while it is being generated.  So it is
+# multiplexed: each data packet's *first byte* is a channel number.
+#
+#     1  packfile data      -- concatenate these, in order, and that is the pack
+#     2  progress           -- for the user's terminal; git prefixes "remote: "
+#     3  a fatal error      -- the server is about to hang up
+
+proc sidebandPacket(p: Pkt, sink: proc (data: string), quiet: bool) =
+  ## One side-band packet, dispatched by its first byte.
+  ##
+  ## Channel 2 is the server talking to the user's terminal -- "Counting
+  ## objects", "Compressing" -- and git shows it prefixed with `remote: `
+  ## (`sideband.c:demultiplex_sideband`).  gittle keeps the prefix and drops
+  ## the carriage-return redrawing, so a non-terminal transcript stays
+  ## readable; that is the whole of the difference.  It is also the whole of
+  ## gittle's progress reporting: gittle prints what the server said and
+  ## computes nothing of its own (docs/03 cuts `--progress`).
+  failIf(p.data.len == 0, "protocol error: empty side-band packet")
+  let band = int(p.data[0])
+  let body = p.data[1 .. ^1]
+  case band
+  of int(sbData): sink(body)
+  of int(sbProgress):
+    if not quiet:
+      for line in body.split('\n'):
+        if line.len > 0:
+          stderr.write "remote: " & line.strip(leading = false,
+                                               chars = {'\r'}) & "\n"
+  of int(sbError): fail("remote error: " & body.strip())
+  else: fail("protocol error: unknown side band " & $band)
+
+proc demuxSideband(s: Stream, sink: proc (data: string), quiet: bool) =
+  ## Read side-band-64k packets until the flush that ends the section.
+  while true:
+    let p = readPkt(s)
+    case p.kind
+    of pkFlush: return
+    of pkData: sidebandPacket(p, sink, quiet)
+
+# ---------------------------------------------------------------------------
+# URLs
+# ---------------------------------------------------------------------------
 
 type
   UrlKind = enum
@@ -81,22 +254,17 @@ type
   RemoteRef* = object
     oid*: Oid
     name*: string
-    symTarget*: string  ## `symref=HEAD:refs/heads/main`, when asked for
-    peeled*: Oid        ## an annotated tag's commit, when asked for
-    unborn*: bool       ## HEAD points at a branch that does not exist yet
+    symTarget*: string  ## HEAD's branch, from the `symref=` capability
+    peeled*: Oid        ## an annotated tag's commit, from its `^{}` line
 
   Conn* = ref object
-    ## A live connection: the child process and the two pipes.
+    ## A live connection: the child process, the two pipes, and everything the
+    ## server said before it was asked anything.
     pid: Pid
     toRemote*, fromRemote*: Stream
-    v2*: bool
     caps*: Table[string, string]
-    adverts: seq[RemoteRef]   ## v0 announces its refs before being asked
+    adverts*: seq[RemoteRef]  ## every ref the server has; see `handshake`
     url*: string
-
-# ---------------------------------------------------------------------------
-# URLs
-# ---------------------------------------------------------------------------
 
 proc parseUrl(url: string): RemoteUrl =
   ## The four forms git accepts for an ssh-or-local remote, and the ones it
@@ -208,9 +376,16 @@ proc streamOf(fd: cint, mode: FileMode): Stream =
   failIf(not open(f, FileHandle(fd), mode), "cannot wrap pipe " & $fd)
   newFileStream(f)
 
-proc connect*(url: string, program: string,
-              wantV2: bool): Conn =
+proc connect*(url: string, program: string): Conn =
   ## Start `program` (`git-upload-pack` or `git-receive-pack`) on the far end.
+  ##
+  ## `GIT_PROTOCOL` is **removed** from the environment rather than left alone:
+  ## it is how a client asks for protocol v2, gittle speaks only v0, and this
+  ## process may well have been started by a git that set it for its own
+  ## children (git exports it around hooks and aliases).  Inheriting it would
+  ## make a *local* server answer in a protocol nothing here can read.  Over
+  ## ssh it would not travel anyway -- forwarding it takes an explicit
+  ## `-o SendEnv=GIT_PROTOCOL`, which is deliberately not passed.
   let u = parseUrl(url)
   case u.kind
   of urUnsupported:
@@ -220,18 +395,13 @@ proc connect*(url: string, program: string,
     failIf(u.path.len == 0, "no path in remote '" & url & "'")
   of urSsh:
     failIf(u.host.len == 0, "no host in remote '" & url & "'")
-
-  # The version is requested through the environment, which is why ssh has to
-  # be asked to forward it: `sshd` only passes what its `AcceptEnv` allows.
-  if wantV2: putEnv("GIT_PROTOCOL", "version=2")
-  else: delEnv("GIT_PROTOCOL")
+  delEnv("GIT_PROTOCOL")
 
   var argv: seq[string]
   if u.kind == urLocal:
     argv = @[program, u.path]
   else:
     argv = @["ssh"]
-    if wantV2: argv.add ["-o", "SendEnv=GIT_PROTOCOL"]
     if u.port.len > 0: argv.add ["-p", u.port]
     argv.add(if u.user.len > 0: u.user & "@" & u.host else: u.host)
     argv.add program & " " & sqQuote(u.path)
@@ -244,12 +414,11 @@ proc connect*(url: string, program: string,
 proc finish*(c: Conn) =
   ## Say goodbye, close the pipes, and reap the child.
   ##
-  ## The goodbye is a flush-pkt and it is not optional: a v0 `upload-pack` that
+  ## The goodbye is a flush-pkt and it is not optional: an `upload-pack` that
   ## has advertised its refs is waiting for a want list, and end-of-file
   ## instead of a flush is, to it, a client that crashed -- it says
   ## "the remote end hung up unexpectedly" on its own stderr, which is the
-  ## user's terminal.  In v2 the same flush ends the session
-  ## (`transport.c:disconnect_git`).
+  ## user's terminal (`transport.c:disconnect_git`).
   if c.toRemote != nil:
     try:
       writeFlush(c.toRemote)
@@ -261,35 +430,37 @@ proc finish*(c: Conn) =
   discard waitpid(c.pid, status, 0)
 
 # ---------------------------------------------------------------------------
-# The handshake
+# The handshake, which is the whole ref advertisement
 # ---------------------------------------------------------------------------
 
 proc parseAdvertisedRef(line: string): RemoteRef =
-  ## `<oid> <name>` in v0, and the same in a v2 `ls-refs` answer with optional
-  ## `symref-target:` and `peeled:` attributes after it.
+  ## `<oid> <name>`, and nothing else: v0 has no per-ref attributes.
   let parts = line.split(' ')
   failIf(parts.len < 2, "protocol error: bad ref line: " & line)
-  if parts[0] == "unborn":
-    return RemoteRef(name: parts[1], unborn: true,
-                     symTarget: (if parts.len > 2 and
-                                    parts[2].startsWith("symref-target:"):
-                                   parts[2]["symref-target:".len .. ^1] else: ""))
-  result.oid = parseOid(parts[0])
-  result.name = parts[1]
-  for extra in parts[2 .. ^1]:
-    if extra.startsWith("symref-target:"):
-      result.symTarget = extra["symref-target:".len .. ^1]
-    elif extra.startsWith("peeled:"):
-      result.peeled = parseOid(extra["peeled:".len .. ^1])
+  RemoteRef(oid: parseOid(parts[0]), name: parts[1])
 
 proc handshake*(c: Conn) =
-  ## Read whatever the server opens with, and decide which protocol this is.
+  ## Read the advertisement the server sends unprompted, which in v0 *is* the
+  ## whole of "what refs do you have".  Fills `c.adverts` and `c.caps`.
   ##
-  ## v2 opens with `version 2` and a list of capabilities.  v0 opens with the
-  ## ref advertisement itself, capabilities NUL-separated on the first line --
-  ## so by the time the version is known, a v0 client already has its answer
-  ## to `ls-refs`, and a v2 client has to go and ask.  v1 is v0 with a
-  ## `version 1` line in front.
+  ## Four things arrive in the one stream and each needs its own treatment:
+  ##
+  ## * the **capabilities** hang off the first ref line after a NUL byte, so
+  ##   the first line is a ref and a capability list at once;
+  ## * `symref=HEAD:refs/heads/main` is among them, and it is the only way to
+  ##   see which branch the remote's HEAD points at -- `clone` needs it to
+  ##   decide which branch to create.  It is attached to the named ref here so
+  ##   that callers never have to know it came from a capability;
+  ## * an annotated tag is advertised twice, the second line named `<tag>^{}`
+  ##   and holding the commit it points at.  That is v0's peeling, and it is
+  ##   folded into the tag's own entry rather than left as a ref of its own;
+  ## * an **empty repository** has no refs to state, so it advertises the null
+  ##   ID against the pseudo-ref `capabilities^{}` purely to have something to
+  ##   hang the capability list on.  It is not a ref and is dropped -- which
+  ##   means an empty remote yields no adverts at all, and, unlike v2's
+  ##   `unborn` line, says nothing about which branch its HEAD names.
+  ##   `remotes.fetchFrom` says what is done about that.
+  var symrefs: seq[string]
   var first = true
   while true:
     var p: Pkt
@@ -310,31 +481,25 @@ proc handshake*(c: Conn) =
     var line = p.data
     if first:
       first = false
-      if line == "version 2":
-        c.v2 = true
-        continue
-      if line == "version 1": continue
-    if c.v2:
-      let sp = line.find('=')
-      if sp > 0: c.caps[line[0 ..< sp]] = line[sp + 1 .. ^1]
-      else: c.caps[line] = ""
-      continue
-
-    # v0: the first ref line carries the capabilities after a NUL.
-    let nul = line.find('\0')
-    if nul >= 0:
-      for cap in line[nul + 1 .. ^1].split(' '):
-        if cap.len == 0: continue
-        let eq = cap.find('=')
-        if eq > 0: c.caps[cap[0 ..< eq]] = cap[eq + 1 .. ^1]
-        else: c.caps[cap] = ""
-      line = line[0 ..< nul]
-    # An empty repository advertises the null OID against `capabilities^{}`.
-    if line.endsWith(" capabilities^{}"): continue
+      # A server only answers `version <n>` when a client asked for that
+      # version, and `connect` unset the variable that asks.  If one arrives
+      # anyway, say so rather than failing later on an unparsable ref line.
+      failIf(line.startsWith("version "),
+             "the remote answered protocol '" & line["version ".len .. ^1] &
+             "'; gittle speaks v0 only\n  " & c.url)
+      # The first ref line carries the capabilities after a NUL.
+      let nul = line.find('\0')
+      if nul >= 0:
+        for cap in line[nul + 1 .. ^1].split(' '):
+          if cap.len == 0: continue
+          if cap.startsWith("symref="): symrefs.add cap["symref=".len .. ^1]
+          let eq = cap.find('=')
+          if eq > 0: c.caps[cap[0 ..< eq]] = cap[eq + 1 .. ^1]
+          else: c.caps[cap] = ""
+        line = line[0 ..< nul]
+      if line.endsWith(" capabilities^{}"): continue
 
     if line.endsWith("^{}"):
-      # v0 peels a tag by advertising `<name>^{}` on its own line, right
-      # after the tag itself.
       let r = parseAdvertisedRef(line)
       let bare = r.name[0 ..< r.name.len - 3]
       for i in countdown(c.adverts.high, 0):
@@ -344,6 +509,13 @@ proc handshake*(c: Conn) =
       continue
     c.adverts.add parseAdvertisedRef(line)
 
+  for spec in symrefs:
+    # `<ref>:<target>`, e.g. `HEAD:refs/heads/main`.
+    let colon = spec.find(':')
+    if colon <= 0: continue
+    for r in c.adverts.mitems:
+      if r.name == spec[0 ..< colon]: r.symTarget = spec[colon + 1 .. ^1]
+
   # gittle is SHA-1 only (plan.md decision 5), and a repository named in
   # another hash would hand back object IDs nothing here can resolve.  The
   # capability is absent on servers old enough not to have the notion, which
@@ -352,101 +524,36 @@ proc handshake*(c: Conn) =
          "the remote uses the '" & c.caps["object-format"] &
          "' object format; gittle implements SHA-1 only\n  " & c.url)
 
-proc capValues(c: Conn, name: string): seq[string] =
-  ## A v2 capability's value is a space-separated set of features.
-  if c.caps.hasKey(name): c.caps[name].split(' ') else: @[]
-
-# ---------------------------------------------------------------------------
-# ls-refs
-# ---------------------------------------------------------------------------
-
-proc lsRefs*(c: Conn, prefixes: openArray[string],
-             symrefs = true, peel = true): seq[RemoteRef] =
-  ## Every ref the remote will show, filtered by prefix.
-  ##
-  ## In v0 there is nothing to send: the advertisement already arrived, and
-  ## the prefixes are applied here instead.  In v2 the prefixes go to the
-  ## server, which is the point of the command -- a repository with 200,000
-  ## tags does not have to describe all of them to answer `fetch main`.
-  if not c.v2:
-    for r in c.adverts:
-      if prefixes.len == 0: result.add r
-      else:
-        for p in prefixes:
-          if r.name.startsWith(p): result.add r; break
-    return
-  let s = c.toRemote
-  writeLine(s, "command=ls-refs")
-  writeLine(s, "agent=" & agent)
-  # Only when the server said it understands the notion: a capability it never
-  # advertised is one it is entitled to reject.
-  if c.caps.hasKey("object-format"): writeLine(s, "object-format=sha1")
-  writeDelim(s)
-  if symrefs: writeLine(s, "symrefs")
-  if peel: writeLine(s, "peel")
-  if "unborn" in c.capValues("ls-refs"): writeLine(s, "unborn")
-  for p in prefixes: writeLine(s, "ref-prefix " & p)
-  writeFlush(s)
-  s.flush()
-  while true:
-    let p = readPktLine(c.fromRemote)
-    if p.kind != pkData: break
-    result.add parseAdvertisedRef(p.data)
-
 # ---------------------------------------------------------------------------
 # fetch
 # ---------------------------------------------------------------------------
 
-proc fetchV2(c: Conn, wants, haves: openArray[Oid],
-             thin, includeTag, quiet: bool, sink: proc (data: string)) =
-  ## The `fetch` command of protocol v2: wants, haves, `done`, then the
-  ## packet-line framed pack on the other side.
-  let s = c.toRemote
-  writeLine(s, "command=fetch")
-  writeLine(s, "agent=" & agent)
-  if c.caps.hasKey("object-format"): writeLine(s, "object-format=sha1")
-  writeDelim(s)
-  if thin: writeLine(s, "thin-pack")
-  if includeTag: writeLine(s, "include-tag")
-  writeLine(s, "ofs-delta")
-  if quiet: writeLine(s, "no-progress")
-  for w in wants: writeLine(s, "want " & $w)
-  for h in haves: writeLine(s, "have " & $h)
-  writeLine(s, "done")
-  writeFlush(s)
-  s.flush()
-  # The response is a series of named sections.  Having sent `done` we expect
-  # to go straight to `packfile`, but a server is free to send
-  # `shallow-info` or `wanted-refs` first, and each is skipped to its
-  # delimiter rather than assumed absent.
-  while true:
-    let p = readPktLine(c.fromRemote)
-    case p.kind
-    of pkFlush: return
-    of pkDelim: continue
-    of pkResponseEnd: return
-    of pkData:
-      if p.data == "packfile":
-        demuxSideband(c.fromRemote, sink, quiet)
-        return
-
-proc fetchV0(c: Conn, wants, haves: openArray[Oid],
-             thin, includeTag, quiet: bool, sink: proc (data: string)) =
-  ## The original protocol: capabilities ride on the first `want` line, and
-  ## the server answers `NAK` (or one `ACK`) before the pack.
+proc fetchPack*(c: Conn, wants, haves: openArray[Oid],
+                thin, includeTag, quiet: bool, sink: proc (data: string)) =
+  ## Ask for everything reachable from `wants` that is not reachable from
+  ## `haves`, and hand the packfile to `sink` as it arrives.
+  ##
+  ## The capabilities ride on the *first* `want` line -- that is v0's only
+  ## place to put them -- and each is asked for only when the server said it
+  ## understands it, because a capability it never advertised is one it is
+  ## entitled to reject.
+  ##
+  ## `includeTag` is how tags follow a fetch without being asked for by name:
+  ## the server adds any annotated tag that points into the history it is
+  ## sending, and the caller decides afterwards which of them to keep.
   failIf(wants.len == 0, "nothing to fetch")
   let s = c.toRemote
   var caps = "side-band-64k ofs-delta agent=" & agent
   if thin and c.caps.hasKey("thin-pack"): caps = "thin-pack " & caps
   if includeTag and c.caps.hasKey("include-tag"): caps = "include-tag " & caps
   if quiet and c.caps.hasKey("no-progress"): caps = "no-progress " & caps
-  writeLine(s, "want " & $wants[0] & " " & caps)
-  for w in wants[1 .. ^1]: writeLine(s, "want " & $w)
+  writePktLine(s, "want " & $wants[0] & " " & caps)
+  for w in wants[1 .. ^1]: writePktLine(s, "want " & $w)
   writeFlush(s)
   # Without `multi_ack` the server stops reading at the first common commit,
   # so the offer has to be small enough to fit a pipe buffer unread.
-  for h in haves: writeLine(s, "have " & $h)
-  writeLine(s, "done")
+  for h in haves: writePktLine(s, "have " & $h)
+  writePktLine(s, "done")
   s.flush()
   # The acknowledgements come first, and there may be any number of them --
   # `ACK <oid>` for each `have` the server recognises, then `NAK` if none.
@@ -461,17 +568,6 @@ proc fetchV0(c: Conn, wants, haves: openArray[Oid],
     sidebandPacket(p, sink, quiet)
     break
   demuxSideband(c.fromRemote, sink, quiet)
-
-proc fetchPack*(c: Conn, wants, haves: openArray[Oid],
-                thin, includeTag, quiet: bool, sink: proc (data: string)) =
-  ## Ask for everything reachable from `wants` that is not reachable from
-  ## `haves`, and hand the packfile to `sink` as it arrives.
-  ##
-  ## `includeTag` is how tags follow a fetch without being asked for by name:
-  ## the server adds any annotated tag that points into the history it is
-  ## sending, and the caller decides afterwards which of them to keep.
-  if c.v2: fetchV2(c, wants, haves, thin, includeTag, quiet, sink)
-  else: fetchV0(c, wants, haves, thin, includeTag, quiet, sink)
 
 # ---------------------------------------------------------------------------
 # push
@@ -489,9 +585,8 @@ type
 
 proc sendPack*(c: Conn, commands: openArray[PushCommand],
                pack: string, quiet: bool): seq[PushResult] =
-  ## The push half, which is v0 whatever the handshake said: `receive-pack`
-  ## has no protocol v2 form (`Documentation/gitprotocol-v2.adoc` lists only
-  ## `ls-refs` and `fetch`).
+  ## `<old> <new> <ref>` for every ref to move, then the packfile, then the
+  ## server's verdict on each.
   ##
   ## `side-band-64k` is deliberately *not* requested.  It would wrap the
   ## status report in a second layer of framing to carry progress text that

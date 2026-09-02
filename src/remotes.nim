@@ -1,11 +1,13 @@
 ## Fetching: the ref map, the pack, and the report.
 ##
 ## `clone`, `fetch` and `pull` are one operation with three sets of arguments,
-## and this is the operation.  It has five steps, and every one of them is
-## visible in `fetchFrom` below:
+## and this is the operation.  It has five steps, and every one of them is a
+## named proc that `fetchFrom` calls in order:
 ##
-## 1. **Ask what is there.**  `ls-refs` (or, in protocol v0, the advertisement
-##    that already arrived) gives every ref the remote will admit to.
+## 1. **Ask what is there.**  In protocol v0 there is nothing to ask: the
+##    advertisement arrived with the handshake and is every ref the remote
+##    will admit to ([transport.nim](transport.nim) says why there is no
+##    filtering).
 ## 2. **Decide what each becomes here.**  Refspecs map remote names to local
 ##    ones; a remote ref that no refspec matches is not fetched.  This is the
 ##    *ref map*, and it is the whole of "what does fetching do to my
@@ -24,8 +26,7 @@
 ##    ([indexpack.nim](indexpack.nim) has the reasoning).
 ## 5. **Move the refs, and say so.**  One transaction -- with the *deletions*
 ##    first, so that a branch deleted upstream and a branch created upstream
-##    can trade places -- and then the report, which is fiddlier than it looks
-##    and is `initDisplay`, `displayRefUpdate` and `flush`.
+##    can trade places -- and then the report.
 ##
 ## ## Tags follow, they are not fetched
 ##
@@ -44,7 +45,7 @@
 ## *tag* is not: `fetch` refuses to move one that already exists unless
 ## `--force`, because a tag that changes underneath you is the one thing in
 ## git that is supposed to be immutable.  `builtin/fetch.c:update_local_ref`
-## has both rules and this file follows it case for case.
+## has both rules and `decideUpdate` below follows it case for case.
 
 import std/[algorithm, os, posix, sequtils, sets, strutils]
 import indexpack, oid, refname, refs, refspec, repository, revwalk,
@@ -86,12 +87,6 @@ type
     old: Oid
     isNew: bool
 
-const
-  defaultTermWidth = 80
-    ## `term_columns()` when there is no terminal and no `COLUMNS`.  It only
-    ## decides whether a ref name is too long to count towards the column
-    ## width, so a fixed value costs nothing but a rare column difference.
-
 func prettify*(name: string): string =
   ## `refs.c:prettify_refname`: a plain prefix strip, with none of the
   ## ambiguity checking `shortenRef` does.  The report is display, not naming.
@@ -99,17 +94,56 @@ func prettify*(name: string): string =
     if name.startsWith(p): return name[p.len .. ^1]
   name
 
-proc summaryColumn*(repo: Repository, oids: openArray[Oid]): int =
-  ## How wide the first column of a fetch or push report is:
-  ## `2 * <abbreviation length> + 3`, which is exactly enough for
-  ## `<old>...<new>` (`transport.c:transport_summary_width`).  The length is
-  ## measured over every object either end mentions, so one long
-  ## abbreviation widens the whole report rather than one line of it.
-  var maxAbbrev = fallbackAbbrev
-  for o in oids:
-    if not o.isNull and repo.hasObject(o):
-      maxAbbrev = max(maxAbbrev, repo.uniqueAbbrev(o, repo.autoAbbrev).len)
-  2 * maxAbbrev + 3
+# ---------------------------------------------------------------------------
+# The report, shared by fetch and push
+# ---------------------------------------------------------------------------
+
+type RefReport* = object
+  ## The block a fetch or a push prints on **stderr**: a header naming the
+  ## other end, then one line per ref that changed.
+  ##
+  ##     From /tmp/src
+  ##      * [new branch] main -> origin/main
+  ##      ! [rejected] side -> origin/side (non-fast-forward)
+  ##
+  ## git right-aligns those into columns whose widths are computed across the
+  ## whole batch -- twice the longest object-ID abbreviation plus three for
+  ## the summary, the longest ref name for the middle
+  ## (`transport.c:transport_summary_width`, `builtin/fetch.c:refcol_width`).
+  ## It therefore cannot print anything until the last ref has been decided,
+  ## and buffers the lot.  gittle prints each line as it is decided, one space
+  ## between fields: the same tokens in the same order, no arithmetic, and no
+  ## buffer.  docs/minimize.md tier 3 is the licence -- human-facing prose is
+  ## compared for content, not bytes.
+  ##
+  ## The header is printed lazily, before the first line and only if there is
+  ## one, which is what makes a fetch that changed nothing print nothing.
+  header*: string        ## "From" for a fetch, "To" for a push
+  url*: string
+  shown: bool
+
+func displayUrl*(url: string): string =
+  ## The URL as the report names it: a trailing "/" or "/.git" is noise
+  ## (`transport.c:transport_anonymize_url` and its callers strip them).
+  result = url.strip(leading = false, chars = {'/'})
+  if result.len > 4 and result.endsWith(".git"): result.setLen(result.len - 4)
+
+proc reportRefUpdate*(r: var RefReport, code: char,
+                      summary, reason, src, dst: string) =
+  ## One ref: ` <code> <summary> <src> -> <dst> (<reason>)`.
+  ##
+  ## `src` empty means there is nothing to point away from -- a push deleting
+  ## a remote ref -- and the arrow goes with it.  A fetch that prunes has the
+  ## opposite shape and passes the literal `(none)` as the source, because
+  ## that is what git prints there.
+  if not r.shown:
+    stderr.write r.header & " " & r.url & "\n"
+    r.shown = true
+  var line = " " & code & " " & summary
+  if src.len > 0: line.add " " & prettify(src) & " ->"
+  line.add " " & prettify(dst)
+  if reason.len > 0: line.add " (" & reason & ")"
+  stderr.write line & "\n"
 
 # ---------------------------------------------------------------------------
 # Which remote, and with which refspecs
@@ -153,19 +187,6 @@ proc defaultRemote*(repo: Repository): string =
 # The ref map
 # ---------------------------------------------------------------------------
 
-proc refPrefixes(specs: seq[Refspec], wantTags: bool): seq[string] =
-  ## What to ask `ls-refs` for.  Narrowing this is the whole point of v2's
-  ## `ref-prefix`: a repository with a hundred thousand tags should not have
-  ## to describe all of them to answer `fetch main`.  When a refspec names a
-  ## ref that has to be resolved the way `rev-parse` would, the narrowing is
-  ## given up rather than guessed at.
-  result.add "HEAD"
-  if wantTags: result.add "refs/tags/"
-  for s in specs:
-    let src = if s.pattern: s.src[0 ..< s.src.find('*')] else: s.src
-    if not src.startsWith("refs/"): return @[]
-    if src notin result: result.add src
-
 proc buildRefMap(adverts: seq[RemoteRef], inSpecs: seq[Refspec],
                  fetchHead, explicit: bool): seq[Mapped] =
   ## `fetch origin main` names a ref in the *remote's* namespace, so the short
@@ -189,7 +210,7 @@ proc buildRefMap(adverts: seq[RemoteRef], inSpecs: seq[Refspec],
                else: "refs/heads/") & s.dst
     s.src = found
   for r in adverts:
-    if r.name == "HEAD" or r.unborn: continue
+    if r.name == "HEAD": continue
     for s in specs:
       let (matched, local) = s.mapRef(r.name)
       if not matched: continue
@@ -199,74 +220,40 @@ proc buildRefMap(adverts: seq[RemoteRef], inSpecs: seq[Refspec],
                         fetchHead: fetchHead)
       break
 
-# ---------------------------------------------------------------------------
-# The report
-# ---------------------------------------------------------------------------
+proc opportunistic(map: seq[Mapped], configured: seq[Refspec]): seq[Mapped] =
+  ## A refspec typed by hand says where *this* fetch goes; it does not repeal
+  ## the remote-tracking layout.  So every ref it fetched is also written to
+  ## wherever `remote.<name>.fetch` would have put it -- reported, but not
+  ## written to FETCH_HEAD, where it would only duplicate the line already
+  ## there (`builtin/fetch.c:get_ref_map`, "opportunistically-updated
+  ## references").
+  for e in map:
+    for s in configured:
+      let (matched, local) = s.mapRef(e.remote.name)
+      if not matched or local.len == 0 or local == e.local: continue
+      if map.anyIt(it.local == local) or result.anyIt(it.local == local):
+        continue
+      result.add Mapped(remote: e.remote, local: local, force: s.force,
+                        oppo: true)
 
-type Display = object
-  url*: string
-  shown: bool
-  summaryWidth, refcolWidth: int
-  buffered: seq[tuple[code: char, summary, error, remote, local: string]]
-
-proc initDisplay(repo: Repository, url: string, m: seq[Mapped],
-                 verbose: bool): Display =
-  ## The two column widths git computes before printing anything
-  ## (`builtin/fetch.c:refcol_width`, `transport.c:transport_summary_width`).
-  ## They are why the report lines up, and why they have to be computed from
-  ## the whole map before the first line is written.
-  result.url = url
-  # A trailing "/" or "/.git" is not shown.
-  var n = result.url.len
-  while n > 0 and result.url[n - 1] == '/': dec n
-  if n > 4 and result.url[n - 4 ..< n] == ".git": n -= 4
-  result.url = result.url[0 ..< n]
-
-  var oids: seq[Oid]
-  for e in m: oids.add [e.old, e.remote.oid]
-  result.summaryWidth = repo.summaryColumn(oids)
-
-  result.refcolWidth = 10
-  for e in m:
-    if e.local.len == 0 or e.remote.name == "HEAD": continue
-    if not verbose and e.old == e.remote.oid: continue
-    let rlen = prettify(e.remote.name).len
-    let llen = prettify(e.local).len
-    if 21 + rlen + 4 + llen >= defaultTermWidth: continue
-    result.refcolWidth = max(result.refcolWidth, rlen)
-
-proc emitRefUpdate(d: var Display, width: int, code: char,
-                   summary, error, remote, local: string) =
-  ## ` %c %-*s %-*s -> %s` plus an optional `  (<error>)`, on **stderr**,
-  ## under a `From <url>` header printed before the first line.
-  if not d.shown:
-    stderr.write "From " & d.url & "\n"
-    d.shown = true
-  var line = " " & code & " " & summary
-  while line.len < 3 + width: line.add ' '
-  line.add " "
-  var col = prettify(remote)
-  while col.len < d.refcolWidth: col.add ' '
-  line.add col & " -> " & prettify(local)
-  if error.len > 0: line.add "  (" & error & ")"
-  stderr.write line & "\n"
-
-proc displayRefUpdate(d: var Display, code: char, summary, error,
-                      remote, local: string) =
-  ## Held back rather than printed, because the width of the first column is
-  ## not known until every ref has been decided: git computes it *after* the
-  ## ref transaction and skips the computation entirely when anything was
-  ## refused, leaving it zero and the column unpadded
-  ## (`builtin/fetch.c`, the `goto cleanup` above `summary_width = ...`).
-  ## Reproducing that means buffering, which is what git does too.
-  d.buffered.add (code, summary, error, remote, local)
-
-proc flush(d: var Display, rejected: bool) =
-  ## Print the buffered report lines with the column widths now known.
-  for b in d.buffered:
-    d.emitRefUpdate((if rejected: 0 else: d.summaryWidth),
-                    b.code, b.summary, b.error, b.remote, b.local)
-  d.buffered.setLen(0)
+proc addTags(map: var seq[Mapped], adverts: seq[RemoteRef], all: bool,
+             repo: Repository) =
+  ## The two ways a tag joins the map, which differ only in the test applied
+  ## to each candidate.
+  ##
+  ## `--tags` is a refspec of its own, added to whatever else was asked for.
+  ## It has no leading `+`: every tag is fetched, but one that already exists
+  ## here is still refused rather than overwritten (`TAG_REFSPEC`).
+  ##
+  ## Following, the default, takes only the tags that came along in the pack
+  ## -- `include-tag` put them there -- and only those we do not already have
+  ## under that name.
+  for r in adverts:
+    if not r.name.startsWith("refs/tags/"): continue
+    if map.anyIt(it.remote.name == r.name): continue
+    if not all and (not repo.hasObject(r.oid) or repo.refs.readRef(r.name).found):
+      continue
+    map.add Mapped(remote: r, local: r.name, isNew: not all, fetchHead: true)
 
 # ---------------------------------------------------------------------------
 # FETCH_HEAD
@@ -285,6 +272,18 @@ proc fetchHeadNote(name, url: string): string =
       "' of " & url
   else:
     "'" & name & "' of " & url
+
+proc storeFetchHead(repo: Repository, map: seq[Mapped], url: string) =
+  ## Merge candidates first, then the rest: that is what lets `FETCH_HEAD` be
+  ## used as a revision naming the thing to merge, which is how `pull` reads
+  ## it (`builtin/fetch.c:store_updated_refs`).
+  var text: string
+  for wantMerge in [true, false]:
+    for e in map:
+      if not e.fetchHead or e.merge != wantMerge: continue
+      text.add $e.remote.oid & "\t" & (if e.merge: "" else: "not-for-merge") &
+               "\t" & fetchHeadNote(e.remote.name, url) & "\n"
+  writeFile(repo.gitDir / "FETCH_HEAD", text)
 
 # ---------------------------------------------------------------------------
 # The operation
@@ -344,6 +343,53 @@ proc negotiationHaves(repo: Repository): seq[Oid] =
       result.add r.oid
       if result.len >= haveLimit: return
 
+proc decideUpdate(repo: Repository, e: Mapped, force: bool):
+    tuple[code: char, summary, reason, act: string] =
+  ## What one mapped ref becomes: the three fields the report prints, and the
+  ## word the reflog records.  A `!` code is a refusal and nothing is written;
+  ## every other code is an update.  `builtin/fetch.c:update_local_ref`.
+  let isTag = e.remote.name.startsWith("refs/tags/")
+  if e.isNew:
+    return ('*', (if isTag: "[new tag]"
+                  elif e.remote.name.startsWith("refs/heads/"): "[new branch]"
+                  else: "[new ref]"), "",
+            (if isTag: "storing tag" else: "storing head"))
+  if isTag:
+    # An existing tag is only replaced on demand: R1's "write minimally"
+    # applied to somebody else's history.
+    if not force: return ('!', "[rejected]", "would clobber existing tag", "")
+    return ('t', "[tag update]", "", "updating tag")
+  let a = repo.uniqueAbbrev(e.old, repo.autoAbbrev)
+  let b = repo.uniqueAbbrev(e.remote.oid, repo.autoAbbrev)
+  if repo.isAncestor(e.old, e.remote.oid):
+    return (' ', a & ".." & b, "", "fast-forward")
+  if force:
+    return ('+', a & "..." & b, "forced update", "forced-update")
+  ('!', "[rejected]", "non-fast-forward", "")
+
+proc pruneStale(repo: Repository, specs: seq[Refspec], map: seq[Mapped],
+                tx: RefTransaction, reflogMsg: string, rep: var RefReport,
+                report: bool) =
+  ## Delete the remote-tracking refs the remote no longer has.
+  ##
+  ## **Pruning goes first** in the transaction, and git orders it this way for
+  ## a reason worth keeping: a branch deleted upstream and a branch created
+  ## upstream can collide -- `topic` gone and `topic/2` arrived cannot both
+  ## exist as loose refs -- and doing the removals first is what lets the
+  ## second one land.
+  var live: HashSet[string]
+  for e in map: live.incl e.local
+  for s in specs:
+    if not s.pattern or not s.hasDst: continue
+    for r in repo.refs.allRefs(s.dst[0 ..< s.dst.find('*')]):
+      # `origin/HEAD` is a symbolic ref naming the remote's default branch,
+      # not a copy of one of its refs; nothing upstream corresponds to it and
+      # pruning it would delete it on every fetch.
+      if r.isSymbolic or r.name in live: continue
+      tx.add RefUpdate(kind: ruDelete, name: r.name, oldOid: r.oid,
+                       haveOldOid: true, msg: reflogMsg & "prune")
+      if report: rep.reportRefUpdate('-', "[deleted]", "", "(none)", r.name)
+
 proc fetchFrom*(repo: Repository, rem: Remote, opt: FetchOpts):
     tuple[refs: seq[RemoteRef], head: string, failed: bool] =
   ## Do the whole thing.  Returns every ref the remote advertised, what its
@@ -359,14 +405,22 @@ proc fetchFrom*(repo: Repository, rem: Remote, opt: FetchOpts):
   let program = if opt.uploadPack.len > 0: opt.uploadPack
                 else: repo.cfg.get("remote." & rem.name & ".uploadpack")
   let conn = connect(rem.url,
-                     if program.len > 0: program else: "git-upload-pack",
-                     wantV2 = true)
+                     if program.len > 0: program else: "git-upload-pack")
   defer: conn.finish()
   conn.handshake()
-  let adverts = conn.lsRefs(refPrefixes(rem.specs, opt.tags or not opt.noTags))
+  # No request was sent and none is possible: in v0 the advertisement is the
+  # handshake.  Everything the remote has is here, and the refspecs below pick
+  # from it.
+  let adverts = conn.adverts
   result.refs = adverts
   for r in adverts:
     if r.name == "HEAD": result.head = r.symTarget
+  # An empty remote advertises no refs at all, and v0 has no way to say which
+  # branch its HEAD names (transport.nim, `handshake`).  git is in the same
+  # position and falls back to the branch name it would have used for a fresh
+  # repository (`builtin/clone.c`); `init` has already put exactly that in
+  # HEAD, so hand `clone` back its own.
+  if adverts.len == 0: result.head = repo.headRefName()
 
   var map: seq[Mapped]
   if rem.specs.len > 0:
@@ -376,28 +430,12 @@ proc fetchFrom*(repo: Repository, rem: Remote, opt: FetchOpts):
       # Everything named on the command line is a merge candidate -- that is
       # what makes `pull origin main` merge what it just fetched.
       for e in map.mitems: e.merge = true
-      # **Opportunistic updates.**  A refspec typed by hand says where *this*
-      # fetch goes; it does not repeal the remote-tracking layout.  So every
-      # ref it fetched is also written to wherever `remote.<name>.fetch` would
-      # have put it -- reported, but not written to FETCH_HEAD, where it would
-      # only duplicate the line already there
-      # (`builtin/fetch.c:get_ref_map`, "opportunistically-updated
-      # references").
-      var extra: seq[Mapped]
-      for e in map:
-        for s in opt.configured:
-          let (matched, local) = s.mapRef(e.remote.name)
-          if not matched or local.len == 0 or local == e.local: continue
-          if map.anyIt(it.local == local) or extra.anyIt(it.local == local):
-            continue
-          extra.add Mapped(remote: e.remote, local: local, force: s.force,
-                           oppo: true)
-      map.add extra
+      map.add opportunistic(map, opt.configured)
   elif not opt.tags:
     # No refspec anywhere -- a bare URL.  git fetches the remote's HEAD into
     # FETCH_HEAD and moves nothing (`get_ref_map`'s last `else`).
     for r in adverts:
-      if r.name == "HEAD" and not r.unborn:
+      if r.name == "HEAD":
         map.add Mapped(remote: r, fetchHead: true, merge: true)
         break
 
@@ -412,16 +450,7 @@ proc fetchFrom*(repo: Repository, rem: Remote, opt: FetchOpts):
         for e in map.mitems:
           if e.remote.name == want: e.merge = true
 
-  if opt.tags:
-    # `--tags` is a refspec of its own, added to whatever else was asked for.
-    # No leading `+`: `--tags` fetches every tag, but a tag that already
-    # exists here is still refused rather than overwritten (`TAG_REFSPEC`).
-    let all = parseRefspec("refs/tags/*:refs/tags/*", forPush = false)
-    for r in adverts:
-      if not r.name.startsWith("refs/tags/"): continue
-      if map.anyIt(it.remote.name == r.name): continue
-      map.add Mapped(remote: r, local: all.mapRef(r.name).dst,
-                     fetchHead: true)
+  if opt.tags: addTags(map, adverts, all = true, repo = repo)
 
   # What we do not have yet.  A ref whose object is already here needs no
   # transfer even when the local ref is behind.
@@ -441,21 +470,13 @@ proc fetchFrom*(repo: Repository, rem: Remote, opt: FetchOpts):
     discard receivePack(repo, conn, wants, negotiationHaves(repo),
                         includeTag = not opt.noTags,
                         quiet = opt.quiet or isatty(2) == 0)
-    var tips: seq[Oid]
-    for w in wants: tips.add w
-    checkConnected(repo, tips)
+    checkConnected(repo, wants)
 
-  # Tags that came along with the history: `include-tag` put them in the pack,
-  # and a remote tag whose object is now here becomes a local tag.  Only when
-  # some refspec had a *destination*, though -- `fetch origin main` writes no
-  # ref, so it follows no tags either (`get_ref_map`'s `*autotags`).
+  # Tags that came along with the history.  Only when some refspec had a
+  # *destination*, though -- `fetch origin main` writes no ref, so it follows
+  # no tags either (`get_ref_map`'s `*autotags`).
   if not opt.noTags and not opt.tags and opt.autoTags:
-    for r in adverts:
-      if not r.name.startsWith("refs/tags/"): continue
-      if map.anyIt(it.remote.name == r.name): continue
-      if not repo.hasObject(r.oid): continue
-      if repo.refs.readRef(r.name).found: continue
-      map.add Mapped(remote: r, local: r.name, isNew: true, fetchHead: true)
+    addTags(map, adverts, all = false, repo = repo)
 
   # git reports in the order its ref map was built, and the opportunistic
   # entries go on the *end* of it -- after the followed tags, which were added
@@ -464,101 +485,37 @@ proc fetchFrom*(repo: Repository, rem: Remote, opt: FetchOpts):
   map = map.filterIt(not it.oppo) & map.filterIt(it.oppo)
 
   # ---- move the refs, reporting each one -------------------------------
-  var d = initDisplay(repo, rem.url, map, opt.verbose)
+  var rep = RefReport(header: "From", url: displayUrl(rem.url))
   let tx = repo.refs.newTransaction()
   let reflogMsg = (if opt.reflogAction.len > 0: opt.reflogAction
                    else: "fetch") & ": "
-  var failed = false
 
-  # **Pruning comes first**, and git orders it this way for a reason worth
-  # keeping: a branch deleted upstream and a branch created upstream can
-  # collide -- `topic` gone and `topic/2` arrived cannot both exist as loose
-  # refs -- and doing the removals first is what lets the second one land.
   if opt.prune:
-    var live: HashSet[string]
-    for e in map: live.incl e.local
-    for s in rem.specs:
-      if not s.pattern or not s.hasDst: continue
-      let prefix = s.dst[0 ..< s.dst.find('*')]
-      for r in repo.refs.allRefs(prefix):
-        # `origin/HEAD` is a symbolic ref naming the remote's default branch,
-        # not a copy of one of its refs; nothing upstream corresponds to it
-        # and pruning it would delete it on every fetch.
-        if r.isSymbolic or r.name in live: continue
-        tx.add RefUpdate(kind: ruDelete, name: r.name, oldOid: r.oid,
-                         haveOldOid: true, msg: reflogMsg & "prune")
-        if opt.report:
-          # Pruning has a width of its own, measured over the stale refs
-          # alone, and prints before anything else (`builtin/fetch.c:1494`).
-          d.emitRefUpdate(d.summaryWidth, '-', "[deleted]", "", "(none)", r.name)
+    pruneStale(repo, rem.specs, map, tx, reflogMsg, rep, opt.report)
 
   for e in map:
-    let isTag = e.remote.name.startsWith("refs/tags/")
     if e.local.len == 0:
       # Fetched into FETCH_HEAD and nowhere else.  git still says so, naming
       # what kind of thing it was (`builtin/fetch.c:store_updated_refs`).
       if opt.report and opt.writeFetchHead:
-        d.displayRefUpdate('*', (if isTag: "tag" else: "branch"), "",
-                           e.remote.name, "FETCH_HEAD")
+        rep.reportRefUpdate('*', (if e.remote.name.startsWith("refs/tags/"):
+                                    "tag" else: "branch"),
+                            "", e.remote.name, "FETCH_HEAD")
       continue
     if e.old == e.remote.oid:
       if opt.verbose and opt.report:
-        d.displayRefUpdate('=', "[up to date]", "", e.remote.name, e.local)
+        rep.reportRefUpdate('=', "[up to date]", "", e.remote.name, e.local)
       continue
-    var code = '*'
-    var summary = ""
-    var error = ""
-    var act = "storing ref"
-    if e.isNew:
-      summary = if isTag: "[new tag]"
-                elif e.remote.name.startsWith("refs/heads/"): "[new branch]"
-                else: "[new ref]"
-      act = if isTag: "storing tag" else: "storing head"
-    elif isTag:
-      # An existing tag is only replaced on demand: R1's "write minimally"
-      # applied to somebody else's history.
-      if not (opt.force or e.force):
-        code = '!'; summary = "[rejected]"; error = "would clobber existing tag"
-        if opt.report: d.displayRefUpdate(code, summary, error, e.remote.name, e.local)
-        failed = true
-        continue
-      code = 't'; summary = "[tag update]"; act = "updating tag"
-    elif repo.isAncestor(e.old, e.remote.oid):
-      code = ' '
-      summary = repo.uniqueAbbrev(e.old, repo.autoAbbrev) & ".." &
-                repo.uniqueAbbrev(e.remote.oid, repo.autoAbbrev)
-      act = "fast-forward"
-    elif opt.force or e.force:
-      code = '+'
-      summary = repo.uniqueAbbrev(e.old, repo.autoAbbrev) & "..." &
-                repo.uniqueAbbrev(e.remote.oid, repo.autoAbbrev)
-      error = "forced update"
-      act = "forced-update"
-    else:
-      code = '!'; summary = "[rejected]"; error = "non-fast-forward"
-      if opt.report: d.displayRefUpdate(code, summary, error, e.remote.name, e.local)
-      failed = true
+    let d = decideUpdate(repo, e, opt.force or e.force)
+    if opt.report:
+      rep.reportRefUpdate(d.code, d.summary, d.reason, e.remote.name, e.local)
+    if d.code == '!':
+      result.failed = true
       continue
     tx.add RefUpdate(kind: ruSet, name: e.local, newOid: e.remote.oid,
-                     oldOid: e.old, haveOldOid: true, msg: reflogMsg & act,
+                     oldOid: e.old, haveOldOid: true, msg: reflogMsg & d.act,
                      noLog: opt.noReflog)
-    if opt.report: d.displayRefUpdate(code, summary, error, e.remote.name, e.local)
 
-  if opt.report: d.flush(failed)
   tx.prepare()
   tx.commit()
-
-  # ---- FETCH_HEAD -----------------------------------------------------
-  if opt.writeFetchHead:
-    # Merge candidates first, then the rest: that is what lets `FETCH_HEAD`
-    # be used as a revision naming the thing to merge, which is how `pull`
-    # reads it (`builtin/fetch.c:store_updated_refs`).
-    var text: string
-    for wantMerge in [true, false]:
-      for e in map:
-        if not e.fetchHead or e.merge != wantMerge: continue
-        text.add $e.remote.oid & "\t" & (if e.merge: "" else: "not-for-merge") &
-                 "\t" & fetchHeadNote(e.remote.name, d.url) & "\n"
-    writeFile(repo.gitDir / "FETCH_HEAD", text)
-
-  result.failed = failed
+  if opt.writeFetchHead: storeFetchHead(repo, map, rep.url)

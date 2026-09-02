@@ -72,9 +72,10 @@ proc cloneInto(c: Ctx, gitDir, dir, url, origin, branchArg, uploadPack: string,
                       autoTags: true)
   let fetched = repo.fetchFrom(rem, opt)
 
-  # What HEAD should become.  The remote's own HEAD is a symbolic ref and
-  # `ls-refs symrefs` is the only way to see through it; without one -- an
-  # older server, or a detached remote HEAD -- fall back to the first branch.
+  # What HEAD should become.  The remote's own HEAD is a symbolic ref, and the
+  # `symref=HEAD:refs/heads/<name>` capability on the v0 advertisement is the
+  # only way to see through it (`transport.nim`); without one -- a detached
+  # remote HEAD -- fall back to the first branch.
   var remoteHead = fetched.head
   if remoteHead.len == 0:
     for r in fetched.refs:

@@ -138,17 +138,22 @@ proc gcRepository*(c: Ctx, remote: string, full, quiet: bool) =
   let rem = repo.lookupRemote(remote)
   let program = repo.cfg.get("remote." & rem.name & ".uploadpack")
   let conn = connect(rem.url, if program.len > 0: program
-                              else: "git-upload-pack", wantV2 = true)
+                              else: "git-upload-pack")
   defer: conn.finish()
   conn.handshake()
 
   # Wants and haves, as the module comment describes.  A tip the walk from
   # an earlier tip already passed is walked no further, and is still wanted:
-  # a want the server finds nothing new for costs nothing.
+  # a want the server finds nothing new for costs nothing.  The advertisement
+  # is unfiltered (protocol v0 has no way to ask for a subset), so branches
+  # and tags are picked out of it here: `HEAD` would only repeat a branch, and
+  # anything else the remote keeps under `refs/` is not history worth packing.
   var wants, haves, stack: seq[Oid]
   var seen: HashSet[Oid]
-  for r in conn.lsRefs(["refs/heads/", "refs/tags/"]):
-    if r.unborn or not repo.hasObject(r.oid) or r.oid in wants: continue
+  for r in conn.adverts:
+    if not (r.name.startsWith("refs/heads/") or
+            r.name.startsWith("refs/tags/")): continue
+    if not repo.hasObject(r.oid) or r.oid in wants: continue
     wants.add r.oid
     if largest == nil: continue
     try: stack.add repo.peelTo(r.oid, otCommit).oid

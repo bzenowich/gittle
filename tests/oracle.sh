@@ -2431,6 +2431,14 @@ chmod +x "$P8/v0"
 p8norm(){ sed -e "s|$P8/s[ab]|SRV|g" -e "s|$P8/[ab]|REPO|g" \
               -e "s|Cloning into '[ab]'|Cloning into 'REPO'|" \
               -e '/^done\.$/d' | p6norm; }
+# The *output* of a fetch or a push is compared through p8out, which squeezes
+# runs of spaces.  A4 (docs/minimize-2.md) replaced git's column alignment --
+# widths computed across the whole batch -- with one line per ref, so the
+# tokens and their order are still compared and only the padding is not.
+# Every *state* comparison below stays byte-exact and goes through p8norm:
+# a push that prints the right thing and leaves the wrong ref on the far side
+# is caught there and nowhere else.
+p8out(){ p8norm | sed -e 's/  */ /g'; }
 
 p8n=0; p8ok=1
 
@@ -2443,14 +2451,14 @@ p8clone(){
   bo=$( cd "$P8" && "$GITTLE" clone "$@" b 2>&1 ); bs=$?
   p8n=$((p8n+1))
   [ "${P6OUT:-1}" = 0 ] || \
-  [ "$(printf '%s\n' "$ao" | p8norm)" = "$(printf '%s\n' "$bo" | p8norm)" ] || this=0
+  [ "$(printf '%s\n' "$ao" | p8out)" = "$(printf '%s\n' "$bo" | p8out)" ] || this=0
   [ "$as" = "$bs" ] || this=0
   sa=$(p6state "$P8/a" | p8norm); sb=$(p6state "$P8/b" | p8norm)
   [ "$sa" = "$sb" ] || this=0
   if [ $this = 0 ]; then
     p8ok=0
     printf '  clone %s  [git %d / gittle %d]\n' "$*" "$as" "$bs"
-    diff <(printf '%s\n' "$ao"|p8norm) <(printf '%s\n' "$bo"|p8norm) | head -5
+    diff <(printf '%s\n' "$ao"|p8out) <(printf '%s\n' "$bo"|p8out) | head -5
     diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -8
   fi
 }
@@ -2472,7 +2480,7 @@ p8mut(){
   bo=$( cd "$P8/b" && "$GITTLE" "$@" 2>&1 ); bs=$?
   p8n=$((p8n+1))
   [ "${P6OUT:-1}" = 0 ] || \
-  [ "$(printf '%s\n' "$ao" | p8norm)" = "$(printf '%s\n' "$bo" | p8norm)" ] || this=0
+  [ "$(printf '%s\n' "$ao" | p8out)" = "$(printf '%s\n' "$bo" | p8out)" ] || this=0
   [ "$as" = "$bs" ] || this=0
   sa="$(p6state "$P8/a"|p8norm)
 == the server ==
@@ -2489,7 +2497,7 @@ $ob"; }
   if [ $this = 0 ]; then
     p8ok=0
     printf '  %s%s  [git %d / gittle %d]\n' "${PREP:+($PREP) }" "$*" "$as" "$bs"
-    diff <(printf '%s\n' "$ao"|p8norm) <(printf '%s\n' "$bo"|p8norm) | head -5
+    diff <(printf '%s\n' "$ao"|p8out) <(printf '%s\n' "$bo"|p8out) | head -5
     diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -8
   fi
 }
