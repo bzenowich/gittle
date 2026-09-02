@@ -87,7 +87,6 @@ type
   Ignore* = ref object
     workTree: string
     noFiles: bool                 ## `clean -x`: consult no pattern file at all
-    cmdline: PatternList          ## `clean -e`, which outranks every file
     fileLists: seq[PatternList]   ## excludesFile, then info/exclude
     dirLists: Table[string, PatternList]
 
@@ -226,15 +225,6 @@ proc newEmptyIgnore*(repo: Repository): Ignore =
   ## and only `-e` patterns remain.
   Ignore(workTree: repo.workTree, noFiles: true)
 
-proc addCommandLinePatterns*(ig: Ignore, pats: openArray[string]) =
-  ## `clean -e <pattern>`: the highest-precedence list, consulted before any
-  ## file.  git numbers these `-(i+1)` in `check-ignore -v` output; nothing in
-  ## v1 prints them, so they are numbered in order like everything else.
-  ig.cmdline.src = "--exclude option"
-  for i, raw in pats:
-    ig.cmdline.patterns.add parsePattern(raw)
-    ig.cmdline.patterns[^1].lineNo = -(i + 1)
-
 proc listFor(ig: Ignore, dir: string): PatternList =
   ## The `.gitignore` sitting in `dir` (root-relative, "" or ending in `/`).
   if ig.noFiles: return PatternList(base: dir)
@@ -254,9 +244,13 @@ proc lastMatch(ig: Ignore, path: string, isDir: bool): Decision =
   ## lists in reverse.  The first list with any opinion wins outright, even if
   ## a shallower list has a more specific pattern -- that is what "deeper files
   ## override shallower ones" means.
+  ##
+  ## git has one list above all of these -- `clean -e <pattern>` /
+  ## `--exclude` -- and gittle has no caller for it: `clean` refuses `-e` by
+  ## name (docs/minimize.md §3.5, and `clean -x` means "there are no ignore
+  ## files" rather than "delete ignored files too").  It goes with the option
+  ## rather than waiting for a second caller that R7 says not to build for.
   if ig == nil: return
-  result = ig.cmdline.lastMatchIn(path, isDir)
-  if result.found: return
   var dir = path
   while true:
     let slash = dir.rfind('/')
