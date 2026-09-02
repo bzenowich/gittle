@@ -79,6 +79,13 @@ proc parseDate*(s: string): tuple[when0: int64, tzOffset: int] =
   # ones rather than guessing.
   var iso = t.replace("Z", "+00:00")
   if iso.len > 10 and iso[10] == ' ': iso[10] = 'T'
+  # A compact zone (`+0200`) is ISO 8601 and git accepts it
+  # (`date.c:parse_date_basic`); Nim's `zzz` only parses the `+02:00` form.
+  # Widening it here rather than carrying a second format table is what lets
+  # this be the project's only date parser (docs/minimize-2.md §B3) -- the
+  # `--since=` path folded into it and must not lose a spelling git takes.
+  if iso.len > 5 and iso[^5] in {'+', '-'} and iso[^4 .. ^1].allCharsInSet(Digits):
+    iso = iso[0 .. ^3] & ":" & iso[^2 .. ^1]
   for fmt in ["yyyy-MM-dd'T'HH:mm:sszzz", "yyyy-MM-dd'T'HH:mm:ss'.'fffzzz",
               "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd"]:
     try:

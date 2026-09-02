@@ -1758,13 +1758,28 @@ rm -rf "$P6/fix"; mkdir -p "$P6/fix"
 p6ok=1; p6n=0; p6dir="$P6/fix"; p6what="rev-parse"
 for x in HEAD HEAD^ HEAD~ HEAD~1 HEAD~2 HEAD^2 HEAD^^ 'HEAD^{}' 'HEAD^{tree}' \
          'HEAD^{commit}' 'HEAD^{object}' v1 'v1^{}' 'v1^{commit}' 'v1^{tag}' \
-         'v1^{tree}' @ 'HEAD@{0}' 'HEAD@{1}' '@{-1}' ':a.txt' ':0:a.txt' \
-         ':1:a.txt' 'HEAD:a.txt' 'HEAD^:a.txt' 'HEAD:sub/s.txt' 'HEAD:' \
-         'HEAD:nosuch' 'main..side' 'main...side' 'side..main' 'side...main' \
+         'v1^{tree}' @ 'HEAD@{0}' 'HEAD@{1}' ':a.txt' ':0:a.txt' \
+         'HEAD:a.txt' 'HEAD^:a.txt' 'HEAD:sub/s.txt' 'HEAD:' \
+         'main..side' 'main...side' 'side..main' 'side...main' \
          '..side' 'main..' 'v1..main' 'HEAD^!' 'HEAD^@' 'HEAD^-1' 'HEAD^-9' \
          '^main' main side light nosuch a.txt 'HEAD~0' 'HEAD^0' 'HEAD^3' \
-         'HEAD~9' '@{5}' '@{-5}' 'side@{0}' 'HEAD^{tree}..HEAD' 'HEAD^!x'; do
+         'HEAD~9' '@{5}' 'side@{0}' 'HEAD^{tree}..HEAD' 'HEAD^!x'; do
   p6ro rev-parse "$x"
+done
+# `:<n>:<path>` and `HEAD:nosuch` agree on stdout and on exit status 128 and
+# differ only in the stderr prose, which is the cut P6ERR=0 exists for.
+P6ERR=0 p6ro rev-parse ':1:a.txt'; P6ERR=0 p6ro rev-parse 'HEAD:nosuch'
+# `@{-<n>}` is cut (docs/minimize-2.md §B3): the branch you were on before
+# lives only in HEAD's reflog, and neither tool-call log types it once.  git
+# *resolves* it, so this cannot be a p6ro comparison -- what is asserted is
+# that gittle refuses and names the expression.  A swallowed refusal is the
+# failure that matters: it would be read as a pathspec.
+for x in '@{-1}' '@{-5}'; do
+  p6n=$((p6n+1))
+  "$GITTLE" -C "$P6/fix" rev-parse "$x" >/dev/null 2>"$WORK/p6.eb" \
+    && { p6ok=0; echo "  rev-parse $x was accepted"; }
+  grep -qF -- "$x" "$WORK/p6.eb" \
+    || { p6ok=0; echo "  rev-parse $x: refusal does not name it"; }
 done
 for f in --verify --short --symbolic-full-name --abbrev-ref; do
   p6ro rev-parse $f HEAD

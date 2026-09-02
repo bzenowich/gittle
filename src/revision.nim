@@ -33,15 +33,57 @@
 ##
 ## ## What is deliberately not here
 ##
-## `:/<text>` and `^{/<text>}` search commit messages for a pattern, and
-## `<ref>@{<date>}` parses "2 weeks ago".  Both are engines behind a single
-## syntax -- R6 -- and both are cut.  `@{push}` needs a push refspec, which is
-## phase 8; `@{upstream}` needs only `branch.<name>.merge`, which `branch -u`
-## writes here, so that one is in.
+## Four corners of `gitrevisions(7)` are refused by name rather than
+## implemented, each because it is an engine standing behind a single spelling
+## -- R6 -- and none of them appears once in the 509 real invocations
+## `docs/git-tool-calls-*.md` records:
+##
+## * `:/<text>` and `^{/<text>}` search every commit message for a pattern.
+##   That is a second walk with a second matcher hanging off a two-character
+##   prefix.
+## * `<ref>@{<date>}` ("`main@{2 weeks ago}`") needs git's approxidate, a
+##   parser of English (`date.c:approxidate_careful`).  `--since` and
+##   `--until` survive it by taking an ISO-8601 date only; see
+##   `parseTimestamp`.
+## * `@{-<n>}` ("the branch I was on <n> checkouts ago", and so `checkout -`)
+##   is a backwards scan of HEAD's reflog counting `checkout: moving from`
+##   messages.  `headDescription` below scans the same log for a different
+##   question and is kept, because `status` prints its answer on every run.
+## * `@{push}` needs a push refspec, which v1 does not model.
+##
+## `@{upstream}` needs only `branch.<name>.merge`, which `branch -u` writes
+## here, so that one is in -- and it is the one `@{…}` form the logs do use.
+## `<ref>@{<n>}` is in too, for a narrower reason: `stash@{2}` is the only way
+## to name an entry of the stash stack, and `cmd/stash.nim` resolves it
+## through this grammar.
 
-import std/[algorithm, os, sequtils, strutils, times]
+import std/[algorithm, os, sequtils, strutils]
 import cli
-import index, objects, oid, pathspec, refs, repository, revwalk, util
+import ident, index, objects, oid, pathspec, refs, repository, revwalk, util
+
+# ---------------------------------------------------------------------------
+# Refusing a syntax, as opposed to failing to resolve one
+# ---------------------------------------------------------------------------
+
+type RevRefused* = object of GittleError
+  ## "gittle does not implement this spelling", as distinct from "this name
+  ## does not resolve".
+  ##
+  ## The distinction is not decoration; it is what keeps a refusal audible.
+  ## `looksLikeRev` below is how every command with both revisions and paths
+  ## decides which it was given, and it decides by resolving the argument and
+  ## swallowing the failure -- `log Makefile` has to work.  A refusal swallowed
+  ## there becomes silence with a wrong explanation: `checkout :/text` would go
+  ## on to say `pathspec ':/text' did not match any file(s)`, which names a
+  ## mistake the user did not make and hides the one they did.  So a refusal is
+  ## re-raised through those two procs and only "does not resolve" means
+  ## "then it is a path".
+
+proc refuse(msg: string) {.noreturn.} =
+  ## Refuse a revision spelling by name.  Every out-of-scope corner of the
+  ## grammar goes through here rather than through `fail`, so that none of
+  ## them can be mistaken for a path.
+  raise newException(RevRefused, msg)
 
 # ---------------------------------------------------------------------------
 # The reflog, read back
@@ -79,27 +121,6 @@ proc readReflog*(s: RefStore, name: string): seq[ReflogEntry] =
       e.who = rest[0 ..< tab]
       e.message = rest[tab + 1 .. ^1]
     result.add e
-
-proc nthPriorCheckout(s: RefStore, n: int): string =
-  ## `@{-<n>}`: the n-th branch checked out before this one.
-  ##
-  ## There is no record of that anywhere except HEAD's reflog, where every
-  ## switch left a `checkout: moving from <old> to <new>` message.  git reads
-  ## the log backwards and counts the *from* fields (`refs.c:
-  ## repo_dwim_log` via `interpret_branch_name`), so `@{-1}` is where the last
-  ## switch came from -- which is what makes `git checkout -` work.
-  const marker = "checkout: moving from "
-  var count = 0
-  let log = s.readReflog(headRef)
-  for i in countdown(log.high, 0):
-    let m = log[i].message
-    if not m.startsWith(marker): continue
-    let rest = m[marker.len .. ^1]
-    let sep = rest.find(" to ")
-    if sep < 0: continue
-    inc count
-    if count == n: return rest[0 ..< sep]
-  ""    ## fewer switches than that: not an error, just not a name
 
 proc headDescription*(repo: Repository): string =
   ## What `status` and `branch` call a HEAD that is not on a branch.
@@ -159,12 +180,15 @@ proc resolveName(repo: Repository, name: string): tuple[ok: bool, oid: Oid] =
     let head = name[0 ..< at]
     let arg = name[at + 2 .. ^2]
 
+    # `@{-<n>}` is refused rather than resolved.  It is the one `@{…}` form
+    # that names a *branch* and not an object ID, and the only record of the
+    # answer is a backwards scan of HEAD's reflog counting `checkout: moving
+    # from` messages (`refs.c:repo_dwim_log`).  Silence here would be the bad
+    # kind: `@{-1}` would fall through and be read as a path.
     if head.len == 0 and arg.len > 0 and arg[0] == '-':
-      # `@{-n}`: a *name*, not an ID -- `checkout @{-1}` moves onto that
-      # branch rather than detaching at its tip.
-      let prior = repo.refs.nthPriorCheckout(parseInt(arg[1 .. ^1]))
-      if prior.len == 0: return (false, nullOid)
-      return repo.resolveName(prior)
+      refuse("'@{" & arg & "}' is out of scope for gittle: the branch you " &
+             "were on before is only in HEAD's reflog; name it, or read " &
+             "`gittle reflog`")
 
     let refName = if head.len == 0: repo.headRefName
                   else:
@@ -180,11 +204,14 @@ proc resolveName(repo: Repository, name: string): tuple[ok: bool, oid: Oid] =
       failIf(not r.found, "upstream branch '" & up & "' does not exist")
       return (true, r.oid)
     if arg == "push":
-      fail("@{push} is out of scope for gittle v1 (docs/09): no push refspecs")
+      refuse("@{push} is out of scope for gittle v1 (docs/09): no push refspecs")
 
-    failIf(arg.len == 0 or not arg.allCharsInSet({'0' .. '9'}),
-           "'" & arg & "' is not a reflog entry number\n" &
-           "  gittle does not implement @{<date>} (docs/04 cuts approxidate)")
+    # Everything else that could stand here is `@{<date>}`, which is git's
+    # approxidate and out of scope; refuse it by name so that a mistyped date
+    # cannot be read as an entry number and answer a different question.
+    if arg.len == 0 or not arg.allCharsInSet({'0' .. '9'}):
+      refuse("'@{" & arg & "}' is not a reflog entry number, and gittle has " &
+             "no @{<date>}: give a number, or a date to --since/--until")
     let n = parseInt(arg)
     let log = repo.refs.readReflog(refName)
     let shown = if head.len > 0: head else: repo.refs.shortenRef(refName)
@@ -262,7 +289,7 @@ proc peelOnion(repo: Repository, spec: string): tuple[ok: bool, oid: Oid] =
   if not base.ok: return base
 
   if inner.len > 0 and inner[0] == '/':
-    fail("^{/<text>} is out of scope for gittle v1 (docs/09): no commit search")
+    refuse("^{/<text>} is out of scope for gittle v1 (docs/09): no commit search")
   if inner.len == 0:
     # Dereference tags, and only tags.
     return (true, repo.peelTags(base.oid))
@@ -335,8 +362,8 @@ proc tryResolveRev(repo: Repository, spec: string): tuple[ok: bool, oid: Oid] =
     if peeled.ok: return peeled
 
   if spec[0] == ':':
-    failIf(spec.len > 2 and spec[1] == '/',
-           ":/<text> is out of scope for gittle v1 (docs/09): no commit search")
+    if spec.len > 2 and spec[1] == '/':
+      refuse(":/<text> is out of scope for gittle v1 (docs/09): no commit search")
     var stage = 0
     var path = spec[1 .. ^1]
     if spec.len > 2 and spec[1] in {'0' .. '3'} and spec[2] == ':':
@@ -381,7 +408,9 @@ proc looksLikeRev*(repo: Repository, spec: string): bool =
   ## Does this argument name something?  The question every command with both
   ## revisions and paths has to ask, and it must not be fatal -- `log Makefile`
   ## is a path, not an error.
-  try: repo.tryResolveRev(spec).ok except GittleError: false
+  try: return repo.tryResolveRev(spec).ok
+  except RevRefused: raise
+  except GittleError: return false
 
 proc looksLikeCommittish(repo: Repository, spec: string): bool =
   ## As above, but for the two parent spellings, which need an actual commit:
@@ -391,8 +420,9 @@ proc looksLikeCommittish(repo: Repository, spec: string): bool =
   ## without dereferencing, so `v1..main` excludes the tag object itself.
   try:
     let r = repo.tryResolveRev(spec)
-    r.ok and repo.peelTo(r.oid, otCommit).oid != nullOid
-  except GittleError: false
+    return r.ok and repo.peelTo(r.oid, otCommit).oid != nullOid
+  except RevRefused: raise
+  except GittleError: return false
 
 # ---------------------------------------------------------------------------
 # Layer 3: a revision argument
@@ -441,27 +471,20 @@ proc addPseudo*(repo: Repository, which: RevPseudo, pattern: string,
     if h.found: dest.add RevPoint(oid: h.oid, uninteresting: notMode)
 
 proc failAmbiguous*(repo: Repository, arg: string) =
-  ## An argument that is neither a revision nor a path that exists: refuse
-  ## it, as git does, rather than guess.  git goes on to diagnose *which*
-  ## near-miss it was (`object-name.c:diagnose_invalid_index_path` and its
-  ## sibling, 46 lines of hints); the minimization pass kept the one
-  ## sentence that says what to do (docs/minimize.md §3, tier 3).
+  ## An argument that is neither a revision nor a path that exists: refuse it,
+  ## as git does, rather than guess -- because guessing means treating a
+  ## mistyped revision as a pathspec and printing a confident empty answer.
+  ##
+  ## One sentence, not a diagnosis.  git re-reads the argument after it has
+  ## failed and works out *which* near miss it was -- `:1:x` when `x` is
+  ## staged only at 0, `HEAD:x` when `x` is not in that tree -- in 46 lines
+  ## across `object-name.c:diagnose_invalid_index_path` and its sibling.  Each
+  ## of those sentences restates the argument the user just typed, and
+  ## docs/minimize.md §3 tier 3 settled that gittle's prose is compared for
+  ## content and not for bytes; what has to survive is the exit status and the
+  ## `--` rule, which is the part that tells the user what to do next.
   if fileExists(repo.workTreePath(repo.prefix & arg)) or
      dirExists(repo.workTreePath(repo.prefix & arg)): return
-  # The two messages that say *what* was missing, without git's guesses at
-  # what was meant: `:<path>` names the index, `<rev>:<path>` names a tree.
-  if arg.len > 1 and arg[0] == ':' and arg[1] != '/':
-    let staged = arg.len > 2 and arg[1] in {'0' .. '3'} and arg[2] == ':'
-    let path = if staged: arg[3 .. ^1] else: arg[1 .. ^1]
-    let idx = readIndex(repo.indexPath)
-    for st in 0 .. 3:
-      failIf(idx.find(path, st) >= 0, "path '" & path &
-             "' is in the index, but not at stage " & (if staged: $arg[1] else: "0"))
-    fail("path '" & path & "' does not exist (neither on disk nor in the index)")
-  let colon = arg.splitColon()
-  if colon > 0 and repo.looksLikeRev(arg[0 ..< colon]):
-    fail("path '" & arg[colon + 1 .. ^1] & "' does not exist in '" &
-         arg[0 ..< colon] & "'")
   fail("ambiguous argument '" & arg & "': unknown revision or path not in " &
        "the working tree.\nUse '--' to separate paths from revisions, like " &
        "this:\n'gittle <command> [<revision>...] -- [<file>...]'")
@@ -580,22 +603,27 @@ type RevInput* = object
 proc initRevInput*(): RevInput = RevInput(maxCount: -1)
 
 proc parseTimestamp*(s: string): int64 =
-  ## `--since` / `--until`, and `gc --prune=<date>`.  A raw seconds count, or
-  ## an ISO-8601 date with an optional time and zone.
+  ## `--since` / `--until`: the boundary of a walk, as seconds since the epoch.
   ##
-  ## Not approxidate: "2 weeks ago" is a 1,200-line parser of English behind
-  ## one option, which is R6's case exactly (plan.md §3).  Refusing by name
-  ## beats accepting it and quietly meaning something else.
+  ## **One date parser, not two.**  `ident.parseDate` already reads the two
+  ## spellings v1 accepts anywhere -- git's own `<epoch> <+hhmm>`, and ISO
+  ## 8601 with an optional time and zone -- because `GIT_AUTHOR_DATE` is
+  ## written in them.  There used to be a second list of formats here, and the
+  ## two lists had drifted: `2026-09-01T00:00:00Z` was a date you could commit
+  ## with and not a date you could bound a walk by, while `2026/09/01` was the
+  ## reverse (docs/minimize.md §7.1).  A date is a date; the difference was an
+  ## accident of which file it was typed into.
+  ##
+  ## Not approxidate.  `--since=2.weeks.ago` is git's `date.c` reading English
+  ## -- over a thousand lines behind one option, which is R6's case exactly
+  ## (plan.md §3).  Refusing it by name beats accepting it and quietly meaning
+  ## something else: a walk bounded by a date nobody chose still prints
+  ## commits, and looks like it worked.
   if s.len > 0 and s.allCharsInSet({'0' .. '9'}): return parseBiggestInt(s)
-  const forms = ["yyyy-MM-dd'T'HH:mm:sszzz", "yyyy-MM-dd'T'HH:mm:ss",
-                 "yyyy-MM-dd HH:mm:ss zzz", "yyyy-MM-dd HH:mm:ss",
-                 "yyyy-MM-dd HH:mm", "yyyy-MM-dd", "yyyy/MM/dd"]
-  for f in forms:
-    try: return parse(s, f).toTime.toUnix
-    except TimeParseError, ValueError: discard
-  fail("invalid date '" & s & "'\n" &
-       "  gittle takes a seconds count or an ISO-8601 date; the relative " &
-       "forms\n  ('2 weeks ago') are out of scope for v1 (plan.md R6)")
+  try: return parseDate(s).when0
+  except GittleError:
+    fail("invalid date '" & s & "': gittle takes an ISO-8601 date or a raw " &
+         "seconds count, not a relative date such as '2 weeks ago'")
 
 const pseudoOpt: array[RevPseudo, string] =
   ["--all", "--branches", "--tags", "--remotes"]

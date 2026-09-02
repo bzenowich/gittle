@@ -91,7 +91,12 @@ proc cmdDiff*(c: Ctx, args: seq[string]): int =
         continue
     var t: Oid
     var ok = true
-    try: t = repo.resolveTree(r) except GittleError: ok = false
+    # A *refusal* is not a "this is not a revision, try it as a path": letting
+    # `RevRefused` through here would report `:/one` as a pathspec that matched
+    # nothing, naming a mistake the user did not make (docs/minimize-2.md §B3).
+    try: t = repo.resolveTree(r)
+    except RevRefused: raise
+    except GittleError: ok = false
     if ok and (seenDashDash or specs.len == 0): trees.add t
     else:
       failAmbiguous(repo, r)
