@@ -90,9 +90,12 @@ type
 func prettify*(name: string): string =
   ## `refs.c:prettify_refname`: a plain prefix strip, with none of the
   ## ambiguity checking `shortenRef` does.  The report is display, not naming.
-  for p in ["refs/heads/", "refs/tags/", "refs/remotes/"]:
-    if name.startsWith(p): return name[p.len .. ^1]
-  name
+  ##
+  ## One strip helper for the whole tree, not three (docs/minimize.md §7.1).
+  ## `shortenRefname` takes a bare `refs/` off as well, which git's
+  ## `prettify_refname` leaves on -- visible only on a ref outside `heads/`,
+  ## `tags/` and `remotes/`, and no refspec puts one in a fetch or push report.
+  shortenRefname(name)
 
 # ---------------------------------------------------------------------------
 # The report, shared by fetch and push
@@ -200,8 +203,11 @@ proc buildRefMap(adverts: seq[RemoteRef], inSpecs: seq[Refspec],
     if s.pattern or s.src.len == 0 or s.src.startsWith(refsPrefix): continue
     var found = ""
     for rule in revParseRules:
+      # `expandRule`, not `rule & s.src`: the last rule is
+      # `refs/remotes/@/HEAD` and concatenating it matched nothing at all
+      # (`remote.c:find_ref_by_name_abbrev` substitutes into every rule).
       for r in adverts:
-        if r.name == rule & s.src: found = r.name; break
+        if r.name == expandRule(rule, s.src): found = r.name; break
       if found.len > 0: break
     failIf(explicit and found.len == 0, "couldn't find remote ref " & s.src)
     if found.len == 0: continue

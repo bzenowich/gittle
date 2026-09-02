@@ -34,10 +34,17 @@
 ## `--edit-description` came out in the minimisation pass (docs/minimize.md
 ## §3): a survey of use found none of them, and `for-each-ref refs/heads`
 ## answers the first five.  Each refuses by name rather than being ignored.
-## `--contains`, `--merged`, `-vv` and `--show-current` -- everything the
-## survey did find -- stay.  The second pass then took the engine out from
-## under `--contains` and `--merged`: they are two `isAncestor` calls now, not
-## a memoised reachability cache (docs/minimize-2.md B5).
+##
+## The second pass (docs/minimize-2.md B4) re-measured the same two logs and
+## took three more: `--merged`, which `for-each-ref --merged refs/heads`
+## answers, and the two upstream verbs `-u`/`--set-upstream-to` and
+## `--unset-upstream`, which are `branch.<name>.remote` and `.merge` in the
+## config and nothing else -- `push -u` and `checkout -b --track` are how an
+## upstream actually gets set, and both go through `setBranchUpstream` still.
+## `--contains` (5 uses), `-vv`, `-a`, `-r`, `-m`, `-f`, `--list` and
+## `--show-current` -- everything the logs do use -- stay, as do the verbs
+## `-d`/`-D` and `-q`/`-t`/`--no-track`, which `checkout` and `worktree` reach
+## through this file's own procs.
 
 import std/[os, strutils]
 import ../cli, ../commitobj, ../config, ../refname, ../refs,
@@ -269,10 +276,8 @@ proc deleteBranches(c: Ctx, names: seq[string], force, quiet, remote: bool): int
       if not merged and up.len > 0:
         let there = repo.refs.resolveRef(up)
         merged = there.found and repo.isAncestor(r.oid, there.oid)
-      failIf(not merged,
-             "the branch '" & name & "' is not fully merged.\n" &
-             "If you are sure you want to delete it, run 'gittle branch -D " &
-             name & "'.")
+      failIf(not merged, "the branch '" & name & "' is not fully merged; " &
+             "'gittle branch -D " & name & "' deletes it anyway")
     repo.refs.deleteRef(full, msg = "branch: deleted")
     if not quiet:
       echo "Deleted " & (if remote: "remote-tracking " else: "") & "branch " &
@@ -337,13 +342,12 @@ const
     opt("-q|--quiet", help = "say nothing on success"),
     opt("-t|--track", help = "set up upstream tracking from the start point"),
     opt("--no-track", help = "do not set up tracking"),
-    opt("-u|--set-upstream-to", okValue, arg = "<upstream>", help = "set the branch's upstream"),
-    opt("--unset-upstream", help = "remove the branch's upstream"),
     opt("--contains", okOptNext, arg = "[<commit>]", help = "list only branches containing <commit> (HEAD by default)"),
-    opt("--merged", okOptNext, arg = "[<commit>]", help = "list only branches reachable from <commit>"),
     opt("-c|--copy|-C|--create-reflog", okRefused, help = "docs/06"),
-    opt("--sort|--format|--points-at|--no-contains|--no-merged|--edit-description",
-        okRefused, help = "trimmed (docs/minimize.md §3); use for-each-ref refs/heads"),
+    opt("-u|--set-upstream-to|--unset-upstream", okRefused,
+        help = "trimmed (docs/minimize-2.md B4); an upstream is branch.<name>.remote and .merge, and push -u writes them"),
+    opt("--sort|--format|--points-at|--no-contains|--merged|--no-merged|--edit-description",
+        okRefused, help = "trimmed (docs/minimize.md §3, B4); use for-each-ref refs/heads"),
   ]
 
 proc cmdBranch*(c: Ctx, args: seq[string]): int =
@@ -368,9 +372,7 @@ proc cmdBranch*(c: Ctx, args: seq[string]): int =
   let force = o.has("force") or o.has("D") or o.has("M")
   let del = o.has("delete") or o.has("D")
   let move = o.has("move") or o.has("M")
-  let unsetUpstream = o.has "unset-upstream"
   let showCurrent = o.has "show-current"
-  let upstreamTo = o.val "set-upstream-to"
   var rest = o.args
   let repo = c.repo
   if kinds.card == 0: kinds = {0}
@@ -378,26 +380,6 @@ proc cmdBranch*(c: Ctx, args: seq[string]): int =
   if showCurrent:
     let name = repo.headRefName
     if name.startsWith(heads): echo name[heads.len .. ^1]
-    return 0
-
-  # The upstream and rename verbs act on the branch named, or failing that
-  # the one HEAD is on -- and a detached HEAD has no branch to act on.
-  proc named(orElse: string): string =
-    if rest.len > 0: return rest[0]
-    failIf(not repo.headRefName.startsWith(heads), orElse)
-    repo.headRefName[heads.len .. ^1]
-
-  if unsetUpstream:
-    let name = named("could not unset upstream of HEAD when it does not " &
-                     "point to any branch")
-    for key in ["remote", "merge"]:
-      discard unsetConfigValue(repo.gitDir / "config",
-                               "branch." & name & "." & key, all = true)
-    return 0
-
-  if upstreamTo.len > 0:
-    setBranchUpstream(c, named("could not set upstream of HEAD when it does " &
-                               "not point to any branch"), upstreamTo, quiet)
     return 0
 
   if del:
@@ -409,7 +391,13 @@ proc cmdBranch*(c: Ctx, args: seq[string]): int =
     # The last argument is the new name; what is left, if anything, is the old.
     let dest = rest[^1]
     rest.setLen(rest.len - 1)
-    renameBranch(c, named("cannot rename a detached HEAD"), dest, force)
+    # With one argument the branch renamed is the one HEAD is on, and a
+    # detached HEAD has none.
+    var src = if rest.len > 0: rest[0] else: repo.headRefName
+    if rest.len == 0:
+      failIf(not src.startsWith(heads), "cannot rename a detached HEAD")
+      src = src[heads.len .. ^1]
+    renameBranch(c, src, dest, force)
     return 0
 
   # A bare name creates; anything else is a listing, and the leftovers are

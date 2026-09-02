@@ -153,7 +153,9 @@ proc headDescription*(repo: Repository): string =
       except GittleError: discard
     if sameCommit:
       # A tag or remote-tracking branch is named without its namespace, the
-      # way it would be typed back.
+      # way it would be typed back -- and a *branch* keeps its `refs/heads/`,
+      # which is why this is two prefixes and not `shortenRefname`'s four
+      # (`wt-status.c:wt_status_get_detached_from`).
       name = d.full
       for p in ["refs/tags/", "refs/remotes/"]:
         if name.startsWith(p): name = name[p.len .. ^1]
@@ -186,9 +188,8 @@ proc resolveName(repo: Repository, name: string): tuple[ok: bool, oid: Oid] =
     # from` messages (`refs.c:repo_dwim_log`).  Silence here would be the bad
     # kind: `@{-1}` would fall through and be read as a path.
     if head.len == 0 and arg.len > 0 and arg[0] == '-':
-      refuse("'@{" & arg & "}' is out of scope for gittle: the branch you " &
-             "were on before is only in HEAD's reflog; name it, or read " &
-             "`gittle reflog`")
+      refuse("'@{" & arg & "}' is out of scope for gittle: name the branch, " &
+             "or find it in `gittle reflog`")
 
     let refName = if head.len == 0: repo.headRefName
                   else:
@@ -485,6 +486,10 @@ proc failAmbiguous*(repo: Repository, arg: string) =
   ## `--` rule, which is the part that tells the user what to do next.
   if fileExists(repo.workTreePath(repo.prefix & arg)) or
      dirExists(repo.workTreePath(repo.prefix & arg)): return
+  # These three lines stay three lines: `p6ro rev-parse` and `p6ro reset`
+  # compare gittle's stderr against git's for seven arguments that must not
+  # resolve, so this one message is git's bytes on purpose -- the A2 pass
+  # (docs/minimize-2.md) shortens prose nothing compares.
   fail("ambiguous argument '" & arg & "': unknown revision or path not in " &
        "the working tree.\nUse '--' to separate paths from revisions, like " &
        "this:\n'gittle <command> [<revision>...] -- [<file>...]'")

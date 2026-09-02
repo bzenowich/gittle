@@ -285,6 +285,43 @@ proc refExists(s: RefStore, name: string): bool =
   ## Does the ref resolve to anything, loose or packed?
   s.readRef(name).found
 
+func expandRule*(rule, name: string): string =
+  ## One `revParseRules` entry with the abbreviated name substituted:
+  ## `refs/tags/` and `v1` make `refs/tags/v1`, and `refs/remotes/@/HEAD` and
+  ## `origin` make `refs/remotes/origin/HEAD`.
+  ##
+  ## git's rules are `printf` formats and the `@` here stands exactly where
+  ## its `%.*s` does (`refs.c:ref_rev_parse_rules`).  This is the only place
+  ## that substitution is written; it was four places, which is how
+  ## `remotes.buildRefMap` came to expand the `/HEAD` rule as a plain prefix
+  ## and match nothing (docs/minimize.md §7.1).
+  if rule.len == 0: name
+  elif rule.endsWith("/HEAD"): rule[0 ..< rule.len - 6] & name & "/HEAD"
+  else: rule & name
+
+func matchRule(rule, full: string): string =
+  ## `expandRule` run backwards: the abbreviated name this rule would have
+  ## expanded into `full`, or "" if it could not have produced it at all.
+  if rule.endsWith("/HEAD"):
+    let head = rule[0 ..< rule.len - 6]
+    if full.startsWith(head) and full.endsWith("/HEAD"):
+      return full[head.len .. full.len - 6]
+  elif full.startsWith(rule):
+    return full[rule.len .. ^1]
+
+iterator refCandidates(name: string): string =
+  ## Every full ref name a short name could mean, in git's order -- the order
+  ## is why a tag beats a branch of the same name.
+  ##
+  ## A one-level candidate is only offered if it looks like a pseudoref, which
+  ## stops `gittle cat-file -t master` from being answered by a stray file
+  ## called `master` in the git directory.
+  for rule in revParseRules:
+    let candidate = expandRule(rule, name)
+    if candidate.startsWith(refsPrefix) or
+       isValidRefname(candidate, {rfAllowOneLevel}):
+      yield candidate
+
 proc shortenRef*(s: RefStore, full: string, strict = false): string =
   ## The shortest name that still means this ref: `refs/heads/main` -> `main`,
   ## for `rev-parse --abbrev-ref` and `branch`'s listings.
@@ -299,24 +336,13 @@ proc shortenRef*(s: RefStore, full: string, strict = false): string =
   ## earlier ones -- a stricter answer for scripts that will feed it back to a
   ## different tool.
   for i in countdown(revParseRules.high, 1):
-    let rule = revParseRules[i]
-    var short: string
-    if rule.endsWith("/HEAD"):
-      let head = rule[0 ..< rule.len - 6]
-      if not (full.startsWith(head) and full.endsWith("/HEAD")): continue
-      short = full[head.len .. full.len - 6]
-    else:
-      if not full.startsWith(rule): continue
-      short = full[rule.len .. ^1]
+    let short = matchRule(revParseRules[i], full)
     if short.len == 0: continue
-
     var ambiguous = false
     for j in 0 ..< (if strict: revParseRules.len else: i):
-      if j == i: continue
-      let other = revParseRules[j]
-      let candidate = if other.endsWith("/HEAD"): other[0 ..< other.len - 6] & short & "/HEAD"
-                      else: other & short
-      if s.refExists(candidate): ambiguous = true; break
+      if j != i and s.refExists(expandRule(revParseRules[j], short)):
+        ambiguous = true
+        break
     if not ambiguous: return short
   full
 
@@ -326,29 +352,14 @@ proc expandRefName*(s: RefStore, name: string): string =
   ## `dwimRef` answers "what object does this name?" and therefore resolves
   ## symbolic refs; `reflog HEAD` needs the other question, because HEAD has a
   ## log of its own that is not the log of the branch it points at.
-  for rule in revParseRules:
-    let candidate = if rule.len == 0: name
-                    elif rule.endsWith("/HEAD"): rule[0 ..< rule.len - 6] & name & "/HEAD"
-                    else: rule & name
-    if not candidate.startsWith(refsPrefix) and
-       not isValidRefname(candidate, {rfAllowOneLevel}):
-      continue
+  for candidate in refCandidates(name):
     if s.readRef(candidate).found: return candidate
   ""
 
 proc dwimRef*(s: RefStore, name: string): tuple[found: bool, full: string, oid: Oid] =
   ## Turn a name a human typed -- `main`, `v1.0`, `origin/main`, `HEAD` -- into
   ## a full ref name and its value, trying git's rules in git's order.
-  for rule in revParseRules:
-    let candidate = if rule.len == 0: name
-                    elif rule.endsWith("/HEAD"): rule[0 ..< rule.len - 6] & name & "/HEAD"
-                    else: rule & name
-    # A one-level name is only a ref if it looks like a pseudoref; this stops
-    # `gittle cat-file -t master` from being answered by a stray file called
-    # `master` in the git directory.
-    if not candidate.startsWith(refsPrefix) and
-       not isValidRefname(candidate, {rfAllowOneLevel}):
-      continue
+  for candidate in refCandidates(name):
     let (found, full, oid) = s.resolveRef(candidate)
     if found: return (true, full, oid)
   (false, "", nullOid)
@@ -532,9 +543,11 @@ proc lockRef(s: RefStore, name: string): RefLock =
                    O_WRONLY or O_CREAT or O_EXCL, 0o666.Mode)
   if result.fd < 0:
     if errno == EEXIST:
-      fail("cannot lock ref '" & name & "': it is already locked\n" &
-           "  another gittle or git process may be running, or a previous " &
-           "one crashed;\n  if you are sure none is, remove " & result.lockPath)
+      # Cause and cure in one sentence: the path *is* the instruction, since
+      # another process holding it and a crashed one leaving it behind look
+      # identical from here and differ only in whether that process still runs.
+      fail("cannot lock ref '" & name & "': another gittle or git holds " &
+           result.lockPath & ", or one crashed and left it behind")
     fail("cannot lock ref '" & name & "': " & $strerror(errno))
   result.held = true
 

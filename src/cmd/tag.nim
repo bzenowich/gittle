@@ -26,7 +26,9 @@
 ## `--format`) and the `-n<num>` annotation listing were trimmed in the
 ## minimisation pass (docs/minimize.md §3): a survey of use found `tag -l`
 ## and nothing more, and `for-each-ref refs/tags` answers every other
-## question.  Each refuses by name rather than being silently ignored.
+## question.  The second pass took `-F <file>` for the same reason
+## (docs/minimize-2.md B4): a message from a file is `-m "$(cat file)"`.
+## Each refuses by name rather than being silently ignored.
 ## Taking `-n<num>` out is also what lets `tag` bundle short options like
 ## every other command: `-n2` was the one spelling that was not a cluster.
 
@@ -52,14 +54,15 @@ proc buildTag(repo: Repository, target: Oid, kind: ObjectType,
   repo.writeObject(otTag, data)
 
 const
-  synopsis = "[-a] [-f] [-m <msg> | -F <file>] <tagname> [<commit>]\n-d <tagname>…\n[-l] [<pattern>…]"
+  synopsis = "[-a] [-f] [-m <msg>] <tagname> [<commit>]\n-d <tagname>…\n[-l] [<pattern>…]"
   options = [
     opt("-a|--annotate", help = "make an annotated tag object, not a plain ref"),
     opt("-f|--force", help = "replace an existing tag"),
     opt("-d|--delete", help = "delete tags"),
     opt("-l|--list", help = "list tags, optionally matching patterns"),
     opt("-m|--message", okValue, arg = "<msg>", help = "the message; repeatable, paragraphs joined; implies -a"),
-    opt("-F|--file", okValue, arg = "<file>", help = "read the message from a file; implies -a"),
+    opt("-F|--file", okRefused,
+        help = "trimmed (docs/minimize-2.md B4); pass the text to -m"),
     opt("-s|--sign|-u|--local-user|-v|--verify", okRefused,
         help = "gittle neither makes nor checks signatures (plan.md decision 5)"),
     opt("-e|--edit|--cleanup|--trailer|--create-reflog", okRefused, help = "docs/08"),
@@ -75,8 +78,7 @@ proc cmdTag*(c: Ctx, args: seq[string]): int =
   let del = o.has "delete"
   let list = o.has "list"
   let messages = o.vals "message"
-  let messageFile = o.val "file"
-  let annotate = o.has("annotate") or messages.len > 0 or messageFile.len > 0
+  let annotate = o.has("annotate") or messages.len > 0
   let rest = o.args
   let repo = c.repo
 
@@ -108,13 +110,9 @@ proc cmdTag*(c: Ctx, args: seq[string]): int =
     let target = repo.resolveRevish(if rest.len > 1: rest[1] else: "HEAD")
     var oid = target
     if annotate:
-      var parts = messages
-      if messageFile.len > 0:
-        parts.add(if messageFile == "-": stdin.readAll()
-                  else: readWholeFile(messageFile))
       # The same cleanup a commit message gets, minus the comment stripping:
       # `-m` is not an editor session, so a line beginning with `#` is text.
-      var msg = cleanupMessage(joinMessages(parts), dropComments = false)
+      var msg = cleanupMessage(joinMessages(messages), dropComments = false)
       failIf(msg.len == 0, "no tag message?")
       if not msg.endsWith("\n"): msg.add "\n"
       oid = buildTag(repo, target, repo.objectInfo(target).kind, name, msg)

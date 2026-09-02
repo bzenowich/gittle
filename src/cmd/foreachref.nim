@@ -59,7 +59,8 @@
 ## those two print their own listings and never go through one.
 
 import std/[sets, strutils]
-import ../cli, ../glob, ../repository, ../revision, ../revwalk, ../util
+import ../cli, ../glob, ../refname, ../repository, ../revision, ../revwalk,
+       ../util
 
 const defaultFormat = "%(objectname) %(objecttype)\t%(refname)"
   ## `builtin/for-each-ref.c`.  A script reads this, so it is byte-exact (R1).
@@ -97,11 +98,11 @@ proc matchesPattern*(refname: string, patterns: seq[string],
   ##   is why `tag -l 'v*'` works and `tag -l 'refs/tags/v*'` does not.
   if patterns.len == 0: return true
   if not asPath:
-    var short = refname
-    for p in ["refs/tags/", "refs/heads/", "refs/remotes/"]:
-      if short.startsWith(p):
-        short = short[p.len .. ^1]
-        break
+    # `shortenRefname` is the tree's one prefix strip (docs/minimize.md §7.1).
+    # It also takes a bare `refs/` off, which the listing this serves never
+    # sees: `branch` and `tag` pass `refs/heads/`, `refs/remotes/` and
+    # `refs/tags/` and nothing else.
+    let short = shortenRefname(refname)
     for p in patterns:
       if globMatch(p, short, {}): return true
     return false
@@ -235,8 +236,7 @@ proc expandRow(repo: Repository, r: RefRow, format: string): string =
       else: repo.refs.shortenRef(up)
     else:
       fail("%(" & atom & ") is out of scope for gittle: for-each-ref has " &
-           "refname, refname:short, objectname, objecttype, upstream and " &
-           "upstream:short (docs/minimize-2.md B5)"))
+           "refname[:short], objectname, objecttype and upstream[:short]"))
 
 # ---------------------------------------------------------------------------
 # Entry point

@@ -1971,7 +1971,7 @@ fanwait
 # --------------------------------------------------------------- branch
 p6ok=1; p6n=0; p6dir="$P6/fix"; p6what="branch"
 for a in "" "-v" "-vv" "-a" "-r" "-av" "-arv" "--show-current" "--list" \
-         "--contains side" "--merged" "-l ma*" "-l s*"; do
+         "--contains side" "-l ma*" "-l s*"; do
   p6ro branch $a
 done
 # A detached HEAD is a row in the listing that is not a ref, and it counts
@@ -1987,7 +1987,8 @@ p6ro branch; p6ro branch -v; p6ro branch -a
 # every branch would look like an answer.
 p6ok=1; p6n=0
 for o in --sort=-refname --format='%(refname)' --points-at --no-contains \
-         --no-merged --edit-description; do
+         --no-merged --edit-description --merged \
+         -u --set-upstream-to=origin/main --unset-upstream; do
   p6n=$((p6n+1))
   ( cd "$P6/fix" && "$GITTLE" branch "$o" ) >/dev/null 2>"$WORK/p6.eb" \
     && { p6ok=0; echo "  branch $o was accepted"; }
@@ -2004,9 +2005,6 @@ p6mut branch -d stale;        p6mut branch -d side
 p6mut branch -D side;         p6mut branch -d nosuch
 p6mut branch -m stale renamed; p6mut branch -m main renamed
 p6mut branch -M main side;    p6mut branch -m nosuch x
-p6mut branch -u origin/main side
-p6mut branch --set-upstream-to=origin/main
-p6mut branch --unset-upstream
 p6mut branch -t newb origin/main
 p6mut branch --no-track newb origin/main
 p6mut branch newb v1;         p6mut branch -d -r origin/main
@@ -2026,7 +2024,7 @@ done
 # that kept `tag` from bundling short options; with it gone `-am msg` works.
 p6ok=1; p6n=0
 for o in -n -n2 --sort=-refname --format='%(refname)' --contains --no-contains \
-         --merged --no-merged --points-at; do
+         --merged --no-merged --points-at -F; do
   p6n=$((p6n+1))
   ( cd "$P6/fix" && "$GITTLE" tag "$o" ) >/dev/null 2>"$WORK/p6.eb" \
     && { p6ok=0; echo "  tag $o was accepted"; }
@@ -2039,7 +2037,7 @@ p6ok=1; p6n=0; p6what="tag"
 p6mut tag newtag;                p6mut tag newtag HEAD~1
 p6mut tag -a -m hello annot;     p6mut tag -mmsg mtag
 p6mut tag -a -m one -m two two;  p6mut tag -f v1
-p6mut tag -am bundled bund;      PREP='echo from file > m.txt' p6mut tag -F m.txt ftag
+p6mut tag -am bundled bund
 p6mut tag -f -m new v1;          p6mut tag -d v1
 p6mut tag -d light;              p6mut tag -d nosuch
 p6mut tag v1;                    p6mut tag newtag v1
