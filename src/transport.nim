@@ -203,6 +203,7 @@ proc spawn(argv: seq[string]): tuple[pid: Pid, toChild, fromChild: cint] =
   (pid, inPipe[1], outPipe[0])
 
 proc streamOf(fd: cint, mode: FileMode): Stream =
+  ## A stream over one end of a pipe.
   var f: File
   failIf(not open(f, FileHandle(fd), mode), "cannot wrap pipe " & $fd)
   newFileStream(f)
@@ -398,6 +399,8 @@ proc lsRefs*(c: Conn, prefixes: openArray[string],
 
 proc fetchV2(c: Conn, wants, haves: openArray[Oid],
              thin, includeTag, quiet: bool, sink: proc (data: string)) =
+  ## The `fetch` command of protocol v2: wants, haves, `done`, then the
+  ## packet-line framed pack on the other side.
   let s = c.toRemote
   writeLine(s, "command=fetch")
   writeLine(s, "agent=" & agent)

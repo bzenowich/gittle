@@ -43,12 +43,12 @@ import ../cli, ../commitobj, ../ident, ../index, ../mergetree, ../objects,
 
 type Kind* = enum pkCherry, pkRevert
 
-const usageText = """usage: gittle cherry-pick [-e|--no-edit] [-x] [-n] [-s] <commit>…
-   or: gittle revert     [-e|--no-edit] [-n] [-s] <commit>…
-   or: gittle <either> --continue | --skip | --quit | --abort"""
 
+# The command's own name, for messages and state files.
 func verb(k: Kind): string = (if k == pkCherry: "cherry-pick" else: "revert")
 func headFile(k: Kind): string =
+  ## The pseudo-ref that marks a stopped operation: `CHERRY_PICK_HEAD` or
+  ## `REVERT_HEAD`.
   if k == pkCherry: "CHERRY_PICK_HEAD" else: "REVERT_HEAD"
 
 proc pickMessage(repo: Repository, k: Kind, c: Commit, oid: Oid,
@@ -68,6 +68,7 @@ proc pickMessage(repo: Repository, k: Kind, c: Commit, oid: Oid,
     result.add "\n(cherry picked from commit " & $oid & ")\n"
 
 proc todoLine(repo: Repository, k: Kind, oid: Oid, msg: string): string =
+  ## One line of `sequencer/todo`: `pick <abbrev> <subject>`.
   (if k == pkCherry: "pick " else: "revert ") &
   repo.uniqueAbbrev(oid, repo.autoAbbrev) & " " & subject(msg) & "\n"
 
@@ -79,15 +80,8 @@ proc conflictAdvice(repo: Repository, k: Kind, oid: Oid, subj: string) =
   stderr.write "error: could not " & (if k == pkCherry: "apply " else: "revert ") &
                repo.uniqueAbbrev(oid, repo.autoAbbrev) & "... " & subj & "\n"
   if repo.cfg.getBool("advice.mergeConflict", true):
-    stderr.write "hint: After resolving the conflicts, mark them with\n" &
-      "hint: \"gittle add/rm <pathspec>\", then run\n" &
-      "hint: \"gittle " & v & " --continue\".\n" &
-      "hint: You can instead skip this commit with \"gittle " & v &
-      " --skip\".\n" &
-      "hint: To abort and get back to the state before \"gittle " & v &
-      "\",\nhint: run \"gittle " & v & " --abort\".\n" &
-      "hint: Disable this message with \"gittle config set " &
-      "advice.mergeConflict false\"\n"
+    stderr.write "hint: fix the conflicts and \"gittle add\" them, then \"gittle " &
+                 v & " --continue\"; or --skip this commit, or --abort\n"
 
 proc writeTodo(repo: Repository, k: Kind, todo: seq[Oid], from0: int) =
   ## The remaining picks, current one first.  Absent when only one is left to
@@ -191,39 +185,43 @@ proc replay(c: Ctx, todo: seq[Oid], k: Kind, recordOrigin, noCommit, signoff,
     if result != 0: return
   if seq0: repo.removeState(sequencerDir)
 
-proc run(c: Ctx, argv: seq[string], k: Kind): int =
-  let args = expandShortOptions(argv, {})
-  var recordOrigin, noCommit, signoff, forceEdit, noEdit = false
-  var cont, skip, quit0, abort = false
-  var specs: seq[string]
-  var i = 0
-  var noMoreOpts = false
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-': specs.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-x": recordOrigin = true
-    elif a == "-n" or a == "--no-commit": noCommit = true
-    elif a == "-s" or a == "--signoff": signoff = true
-    elif a == "--no-signoff": signoff = false
-    elif a == "-e" or a == "--edit": forceEdit = true
-    elif a == "--no-edit": noEdit = true
-    elif a == "--continue": cont = true
-    elif a == "--skip": skip = true
-    elif a == "--quit": quit0 = true
-    elif a == "--abort": abort = true
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif a in ["-m", "--mainline", "-r", "--cleanup", "--ff", "--allow-empty",
-               "--allow-empty-message", "--empty", "--keep-redundant-commits",
-               "--strategy", "-X", "--strategy-option", "--reference",
-               "--rerere-autoupdate", "--no-rerere-autoupdate", "-S",
-               "--gpg-sign", "--no-gpg-sign"]:
-      fail(a & " is out of scope for gittle v1 (docs/06)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
+const
+  synopsis = "[-e|--no-edit] [-x] [-n] [-s] <commit>…\n--continue | --skip | --quit | --abort"
+  options = [
+    opt("-x", help = "append `(cherry picked from commit …)` to the message"),
+    opt("-n|--no-commit", help = "apply to the index and tree, do not commit"),
+    opt("-s|--signoff", help = "add a Signed-off-by trailer"),
+    opt("--no-signoff"),
+    opt("-e|--edit", help = "open the editor on each message"),
+    opt("--no-edit", help = "never open the editor"),
+    opt("--continue", help = "go on after resolving conflicts"),
+    opt("--skip", help = "drop the current commit and go on"),
+    opt("--quit", help = "forget the operation, keeping the tree as it is"),
+    opt("--abort", help = "undo the operation entirely"),
+    opt("-m|--mainline|-r|--cleanup|--ff|--allow-empty|--allow-empty-message|--empty|" &
+        "--keep-redundant-commits|--strategy|-X|--strategy-option|--reference|" &
+        "--rerere-autoupdate|--no-rerere-autoupdate|-S|--gpg-sign|--no-gpg-sign",
+        okRefused, help = "docs/06"),
+  ]
 
+proc run(c: Ctx, argv: seq[string], k: Kind): int =
+  ## The one body behind `cherry-pick` and `revert`: parse, then either
+  ## continue/skip/quit/abort a stopped operation or start replaying the
+  ## named commits.
+  let o = parse(options, argv, k.verb, synopsis)
+  var signoff = false
+  for (key, _) in o.occurrences:
+    if key == "signoff": signoff = true
+    elif key == "no-signoff": signoff = false
+  let recordOrigin = o.has "x"
+  let noCommit = o.has "no-commit"
+  let forceEdit = o.has "edit"
+  let noEdit = o.has "no-edit"
+  let cont = o.has "continue"
+  let skip = o.has "skip"
+  let quit0 = o.has "quit"
+  let abort = o.has "abort"
+  let specs = o.args
   let repo = c.repo
   failIf(repo.workTree.len == 0,
          k.verb & " is not possible in a bare repository")
@@ -289,7 +287,7 @@ proc run(c: Ctx, argv: seq[string], k: Kind): int =
                     signoff = false, useEditor = false, sequence = true)
 
   repo.refuseIfInProgress(idx, k.verb)
-  failIf(specs.len == 0, "no commit specified\n" & usageText)
+  failIf(specs.len == 0, "no commit specified\n" & o.use)
   # An editor by default for `revert` and never for `cherry-pick`, and only
   # when there is a terminal to open one on
   # (`builtin/revert.c` asks `isatty` for its default).
@@ -297,5 +295,7 @@ proc run(c: Ctx, argv: seq[string], k: Kind): int =
                   (k == pkRevert and not noEdit and isTty() and isatty(0) != 0)
   c.replay(repo.collect(specs), k, recordOrigin, noCommit, signoff, useEditor)
 
+# Entry point for `cherry-pick`.
 proc cmdCherryPick*(c: Ctx, argv: seq[string]): int = run(c, argv, pkCherry)
+# Entry point for `revert`.
 proc cmdRevert*(c: Ctx, argv: seq[string]): int = run(c, argv, pkRevert)

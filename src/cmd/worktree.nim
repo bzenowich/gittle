@@ -44,11 +44,6 @@ import ../cmd/branch as cmdbranch
 
 const heads = refsPrefix & "heads/"
 
-const usageText = """usage: gittle worktree add [-f] [-b <branch> | -B <branch>] [-d] [-q] <path> [<commit-ish>]
-   or: gittle worktree list
-   or: gittle worktree move <worktree> <new-path>
-   or: gittle worktree prune
-   or: gittle worktree remove [-f] <worktree>"""
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -84,6 +79,7 @@ proc linkedWorktree(repo: Repository, arg, startDir: string, force: int,
          "use '" & verb & " -f -f' to override or unlock first")
 
 proc emptyDir(path: string): bool =
+  ## Is the directory empty?
   for _, _ in walkDir(path): return false
   true
 
@@ -169,31 +165,32 @@ proc worktreeCheckout(c: Ctx, repo: Repository, admin, path, branch: string,
   idx.writeIndex()
   wt.refs.updateRef(headRef, oid, msg = "reset: moving to HEAD")
 
-proc worktreeAdd(c: Ctx, args: seq[string]): int =
-  var force = 0
-  var detach, quiet = false
-  var newBranch, newBranchForce = ""
-  var rest: seq[string]
-  var i = 0
-  optionValue(args, i)
-  while i < args.len:
-    let a = args[i]
-    if a.len == 0 or a[0] != '-': rest.add a
-    elif a == "-f" or a == "--force": inc force
-    elif a == "-d" or a == "--detach": detach = true
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "-b": newBranch = valueFor(a)
-    elif a == "-B": newBranchForce = valueFor(a)
-    elif a == "-h" or a == "--help": (echo usageText; return 0)
-    elif a in ["--orphan", "--lock", "--reason", "--track", "--no-track",
-               "--guess-remote", "--relative-paths", "--no-checkout"]:
-      fail("gittle worktree add does not support '" & a & "' (docs/08)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
+const
+  synopsis = "add [-f] [-b <branch> | -B <branch>] [-d] [-q] <path> [<commit-ish>]\nlist\nmove <worktree> <new-path>\nremove [-f] <worktree>\nprune"
+  addOptions = [
+    opt("-f|--force", okCount, help = "add over a branch another worktree has; -ff over a locked one"),
+    opt("-d|--detach", help = "detach HEAD in the new worktree"),
+    opt("-q|--quiet", help = "say nothing"),
+    opt("-b", okValue, arg = "<branch>", help = "create the branch first"),
+    opt("-B", okValue, arg = "<branch>", help = "create or reset the branch first"),
+    opt("--orphan|--lock|--reason|--track|--no-track|--guess-remote|--relative-paths|--no-checkout",
+        okRefused, help = "docs/08"),
+  ]
+  forceOption = [opt("-f|--force", okCount, help = "remove even when dirty or locked")]
 
+proc worktreeAdd(c: Ctx, args: seq[string]): int =
+  ## `worktree add`: validate the path and the branch, write the admin
+  ## directory and the `.git` file, then check the tree out.
+  let o = parse(addOptions, args, "worktree", synopsis)
+  let force = o.count "force"
+  let detach = o.has "detach"
+  let quiet = o.has "quiet"
+  let newBranch = o.val "b"
+  let newBranchForce = o.val "B"
+  let rest = o.args
   failIf(int(detach) + int(newBranch.len > 0) + int(newBranchForce.len > 0) > 1,
          "options '-b', '-B', and '--detach' cannot be used together")
-  failIf(rest.len < 1 or rest.len > 2, usageText)
+  failIf(rest.len < 1 or rest.len > 2, o.use)
 
   let repo = c.repo
   let path = absolutePath(rest[0], c.startDir).normalizedPath
@@ -300,9 +297,9 @@ proc worktreeAdd(c: Ctx, args: seq[string]): int =
 # ---------------------------------------------------------------------------
 
 proc worktreeList(c: Ctx, args: seq[string]): int =
-  for a in args:
-    if a == "-h" or a == "--help": (echo usageText; return 0)
-    fail("gittle worktree list does not support '" & a & "' (docs/08)")
+  ## `worktree list`: the main worktree first, then each linked one, with
+  ## its HEAD and branch.
+  discard parse([], args, "worktree", synopsis)
   let repo = c.repo
   let all = repo.allWorktrees
 
@@ -350,20 +347,19 @@ proc validateWorktree(repo: Repository, w: Worktree, verb: string) =
          why & "'" & w.path & "' does not point back to '" &
          repo.adminDir(w.id) & "'")
 
+# `rename(2)`, for moving a worktree directory in one step.
 proc rename(oldPath, newPath: cstring): cint {.importc, header: "<stdio.h>".}
 
 proc forceAndPaths(args: seq[string], want: int):
     tuple[force: int, rest: seq[string]] =
-  ## `move` and `remove` take the same options -- `-f`, repeatable, and
-  ## nothing else -- and the same number of paths each.
-  for a in args:
-    if a.len == 0 or a[0] != '-': result.rest.add a
-    elif a == "-f" or a == "--force": inc result.force
-    elif a == "-h" or a == "--help": (echo usageText; exitWith(0))
-    else: fail("unknown option '" & a & "'\n" & usageText)
-  failIf(result.rest.len != want, usageText)
+  ## `rename(2)`, for moving a worktree directory in one step.
+  let o = parse(forceOption, args, "worktree", synopsis)
+  failIf(o.args.len != want, o.use)
+  (o.count "force", o.args)
 
 proc worktreeMove(c: Ctx, args: seq[string]): int =
+  ## `worktree move`: rename the directory and fix the two files that
+  ## point at each other.
   let (force, rest) = forceAndPaths(args, 2)
   let repo = c.repo
   let w = repo.linkedWorktree(rest[0], c.startDir, force, "move")
@@ -383,6 +379,8 @@ proc worktreeMove(c: Ctx, args: seq[string]): int =
   0
 
 proc worktreeRemove(c: Ctx, args: seq[string]): int =
+  ## `worktree remove`: refuse a dirty tree without `-f`, delete the
+  ## directory and the admin directory.
   let (force, rest) = forceAndPaths(args, 1)
   let repo = c.repo
   let w = repo.linkedWorktree(rest[0], c.startDir, force, "remove")
@@ -408,7 +406,10 @@ proc worktreeRemove(c: Ctx, args: seq[string]): int =
   0
 
 proc cmdWorktree*(c: Ctx, args: seq[string]): int =
-  failIf(args.len == 0, usageText)
+  ## Entry point: the sub-verb is the first argument; each has its own
+  ## parse.
+  let use = usage("worktree", synopsis, [])
+  failIf(args.len == 0, use)
   let rest = args[1 .. ^1]
   case args[0]
   of "add": worktreeAdd(c, rest)
@@ -416,10 +417,10 @@ proc cmdWorktree*(c: Ctx, args: seq[string]): int =
   of "move": worktreeMove(c, rest)
   of "remove": worktreeRemove(c, rest)
   of "prune":
-    failIf(rest.len > 0, usageText)
+    failIf(rest.len > 0, use)
     pruneWorktrees(c.repo, dryRun = false, verbose = false)
     0
   of "lock", "unlock", "repair":
     fail("gittle worktree " & args[0] & " is out of scope for v1 (docs/08)")
-  of "-h", "--help": (echo usageText; 0)
-  else: fail("unknown subcommand: " & args[0] & "\n" & usageText)
+  of "-h", "--help": (echo use; 0)
+  else: fail("unknown subcommand: " & args[0] & "\n" & use)

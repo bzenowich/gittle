@@ -27,18 +27,22 @@ type
     total: uint64  ## message length in bytes
 
 func rotl(x: uint32, n: int): uint32 {.inline.} =
+  ## Rotate left, the one bit operation SHA-1 needs beyond and/or/xor.
   (x shl uint32(n)) or (x shr uint32(32 - n))
 
 func init*(c: var Sha1Ctx) =
+  ## Reset to the five initial words (FIPS 180-1, §6.1).
   c.h = [0x67452301'u32, 0xEFCDAB89'u32, 0x98BADCFE'u32,
          0x10325476'u32, 0xC3D2E1F0'u32]
   c.used = 0
   c.total = 0
 
 func initSha1*(): Sha1Ctx =
+  ## A fresh context.
   init(result)
 
 func compress(c: var Sha1Ctx, blk: openArray[byte], off: int) =
+  ## One 64-byte block through the 80 rounds.
   var w: array[80, uint32]
   for i in 0 ..< 16:
     let j = off + i * 4
@@ -103,6 +107,7 @@ func update*(c: var Sha1Ctx, data: openArray[byte]) =
     inc c.used
 
 func update*(c: var Sha1Ctx, s: string) {.inline.} =
+  ## Feed bytes; whole blocks are compressed, the tail is kept.
   update(c, s.toOpenArrayByte(0, s.len - 1))
 
 func finish*(c: var Sha1Ctx): Sha1Digest =
@@ -127,11 +132,13 @@ func finish*(c: var Sha1Ctx): Sha1Digest =
     result[i*4+3] = byte(c.h[i] and 0xFF)
 
 func sha1*(data: openArray[byte]): Sha1Digest =
+  ## The digest of one buffer in a single call.
   var c = initSha1()
   c.update(data)
   c.finish()
 
 func sha1*(s: string): Sha1Digest =
+  ## The digest of one buffer in a single call.
   var c = initSha1()
   c.update(s)
   c.finish()

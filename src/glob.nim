@@ -29,6 +29,7 @@ type
     gfIgnoreCase
 
 func foldIf(c: char, fold: bool): char {.inline.} =
+  ## The character lower-cased when matching case-insensitively.
   if fold and c >= 'A' and c <= 'Z': char(ord(c) + 32) else: c
 
 func matchClass(pat: string, pi: var int, ch: char, fold: bool): bool =

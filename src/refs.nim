@@ -95,6 +95,7 @@ type
     packed: seq[Ref]
     packedLoaded: bool
 
+# A symbolic ref names another ref rather than an object.
 func isSymbolic*(r: Ref): bool = r.symTarget.len > 0
 
 func found*(r: Ref): bool = r.name.len > 0
@@ -117,6 +118,8 @@ func isPerWorktreeRef*(name: string): bool =
     name.startsWith("refs/rewritten/")
 
 func baseDir*(s: RefStore, name: string): string =
+  ## The directory a ref lives under: per-worktree ones in `gitDir`, the
+  ## rest in the common dir.
   if isPerWorktreeRef(name): s.gitDir else: s.commonDir
 
 func refPath*(s: RefStore, name: string): string =
@@ -124,6 +127,7 @@ func refPath*(s: RefStore, name: string): string =
   s.baseDir(name) / name
 
 func reflogPath*(s: RefStore, name: string): string =
+  ## The reflog file under `logs/`.
   s.baseDir(name) / "logs" / name
 
 func packedRefsPath*(s: RefStore): string =
@@ -153,6 +157,7 @@ proc parseRefContents(text, path: string): Ref =
          "invalid object name in " & path & ": '" & body & "'")
 
 proc readLooseRef(s: RefStore, name: string): Ref =
+  ## A loose ref file, or not found; a symref when it starts `ref: `.
   let path = s.refPath(name)
   if not fileExists(path): return
   var raw: string
@@ -277,6 +282,7 @@ const revParseRules* = ["", refsPrefix, "refs/tags/", "refs/heads/",
   ## a tag beats a branch of the same name.
 
 proc refExists(s: RefStore, name: string): bool =
+  ## Does the ref resolve to anything, loose or packed?
   s.readRef(name).found
 
 proc shortenRef*(s: RefStore, full: string, strict = false): string =
@@ -365,6 +371,8 @@ func normalizeReflogMsg*(msg: string): string =
   result = result.strip(leading = false)
 
 proc shouldAutocreateReflog(s: RefStore, name: string): bool =
+  ## `core.logAllRefUpdates`: a new branch, remote-tracking ref or note
+  ## gets a log; anything else only if one already exists.
   case s.logPolicy
   of lrAlways: true
   of lrNone: false
@@ -423,9 +431,6 @@ type
     ruSet          ## point the ref at an object ID
     ruDelete       ## remove the ref wherever it is stored
     ruSetSymbolic  ## point the ref at another ref
-    ruVerify       ## assert the current value and change nothing
-                   ## -- `update-ref --stdin`'s `verify`, which exists so a
-                   ## batch can be conditional on refs it does not modify
 
   RefUpdate* = object
     ## One requested change.  The `have*` flags matter: "no old value given"
@@ -436,9 +441,7 @@ type
     newOid*: Oid
     newTarget*: string
     oldOid*: Oid
-    oldTarget*: string
     haveOldOid*: bool     ## an expected object ID was specified
-    haveOldTarget*: bool  ## an expected symref target was specified
     logOld*: Oid          ## what the reflog should record as the old value,
                           ## when that is not what the ref currently holds.
                           ## `branch -m` is the case: the new name has no
@@ -479,7 +482,6 @@ type
     before: Oid       ## the value before the change, for the reflog
     content: string   ## bytes to write; empty when nothing is written
     delete: bool
-    verifyOnly: bool  ## locked and checked, but left exactly as it was
     forceLog: bool
     noLog: bool
     msg: string
@@ -491,11 +493,10 @@ type
     plans: seq[Plan]
     state: TxState
 
-func isPrepared*(tx: RefTransaction): bool = tx.state == txPrepared
-
 # -- locks ------------------------------------------------------------------
 
 proc rollback(l: var RefLock) =
+  ## Give a lock up without writing: close and unlink `<ref>.lock`.
   if l.held:
     if l.fd >= 0:
       discard close(l.fd)
@@ -551,6 +552,8 @@ proc commitLock(l: var RefLock) =
   l.held = false
 
 proc releaseAfterDelete(l: var RefLock) =
+  ## Release a lock whose ref was just deleted -- the lock file goes, the
+  ## ref file is already gone.
   if l.fd >= 0:
     discard close(l.fd)
     l.fd = -1
@@ -594,7 +597,8 @@ proc rewritePackedRefsWithout(s: RefStore, names: seq[string]) =
   # The header deliberately does *not* claim `peeled` or `fully-peeled`: this
   # writer copies through the peel lines it finds and never computes one, so
   # claiming every tag is peeled would be a lie a later reader is entitled to
-  # act on.  `packRefs` does compute them, and does claim it.
+  # act on.  (`gc` used to write a peeled file; docs/minimize.md §3.4
+  # handed packing refs back to git, so nothing here computes a peel now.)
   var text = "# pack-refs with: sorted \n"
   for r in keep:
     text.add $r.oid & " " & r.name & "\n"
@@ -616,63 +620,10 @@ proc pruneEmptyRefDirs(s: RefStore, name: string) =
       break
     dir = parentDir(dir)
 
-proc packRefs*(s: RefStore, peel: proc (o: Oid): Oid {.closure.}) =
-  ## Fold every loose shared ref into `packed-refs`, then delete the loose
-  ## files.  This is `pack-refs --all --prune`, which is the half of `gc` that
-  ## is about refs rather than objects.
-  ##
-  ## Three things are deliberately left out of the packed file:
-  ##
-  ## * **per-worktree refs** (HEAD, `refs/bisect/…`) -- `packed-refs` is
-  ##   shared, so packing one would make every worktree see it;
-  ## * **symbolic refs** (`refs/remotes/origin/HEAD`) -- the format has no way
-  ##   to say "points at another ref", so git leaves them loose too
-  ##   (`refs/files-backend.c:files_pack_refs`);
-  ## * nothing else.  Unlike git's `--prune`, there is no `--no-prune` form
-  ##   here: a loose ref left beside its packed copy is not wrong, but it is
-  ##   the entire point of the exercise.
-  ##
-  ## Because the peels are computed rather than copied through, the header can
-  ## claim `fully-peeled` -- a claim `rewritePackedRefsWithout` does not make,
-  ## which is safe in that direction: a reader that is not told the file is
-  ## peeled simply peels the tag itself.
-  s.loadPackedRefs()
-  var keep: seq[Ref]
-  var loose: seq[Ref]
-  for r in s.allRefs(refsPrefix):
-    if isPerWorktreeRef(r.name) or r.isSymbolic: continue
-    var packedRef = Ref(name: r.name, oid: r.oid, packed: true)
-    packedRef.peeled = peel(r.oid)
-    packedRef.hasPeeled = not packedRef.peeled.isNull
-    keep.add packedRef
-    if not r.packed: loose.add r
-
-  # No packed refs at all is spelled by the file's absence, not by an empty
-  # file: a stray empty one is parsed on every read for nothing.
-  if keep.len == 0:
-    discard tryRemoveFile(s.packedRefsPath)
-  else:
-    var text = "# pack-refs with: peeled fully-peeled sorted \n"
-    for r in keep:
-      text.add $r.oid & " " & r.name & "\n"
-      if r.hasPeeled: text.add "^" & $r.peeled & "\n"
-    s.writePackedRefs(text)
-  s.packed = keep
-
-  # Only after the packed file is in place, and only when the loose file
-  # still says what was packed: a ref somebody else moved in between must not
-  # be silently rewound to the packed value.
-  for r in loose:
-    let p = s.refPath(r.name)
-    try:
-      if readWholeFile(p).strip() != $r.oid: continue
-    except CatchableError: continue
-    discard tryRemoveFile(p)
-    s.pruneEmptyRefDirs(r.name)
-
 # -- the transaction --------------------------------------------------------
 
 proc newTransaction*(s: RefStore): RefTransaction =
+  ## An empty transaction over the store.
   RefTransaction(store: s, state: txOpen)
 
 proc add*(tx: RefTransaction, update: RefUpdate) =
@@ -720,16 +671,6 @@ proc checkNewValue(s: RefStore, u: RefUpdate, target: string) =
 proc verifyOld(s: RefStore, u: RefUpdate, name: string) =
   ## The compare half of compare-and-swap, run with the lock held -- which is
   ## the only way the answer stays true long enough to act on.
-  if u.haveOldTarget:
-    let rf = s.readRef(name)
-    failIf(not rf.found or not rf.isSymbolic,
-           "cannot lock ref '" & u.name & "': expected a symbolic ref with " &
-           "target '" & u.oldTarget & "'")
-    failIf(rf.symTarget != u.oldTarget,
-           "cannot lock ref '" & u.name & "': is at " & rf.symTarget &
-           " but expected " & u.oldTarget)
-    return
-
   if not u.haveOldOid: return
 
   let (resolved, _, current) = s.resolveRef(name)
@@ -815,7 +756,6 @@ proc prepare*(tx: RefTransaction) =
         p.noop = cur.found and not cur.isSymbolic and p.before == u.newOid
       of ruSetSymbolic: p.content = "ref: " & u.newTarget & "\n"
       of ruDelete: p.delete = true
-      of ruVerify: p.verifyOnly = true
       tx.plans.add p
 
     # If any of this will write a reflog, resolve the identity *now*.  An
@@ -823,7 +763,7 @@ proc prepare*(tx: RefTransaction) =
     # batch half applied, which is exactly what the transaction exists to
     # prevent -- and the identity is the one input that can fail this late.
     for p in tx.plans:
-      if not p.delete and not p.verifyOnly and not p.noLog and
+      if not p.delete and not p.noLog and
          (p.forceLog or s.willWriteReflog(p.target) or
           (p.alias.len > 0 and s.willWriteReflog(p.alias))):
         discard s.identFn()
@@ -845,11 +785,7 @@ proc commit*(tx: RefTransaction) =
   var deleted: seq[string]
 
   for i in 0 ..< tx.plans.len:
-    if tx.plans[i].verifyOnly:
-      # The check already happened under the lock in `prepare`; all that is
-      # left is to let go without touching the ref.
-      tx.locks[i].rollback()
-    elif tx.plans[i].noop:
+    if tx.plans[i].noop:
       tx.locks[i].rollback()
     elif tx.plans[i].delete:
       discard tryRemoveFile(tx.locks[i].path)
@@ -866,7 +802,6 @@ proc commit*(tx: RefTransaction) =
     s.rewritePackedRefsWithout(deleted)
 
   for p in tx.plans:
-    if p.verifyOnly: continue
     if p.delete:
       # The reflog goes with the ref.  Leaving it behind would make a branch of
       # the same name, created later, appear to continue the deleted one.
@@ -931,5 +866,7 @@ proc writeSymRef*(s: RefStore, name, target: string, msg = "",
 proc newRefStore*(gitDir, commonDir: string, policy: LogRefsPolicy,
                   identFn: proc (): Ident {.closure.},
                   objectKindFn: proc (o: Oid): ObjectType {.closure.} = nil): RefStore =
+  ## A store over a repository's ref directories; `identFn` is asked for
+  ## the committer only when a reflog is actually written.
   RefStore(gitDir: gitDir, commonDir: commonDir, logPolicy: policy,
            identFn: identFn, objectKindFn: objectKindFn)

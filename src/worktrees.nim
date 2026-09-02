@@ -63,6 +63,7 @@ type
 func worktreesDir*(repo: Repository): string = repo.commonDir / "worktrees"
 
 func adminDir*(repo: Repository, id: string): string =
+  ## `.git/worktrees`, where each linked worktree has its admin directory.
   repo.worktreesDir / id
 
 proc mainWorkTree*(repo: Repository): string =
@@ -148,6 +149,7 @@ proc pruneReason*(repo: Repository, id: string): string =
   ""
 
 proc removeAdminDir*(repo: Repository, id: string) =
+  ## Delete a linked worktree's admin directory.
   try: removeDir(repo.adminDir(id))
   except OSError:
     fail("failed to delete '" & repo.adminDir(id) & "'")

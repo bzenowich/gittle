@@ -10,109 +10,55 @@ share a repository with real git, and plausible in a busybox-class environment.
   pushes to a git host, and does not host one.
 - **One static binary**, busybox-style `argv[0]` dispatch. Only external
   dependency is the system zlib.
-- **Small enough to read in an afternoon** — 13.9 kloc of Nim, all of v1.
+- **Small enough to read in an afternoon** — 11.7 kloc of Nim, every
+  function documented.
+- **Two runtime dependencies**: the system zlib, and `diff(1)` — the edit
+  script comes from the `diff` every Unix has, gittle does the rest.
 
 ## Status
 
-**v1 is feature-complete.** All nine phases are built — the object store,
-refs and config, the index and trees, the first commit, diff, history, merge,
-the transport, and housekeeping. **All 53 commands** work and agree with real
-git, checked by 187 differential tests. `gittle init`, `gittle add .`,
-`gittle commit` produces a repository real git continues in without noticing
-— identical commit objects, reflogs and index — and `gittle log` reproduces
-git's output over 20,000 commits of the repository next door. `git fsck
---strict` is clean after everything gittle writes.
+**v1 is feature-complete, and minimised.** 44 commands work and agree with
+real git, checked by differential tests that compare not only output but
+every ref, reflog, index entry, object and in-progress marker either tool
+wrote. `gittle init`, `gittle add .`, `gittle commit` produces a repository
+real git continues in without noticing; a merge gittle stopped is concluded
+by `git commit`, and a cherry-pick git stopped is continued by `gittle
+cherry-pick --continue`.
 
-The diff engine is a reimplementation of git's `xdiff/` in the configuration
-`--minimal` selects, including the indent heuristic that decides where a hunk
-sits: **every file pair of 900 real commits comes out hunk for hunk identical**.
-`diff`, `status` in all four output formats, and `grep` are in, `log -p` and
-`show` print their patches, and `commit` prints its diffstat.
+The scope is what an agent-driven daily loop uses, measured from real
+tool-call logs (`docs/git-tool-calls-*.md`), plus `clone`, `fetch` and
+`push` over one transport — a program with a pipe on each end — and the
+plumbing that makes the rest testable from a shell. Ten plumbing wrappers
+nothing called, and the options nothing used, came out in the minimisation
+pass; [`docs/minimize.md`](docs/minimize.md) is the record of what was cut,
+why, and what each cut cost.
 
-Phase 6 added the revision grammar — `HEAD~3`, `v1.0^{}`, `A..B`, `HEAD@{2}`,
-`:0:file` — and with it `rev-list`, `rev-parse`, `merge-base`, `branch`,
-`tag`, `reflog`, and the four commands that are the first to *change* tracked
-files: `checkout`, `switch`, `restore` and `reset`. `rev-list --topo-order`
-reproduces git's choice of topological order over the reference repository,
-and every mutating command is tested by running it in two copies of a
-repository and comparing every ref, reflog, config line, index entry and file
-either tool wrote.
+Three design choices carry the code count:
 
-Phase 7 is the merge: one algorithm behind five commands. `merge`,
-`cherry-pick`, `revert`, `rebase` and `stash` differ only in *which three
-trees* they hand the three-way merge and what they write afterwards, so the
-phase is three modules — the file merge (`xdiff/xmerge.c`), the tree merge
-(`merge-ort.c` without renames) and the in-progress state on disk — and five
-thin commands over them. **400 random three-way file merges come out
-byte-identical to git's**, conflict markers included, and every conflicted
-merge, pick, rebase and stash is checked by running it in two copies of a
-repository and comparing not only the refs, index and files but *every
-in-progress marker* and *each tool's own `status`* — because half of what
-these commands write is state for the next command to continue from. A merge
-gittle stopped is concluded by `git commit`; a cherry-pick git stopped is
-continued by `gittle cherry-pick --continue`.
+- **Options are a table.** Every command declares its options as data —
+  spelling, kind, help — and one parser in `cli.nim` reads them and writes
+  the usage text.
+- **The diff is `diff(1)`.** gittle asks the system `diff` for a minimal
+  edit script and adds the context, the headers and the counts itself. The
+  three-way merge that `merge`, `cherry-pick`, `rebase` and `stash` share
+  is still gittle's own, byte-identical to git's over 400 random merges,
+  conflict markers included.
+- **`gc` is the server's job.** The remote runs full git, so `gittle gc` is
+  a fetch with chosen haves: the server's `pack-objects` sends the
+  repository's own history back as one properly deltified pack, and
+  gittle deletes only what that pack now covers. It runs by hand, and on
+  its own at the end of a push once `gc.auto` loose objects have piled up.
 
-Phase 8 is the wire. `clone`, `fetch`, `pull`, `push`, `remote`, `ls-remote`,
-`index-pack` and `pack-objects`, over one transport: **a program with a pipe on
-each end**, speaking pkt-line. `ssh host "git-upload-pack '/srv/repo'"` and
-`git-upload-pack /srv/repo` are the same line with a prefix, which is what lets
-every protocol test run against a real `git-upload-pack` with no server, no
-account and no network. Protocol v2 where the server gets `GIT_PROTOCOL`, v0
-where it does not, and v0 for push always — `receive-pack` has no v2 form.
-
-Two claims are measured rather than asserted. The `.idx` that `index-pack`
-writes is **byte-identical to git's over all 420,113 objects** of the
-repository next door, a 318 MiB pack. And R2 — never search for a delta, only
-pass on one you were given — makes `pack-objects` 54 lines and still
-**reuses 28,284 deltas** when packing two thousand commits of that history.
-
-Phase 10 is the housekeeping: `check-ignore`, `rm`, `mv`, `clean`, `worktree`
-and `gc`, plus `stage`. No new engine — every one of them is a command over
-something an earlier phase built, which is what makes `check-ignore` 45 lines
-and `stage` zero. Two rules carry the phase. **`clean -x` means "there are no
-ignore files", not "delete ignored files too"** — read the other way,
-`clean -fdx -e '*.log'` deletes the logs it was told to keep. And **`gc` is
-additive** (plan.md R2a): loose objects are folded into a new pack and the
-packs that were already there are never rewritten, because rewriting one means
-re-deltifying it and gittle does not search for deltas — a 304 MiB clone would
-come back as 3.1 GiB. A real `git gc` in the same repository restores git's
-own layout; the only thing gittle must never do is undo it.
-
-`worktree` is the largest command in the project, and it is a second copy of
-the repository abstraction rather than an option surface: a linked worktree
-*is* a `Repository` with a different `gitDir`. One invariant runs through
-four commands — a branch is checked out in at most one worktree — so
-`worktree add`, `checkout`, `switch` and `branch` all ask the same question,
-and `branch -v` marks the answer with `+`.
-
-`grep` and `log --grep` use libc's POSIX regex rather than a vendored engine —
-which is what git itself does, and what turned a 500-line budget line into 45.
-
-13,872 lines of code, against an original sketch of ~8,700 for the whole of
-v1. That sketch was always a measurement rather than a limit, and across four
-phases it missed for four different reasons — none of them the option
-combinations it counts: shared output formatting, state machines,
-compatibility surface, and a second copy of the repository abstraction.
-[`docs/plan.md`](docs/plan.md) §5.1–§5.4 have the numbers and the reasoning.
-The optimisation and refactoring pass comes next.
-
-- [`docs/plan.md`](docs/plan.md) — goals, the eight design rules, scope,
-  budget, the ten decisions, build order. **Read this first.**
-- [`CLAUDE.md`](CLAUDE.md) — the short version: the rules that bind, the
-  environment, and what finishing a phase requires.
-- [`docs/phase-1.md`](docs/phase-1.md), [`docs/phase-2.md`](docs/phase-2.md),
-  [`docs/phase-3.md`](docs/phase-3.md), [`docs/phase-4.md`](docs/phase-4.md),
-  [`docs/phase-5.md`](docs/phase-5.md), [`docs/phase-6.md`](docs/phase-6.md),
-  [`docs/phase-7.md`](docs/phase-7.md), [`docs/phase-8.md`](docs/phase-8.md),
-  [`docs/phase-10.md`](docs/phase-10.md) —
-  the finished phases: what was built, what it was verified against, what was
-  left for later, and where the budget stands.
-- [`docs/README.md`](docs/README.md) — index to the feature inventory
-  (`01`–`15`), where every git command and option is marked in or out of scope.
+Three things are deliberately not git's: `diff` hunks may sit elsewhere than
+git's on a few percent of files (both are correct patches), `status` prints
+no `(use "git …")` hints, and `--date=relative` is gone. What a script reads
+— `--short`, `--porcelain`, `--name-only`, `--numstat`, `--format` — is
+byte-exact.
 
 ## Building
 
-Nim 2.x and the system zlib; no other dependency, and no package manager.
+Nim 2.x, the system zlib, and a `diff` on `PATH` at run time (busybox's is
+enough); no other dependency, and no package manager.
 
 ```sh
 nim c -d:release --out:build/gittle src/gittle.nim            # links libz

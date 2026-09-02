@@ -52,6 +52,8 @@ type
 const wildcardChars = {'*', '?', '[', '\\'}
 
 func firstWildcard(s: string): int =
+  ## Where the first glob character is, or the length: the literal prefix
+  ## is what a directory walk can prune on.
   result = s.len
   for i, c in s:
     if c in wildcardChars: return i
@@ -87,6 +89,8 @@ proc inPrefix*(path, prefix: string): string =
   applyPrefix(path, prefix, false)
 
 proc parseItem(spec, prefix: string): PathspecItem =
+  ## One pathspec into its parts: the magic (`:(top)`, `:/`, `:!`), the
+  ## prefix-relative path, and the literal prefix.
   result.raw = spec
   var top = false
   var i = 0
@@ -144,9 +148,11 @@ proc parsePathspec*(specs: openArray[string], prefix = "",
     return
   for s in specs: result.items.add parseItem(s, prefix)
 
+# No items: matches everything.
 func isEmpty*(ps: Pathspec): bool = ps.items.len == 0
 
 func globFlags(it: PathspecItem): set[GlobFlag] =
+  ## The glob flags this item's magic asks for.
   if it.globMagic: result.incl gfPathname
   if it.icase: result.incl gfIgnoreCase
 
@@ -176,6 +182,7 @@ func matchItem(it: PathspecItem, path: string): PathMatch =
   if globMatch(it.pattern, path, it.globFlags): pmFnmatch else: pmNone
 
 func matchesItem(it: PathspecItem, path: string): bool =
+  ## Does the item match the path at all (exactly or by prefix)?
   it.matchItem(path) != pmNone
 
 func matches*(ps: Pathspec, path: string): bool =
@@ -268,4 +275,5 @@ proc relativeTo*(path, prefix: string): string =
   relativePath(path, prefix.strip(leading = false, chars = {'/'}))
 
 proc displayPath*(ps: Pathspec, path: string): string =
+  ## The path as a command should print it: relative to where it was run.
   relativeTo(path, ps.prefix)

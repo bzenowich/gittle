@@ -96,9 +96,11 @@ type Reader = object
   pos: int
 
 proc need(r: var Reader, n: int) =
+  ## Refuse to read past the end -- a truncated index is corrupt, not short.
   failIf(r.pos + n > r.data.len, "index file is truncated")
 
 proc u32(r: var Reader): uint32 =
+  ## A big-endian 32-bit field.
   r.need(4)
   result = (uint32(byte(r.data[r.pos])) shl 24) or
            (uint32(byte(r.data[r.pos+1])) shl 16) or
@@ -107,6 +109,7 @@ proc u32(r: var Reader): uint32 =
   r.pos += 4
 
 proc u16(r: var Reader): uint16 =
+  ## A big-endian 16-bit field.
   r.need(2)
   result = (uint16(byte(r.data[r.pos])) shl 8) or uint16(byte(r.data[r.pos+1]))
   r.pos += 2
@@ -126,6 +129,8 @@ proc varintOffset(r: var Reader): int =
     result = ((result + 1) shl 7) or int(b and 0x7F)
 
 proc readEntry(r: var Reader, version: int, prev: string): IndexEntry =
+  ## One index entry, in the layout of `version` -- v4 takes its path as a
+  ## suffix on the previous one.
   let start = r.pos
   result.ctimeSec = r.u32()
   result.ctimeNsec = r.u32()
@@ -194,6 +199,8 @@ proc skipExtensions(r: var Reader, endAt: int) =
     r.pos += size
 
 proc parseIndex*(data, path: string): Index =
+  ## The whole file: header, entries, then the extensions, of which only
+  ## the ones gittle understands may be *required*.
   result = Index(path: path)
   if data.len == 0: return          # a missing or empty index is an empty one
   var r = Reader(data: data, pos: 0)
@@ -229,6 +236,8 @@ proc parseIndex*(data, path: string): Index =
     failIf(toOid(c.finish()) != trailer, "index checksum mismatch in " & path)
 
 proc readIndex*(path: string): Index =
+  ## Read the index file, or an empty v2 index when there is none, and
+  ## remember its mtime for the racy-git check.
   if not fileExists(path):
     return Index(path: path, version: 2)
   result = parseIndex(readWholeFile(path), path)
@@ -242,12 +251,14 @@ type Writer = object
   buf: string
 
 proc u32(w: var Writer, v: uint32) =
+  ## A big-endian 32-bit field.
   w.buf.add char((v shr 24) and 0xFF)
   w.buf.add char((v shr 16) and 0xFF)
   w.buf.add char((v shr 8) and 0xFF)
   w.buf.add char(v and 0xFF)
 
 proc u16(w: var Writer, v: uint16) =
+  ## A big-endian 16-bit field.
   w.buf.add char((v shr 8) and 0xFF)
   w.buf.add char(v and 0xFF)
 
@@ -407,6 +418,8 @@ proc modeForFile*(st: Stat): uint32 =
   else: modeRegular
 
 proc statPath*(path: string): tuple[ok: bool, st: Stat] =
+  ## `lstat`, as a pair rather than an exception: a missing path is an
+  ## ordinary answer here.
   result.ok = lstat(path.cstring, result.st) == 0
 
 proc fillStat*(e: var IndexEntry, st: Stat) =

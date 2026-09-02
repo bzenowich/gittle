@@ -14,11 +14,11 @@
 import std/[os, posix, strutils]
 import cli, config, util
 import cmd/hashobject, cmd/catfile
-import cmd/updateref, cmd/symbolicref, cmd/foreachref
+import cmd/updateref, cmd/foreachref
 import cmd/revparse, cmd/revlist, cmd/mergebase, cmd/mergefile
-import cmd/lstree, cmd/writetree, cmd/readtree, cmd/updateindex, cmd/lsfiles
+import cmd/lstree, cmd/writetree, cmd/lsfiles
 import cmd/config as cmdconfig
-import cmd/init, cmd/committree, cmd/add, cmd/log, cmd/commit, cmd/show
+import cmd/init, cmd/add, cmd/log, cmd/commit, cmd/show
 import cmd/branch, cmd/tag, cmd/checkout, cmd/reset, cmd/reflog
 import cmd/merge as cmdmerge
 import cmd/cherrypick, cmd/rebase
@@ -26,17 +26,80 @@ import cmd/stash as cmdstash
 import cmd/diff as cmddiff
 import cmd/status as cmdstatus
 import cmd/grep as cmdgrep
-import cmd/indexpack, cmd/clone, cmd/fetch, cmd/lsremote
-import cmd/packobjects, cmd/push as cmdpush, cmd/remote as cmdremote
+import cmd/clone, cmd/fetch
+import cmd/push as cmdpush, cmd/remote as cmdremote
 import cmd/pull as cmdpull
 import cmd/checkignore, cmd/rm as cmdrm, cmd/mv as cmdmv
 import cmd/clean as cmdclean
 import cmd/worktree as cmdworktree
 import cmd/gc as cmdgc
 
-const
-  version = "gittle version 0.1.0"
-  usageText = """usage: gittle [<options>] <command> [<args>]
+const version = "gittle version 0.1.0"
+
+# The `help` text, built from the command table.
+proc usageText(): string
+  ## Forward: the `help` row below prints it, and it is built from the rows.
+
+type Command = tuple[name: string, run: proc (c: Ctx, args: seq[string]): int,
+                     summary: string]
+
+const commands: array[46, Command] = [
+  ("add", cmdAdd, "stage content into the index"),
+  ("branch", cmdBranch, "list, create, rename and delete branches"),
+  ("cat-file", cmdCatFile, "inspect objects"),
+  ("check-ignore", cmdCheckIgnore, "say why a path is ignored"),
+  ("checkout", cmdCheckout, "switch branches, or restore files"),
+  ("cherry-pick", cmdCherryPick, "replay existing commits onto this branch"),
+  ("clean", cmdclean.cmdClean, "delete untracked files"),
+  ("clone", cmdClone, "copy a repository into a new directory"),
+  ("commit", cmdCommit, "record the staged content as a new commit"),
+  ("config", cmdconfig.cmdConfig, "read and write configuration"),
+  ("diff", cmddiff.cmdDiff, "show changes between trees, index and working tree"),
+  ("fetch", cmdFetch, "download objects and refs from a remote"),
+  ("for-each-ref", cmdForEachRef, "list refs through a format string"),
+  ("gc", cmdgc.cmdGc, "pack this repository's history, with the remote's help"),
+  ("grep", cmdgrep.cmdGrep, "search tracked content"),
+  ("hash-object", cmdHashObject, "compute, and optionally store, an object ID"),
+  ("init", cmdInit, "create a repository"),
+  ("log", cmdLog, "show commit history"),
+  ("ls-files", cmdLsFiles, "list index and working-tree files"),
+  ("ls-tree", cmdLsTree, "list a tree object's entries"),
+  ("merge", cmdmerge.cmdMerge, "join another history into this one"),
+  ("merge-base", cmdMergeBase, "find the common ancestor of two commits"),
+  ("merge-file", cmdMergeFile, "three-way merge of three files"),
+  ("mv", cmdmv.cmdMv, "move or rename a tracked path"),
+  ("pull", cmdpull.cmdPull, "fetch from a remote and integrate"),
+  ("push", cmdpush.cmdPush, "send refs and objects to a remote"),
+  ("rebase", cmdRebase, "replay commits onto a different base"),
+  ("reflog", cmdReflog, "show where a ref has been"),
+  ("remote", cmdremote.cmdRemote, "manage the set of named remotes"),
+  ("reset", cmdReset, "move HEAD, the index and the working tree"),
+  ("restore", cmdRestore, "restore working-tree and index files"),
+  ("rev-list", cmdRevList, "walk history and list the objects it reaches"),
+  ("rev-parse", cmdRevParse, "resolve revisions and report repository layout"),
+  ("rm", cmdrm.cmdRm, "remove files from the working tree and the index"),
+  ("revert", cmdRevert, "undo commits with new commits"),
+  ("show", cmdShow, "display objects"),
+  ("stash", cmdstash.cmdStash, "set aside uncommitted work"),
+  ("stage", cmdAdd, "stage content into the index (an alias of add)"),
+  ("status", cmdstatus.cmdStatus, "report working tree state"),
+  ("switch", cmdSwitch, "change branches"),
+  ("tag", cmdTag, "create, list and delete tags"),
+  ("update-ref", cmdUpdateRef, "create, update and delete refs"),
+  ("worktree", cmdworktree.cmdWorktree, "manage linked working trees"),
+  ("write-tree", cmdWriteTree, "write the index out as a tree"),
+  ("version", proc (c: Ctx, args: seq[string]): int = (echo version; 0),
+   "print the version"),
+  ("help", proc (c: Ctx, args: seq[string]): int = (echo usageText(); 0),
+   "print this message"),
+]
+  ## Every verb, its entry point and one line for `help`.  The table is the
+  ## dispatch and the usage text both, so a command cannot be listed without
+  ## being runnable or the other way round.
+
+proc usageText(): string =
+  ## The `help` text, built from the command table.
+  result = """usage: gittle [<options>] <command> [<args>]
 
 Options before the command:
    -C <path>             run as if started in <path>
@@ -48,116 +111,15 @@ Options before the command:
    -v, --version         print the version
    -h, --help            print this message
 
-Commands:
-   add                   stage content into the index
-   branch                list, create, rename and delete branches
-   cat-file              inspect objects
-   check-ignore          say why a path is ignored
-   checkout              switch branches, or restore files
-   cherry-pick           replay existing commits onto this branch
-   clean                 delete untracked files
-   clone                 copy a repository into a new directory
-   commit                record the staged content as a new commit
-   commit-tree           create a commit object
-   config                read and write configuration
-   diff                  show changes between trees, index and working tree
-   fetch                 download objects and refs from a remote
-   for-each-ref          list refs through a format string
-   gc                    pack loose objects and refs, and prune
-   grep                  search tracked content
-   hash-object           compute, and optionally store, an object ID
-   index-pack            build a .idx for a packfile
-   init                  create a repository
-   log                   show commit history
-   ls-files              list index and working-tree files
-   ls-remote             list the refs a remote advertises
-   ls-tree               list a tree object's entries
-   merge                 join another history into this one
-   merge-base            find the common ancestor of two commits
-   merge-file            three-way merge of three files
-   mv                    move or rename a tracked path
-   pack-objects          create a packfile
-   pull                  fetch from a remote and integrate
-   push                  send refs and objects to a remote
-   rebase                replay commits onto a different base
-   read-tree             load a tree into the index
-   reflog                show where a ref has been
-   remote                manage the set of named remotes
-   reset                 move HEAD, the index and the working tree
-   restore               restore working-tree and index files
-   rev-list              walk history and list the objects it reaches
-   rev-parse             resolve revisions and report repository layout
-   rm                    remove files from the working tree and the index
-   revert                undo commits with new commits
-   show                  display objects
-   stash                 set aside uncommitted work
-   stage                 stage content into the index (an alias of add)
-   status                report working tree state
-   switch                change branches
-   symbolic-ref          read and write symbolic refs
-   tag                   create, list and delete tags
-   update-index          modify the index
-   update-ref            create, update and delete refs
-   worktree              manage linked working trees
-   write-tree            write the index out as a tree
-   version               print the version"""
+Commands:"""
+  for cmd in commands:
+    result.add "\n   " & cmd.name.alignLeft(22) & cmd.summary
 
 proc runVerb(c: Ctx, verb: string, args: seq[string]): int =
-  case verb
-  of "hash-object": cmdHashObject(c, args)
-  of "cat-file": cmdCatFile(c, args)
-  of "check-ignore": cmdCheckIgnore(c, args)
-  of "init": cmdInit(c, args)
-  of "add", "stage": cmdAdd(c, args)
-  of "branch": cmdBranch(c, args)
-  of "checkout": cmdCheckout(c, args)
-  of "switch": cmdSwitch(c, args)
-  of "restore": cmdRestore(c, args)
-  of "reset": cmdReset(c, args)
-  of "reflog": cmdReflog(c, args)
-  of "tag": cmdTag(c, args)
-  of "log": cmdLog(c, args)
-  of "commit": cmdCommit(c, args)
-  of "cherry-pick": cmdCherryPick(c, args)
-  of "revert": cmdRevert(c, args)
-  of "rebase": cmdRebase(c, args)
-  of "show": cmdShow(c, args)
-  of "diff": cmddiff.cmdDiff(c, args)
-  of "stash": cmdstash.cmdStash(c, args)
-  of "status": cmdstatus.cmdStatus(c, args)
-  of "gc": cmdgc.cmdGc(c, args)
-  of "grep": cmdgrep.cmdGrep(c, args)
-  of "commit-tree": cmdCommitTree(c, args)
-  of "index-pack": cmdIndexPack(c, args)
-  of "clean": cmdclean.cmdClean(c, args)
-  of "clone": cmdClone(c, args)
-  of "fetch": cmdFetch(c, args)
-  of "ls-remote": cmdLsRemote(c, args)
-  of "mv": cmdmv.cmdMv(c, args)
-  of "pack-objects": cmdPackObjects(c, args)
-  of "push": cmdpush.cmdPush(c, args)
-  of "pull": cmdpull.cmdPull(c, args)
-  of "remote": cmdremote.cmdRemote(c, args)
-  of "merge": cmdmerge.cmdMerge(c, args)
-  of "merge-base": cmdMergeBase(c, args)
-  of "merge-file": cmdMergeFile(c, args)
-  of "rev-list": cmdRevList(c, args)
-  of "rev-parse": cmdRevParse(c, args)
-  of "rm": cmdrm.cmdRm(c, args)
-  of "update-ref": cmdUpdateRef(c, args)
-  of "symbolic-ref": cmdSymbolicRef(c, args)
-  of "for-each-ref": cmdForEachRef(c, args)
-  of "ls-tree": cmdLsTree(c, args)
-  of "worktree": cmdworktree.cmdWorktree(c, args)
-  of "write-tree": cmdWriteTree(c, args)
-  of "read-tree": cmdReadTree(c, args)
-  of "update-index": cmdUpdateIndex(c, args)
-  of "ls-files": cmdLsFiles(c, args)
-  of "config": cmdconfig.cmdConfig(c, args)
-  of "version": (echo version; 0)
-  of "help": (echo usageText; 0)
-  else:
-    fail("'" & verb & "' is not a gittle command. See 'gittle help'.")
+  ## Dispatch a verb through the table.
+  for cmd in commands:
+    if cmd.name == verb: return cmd.run(c, args)
+  fail("'" & verb & "' is not a gittle command. See 'gittle help'.")
 
 proc parseDriver(c: Ctx, argv: seq[string]): tuple[verb: string, rest: seq[string]] =
   ## Consume the options the `git` wrapper itself takes, stopping at the first
@@ -172,7 +134,7 @@ proc parseDriver(c: Ctx, argv: seq[string]): tuple[verb: string, rest: seq[strin
       echo version
       exitWith(0)
     of "-h", "--help":
-      echo usageText
+      echo usageText()
       exitWith(0)
     of "-C":
       inc i
@@ -199,11 +161,12 @@ proc parseDriver(c: Ctx, argv: seq[string]): tuple[verb: string, rest: seq[strin
       elif a.startsWith("-C"):
         c.startDir = absolutePath(a[2 .. ^1], c.startDir).normalizedPath
       else:
-        fail("unknown option: " & a & "\n" & usageText)
+        fail("unknown option: " & a & "\n" & usageText())
     inc i
   ("", @[])
 
 proc main(): int =
+  ## argv[0] dispatch, then the driver options, then the verb.
   var c = Ctx(startDir: getCurrentDir())
   let argv = commandLineParams()
 
@@ -216,7 +179,7 @@ proc main(): int =
 
   let (verb, rest) = parseDriver(c, argv)
   if verb.len == 0:
-    echo usageText
+    echo usageText()
     return 1
   runVerb(c, verb, rest)
 

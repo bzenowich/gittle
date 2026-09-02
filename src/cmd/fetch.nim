@@ -20,47 +20,34 @@
 import std/[sequtils, strutils]
 import ../cli, ../refspec, ../remotes, ../util
 
-const usageText = """usage: gittle fetch [<options>] [<repository> [<refspec>…]]
+const
+  synopsis = "[<options>] [<repository> [<refspec>…]]"
+  fetchOptions* = [
+    opt("-t|--tags", help = "fetch all tags"),
+    opt("--no-tags", help = "do not follow tags at all"),
+    opt("-f|--force", help = "allow a non-fast-forward update of a local ref"),
+    opt("-p|--prune", help = "delete remote-tracking refs the remote no longer has"),
+    opt("--upload-pack", okValue, arg = "<exec>", help = "the command to run on the far end"),
+    opt("-q|--quiet", help = "report nothing but errors"),
+    opt("-v|--verbose", help = "also report refs that were already up to date"),
+    opt("--all|--multiple|--atomic|--dry-run|--porcelain|--refetch|--unshallow|" &
+        "--set-upstream|--append|-a", okRefused, help = "docs/05"),
+    opt("--depth|--deepen|--shallow-since|--shallow-exclude|--filter", okValue,
+        key = "shallow"),
+  ]
 
-   -t, --tags            fetch all tags
-   --no-tags             do not follow tags at all
-   -f, --force           allow a non-fast-forward update of a local ref
-   -p, --prune           delete remote-tracking refs the remote no longer has
-   --upload-pack <exec>  the command to run on the far end
-   -q, --quiet           report nothing but errors
-   -v, --verbose         also report refs that were already up to date"""
-
-proc parseFetchArgs*(args: seq[string], opt: var FetchOpts): seq[string] =
-  ## Shared with `pull`, which takes the same options and passes them through.
-  var i = 0
-  while i < args.len:
-    let a = args[i]
-    case a
-    of "-t", "--tags": opt.tags = true
-    of "--no-tags": opt.noTags = true
-    of "-f", "--force": opt.force = true
-    of "-p", "--prune": opt.prune = true
-    of "-q", "--quiet": opt.quiet = true
-    of "-v", "--verbose": opt.verbose = true
-    of "--upload-pack":
-      inc i
-      failIf(i >= args.len, "option '--upload-pack' requires a value")
-      opt.uploadPack = args[i]
-    of "-h", "--help": (echo usageText; return @["--help"])
-    of "--all", "--multiple", "--atomic", "--dry-run", "--porcelain",
-       "--refetch", "--unshallow", "--set-upstream", "--append", "-a":
-      fail(a & " is out of scope for gittle v1 (docs/05)")
-    else:
-      if a.startsWith("--upload-pack="):
-        opt.uploadPack = a["--upload-pack=".len .. ^1]
-      elif a.startsWith("--depth") or a.startsWith("--shallow") or
-           a.startsWith("--filter"):
-        fail(a.split('=')[0] & " is out of scope for gittle v1: gittle has no " &
-             "shallow or partial clone (plan.md §1)")
-      elif a.startsWith("-") and a.len > 1 and a != "--":
-        fail("unknown option '" & a & "'\n" & usageText)
-      else: result.add a
-    inc i
+proc applyFetchOpts*(o: Opts, opt: var FetchOpts) =
+  ## The fetch half of a parse; `pull` parses `fetchOptions` alongside its
+  ## own and hands the result here.
+  failIf(o.has "shallow",
+         "shallow and partial clones are out of scope for gittle (plan.md §1)")
+  opt.tags = o.has "tags"
+  opt.noTags = o.has "no-tags"
+  opt.force = o.has "force"
+  opt.prune = o.has "prune"
+  opt.quiet = o.has "quiet"
+  opt.verbose = o.has "verbose"
+  opt.uploadPack = o.val "upload-pack"
 
 proc runFetch*(c: Ctx, positional: seq[string], opt: var FetchOpts):
     tuple[remote: Remote, failed: bool] =
@@ -84,10 +71,11 @@ proc runFetch*(c: Ctx, positional: seq[string], opt: var FetchOpts):
   result.failed = repo.fetchFrom(result.remote, opt).failed
 
 proc cmdFetch*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse into `FetchOpts`, then `runFetch`.
   # git's reflog action is the command line as typed -- `fetch --tags origin`,
   # not `fetch` -- which is why every entry says exactly what produced it
   # (`builtin/fetch.c`, `default_rla`).
   var opt = FetchOpts(reflogAction: ("fetch " & args.join(" ")).strip())
-  let positional = parseFetchArgs(args, opt)
-  if positional == @["--help"]: return 0
-  if runFetch(c, positional, opt).failed: 1 else: 0
+  let o = parse(fetchOptions, args, "fetch", synopsis)
+  applyFetchOpts(o, opt)
+  if runFetch(c, o.args, opt).failed: 1 else: 0

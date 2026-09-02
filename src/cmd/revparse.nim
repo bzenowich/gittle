@@ -5,9 +5,16 @@
 ## * **an object-name calculator.** Every argument that resolves is printed as
 ##   a 40-digit ID, excluded ones prefixed `^`; `--verify` demands exactly one;
 ##   `--symbolic-full-name` and `--abbrev-ref` print the *ref* instead.
-## * **a repository-layout oracle.** `--git-dir`, `--show-toplevel`,
-##   `--show-prefix` and the three `--is-…` predicates, which is how every
-##   shell script written against git finds its bearings.
+## * **a repository-layout oracle.** `--git-dir`, `--show-toplevel` and the
+##   three `--is-…` predicates, which is how every shell script written
+##   against git finds its bearings.
+##
+## In scope: `--verify`, `-q`, `--short[=<n>]`, `--symbolic-full-name`,
+## `--abbrev-ref[=strict|loose]`, `--git-dir`, `--show-toplevel`, the three
+## `--is-…` predicates, revisions and `--`.  docs/minimize.md §3 trims
+## `--show-cdup`, `--show-prefix`, `--git-path` and `--sq`, none of which
+## appeared in the logs it surveyed; they are refused by name, because the
+## echo-back rule below would otherwise print them as if they were answers.
 ##
 ## ## Everything it does not understand, it echoes
 ##
@@ -30,17 +37,20 @@ const usageText = """usage: gittle rev-parse [<options>] <args>…
    --abbrev-ref[=strict|loose]  print the shortest unambiguous ref name
    --git-dir                 the repository directory
    --show-toplevel           the working tree root
-   --show-cdup               the relative path up to it
-   --show-prefix             the current directory below it
    --is-inside-git-dir, --is-inside-work-tree, --is-bare-repository"""
 
 proc cmdRevParse*(c: Ctx, args: seq[string]): int =
+  ## Entry point: a streaming interpreter over the arguments, printing
+  ## each as it goes, since `--short` and friends change how the rest
+  ## render.
   var verify, quiet, symbolic, abbrevRef, strictRef, asIs = false
   var shortLen = 0
   # Pre-scanned, not noticed as it goes by: a `--` anywhere makes an earlier
   # unresolvable argument a hard error rather than a filename, because the
   # user has already said where the paths begin.
   let sawDashDash = "--" in args
+  let cwd = getCurrentDir()
+  let insideGitDir = cwd == c.repo.gitDir or cwd.startsWith(c.repo.gitDir & "/")
   var verified: seq[RevPoint]
 
   proc emit(p: RevPoint) =
@@ -75,7 +85,7 @@ proc cmdRevParse*(c: Ctx, args: seq[string]): int =
       return 0
 
     # The layout queries: each answers and moves on, so `rev-parse --git-dir
-    # --show-prefix` prints two lines in that order.
+    # --show-toplevel` prints two lines in that order.
     var layout = true
     case arg
     of "--git-dir":
@@ -83,31 +93,23 @@ proc cmdRevParse*(c: Ctx, args: seq[string]): int =
       # in -- `.git` at the top, `.` when standing inside it -- and absolute
       # otherwise, which is what a script that will `cd` elsewhere needs.
       let gd = c.repo.gitDir
-      let cwd = getCurrentDir()
       echo (if gd == cwd: "."
             elif gd.startsWith(cwd & "/"): gd[cwd.len + 1 .. ^1]
             else: gd)
     of "--show-toplevel":
       failIf(c.repo.workTree.len == 0, "this operation must be run in a work tree")
       echo c.repo.workTree
-    of "--show-cdup":
-      echo repeat("../", c.repo.prefix.count('/'))
-    of "--show-prefix":
-      echo c.repo.prefix
-    of "--is-inside-git-dir":
-      let cwd = getCurrentDir()
-      echo cwd == c.repo.gitDir or cwd.startsWith(c.repo.gitDir & "/")
-    of "--is-inside-work-tree":
-      echo c.repo.workTree.len > 0 and not (getCurrentDir() == c.repo.gitDir or
-            getCurrentDir().startsWith(c.repo.gitDir & "/"))
-    of "--is-bare-repository":
-      echo c.repo.bare
+    of "--is-inside-git-dir": echo insideGitDir
+    of "--is-inside-work-tree": echo c.repo.workTree.len > 0 and not insideGitDir
+    of "--is-bare-repository": echo c.repo.bare
     of "--verify": verify = true
     of "-q", "--quiet": quiet = true
     of "--symbolic-full-name": symbolic = true
     of "--symbolic":
       fail("--symbolic is out of scope for gittle v1 (docs/09); " &
            "use --symbolic-full-name")
+    of "--show-cdup", "--show-prefix", "--git-path", "--sq":
+      fail(arg & " is out of scope for gittle (docs/minimize.md §3)")
     else:
       layout = false
 

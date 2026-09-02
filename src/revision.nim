@@ -40,6 +40,7 @@
 ## writes here, so that one is in.
 
 import std/[algorithm, os, sequtils, strutils, times]
+import cli
 import index, objects, oid, pathspec, refs, repository, revwalk, util
 
 # ---------------------------------------------------------------------------
@@ -264,10 +265,7 @@ proc peelOnion(repo: Repository, spec: string): tuple[ok: bool, oid: Oid] =
     fail("^{/<text>} is out of scope for gittle v1 (docs/09): no commit search")
   if inner.len == 0:
     # Dereference tags, and only tags.
-    var o = base.oid
-    while repo.objectInfo(o).kind == otTag:
-      o = parseOid(headerField(repo.readObject(o).data, "object"))
-    return (true, o)
+    return (true, repo.peelTags(base.oid))
   if inner == "object": return base
   for (suffix, want) in onionTypes:
     if inner & "}" == suffix: return (true, repo.peelTo(base.oid, want).oid)
@@ -442,65 +440,28 @@ proc addPseudo*(repo: Repository, which: RevPseudo, pattern: string,
     let h = repo.refs.resolveRef(headRef)
     if h.found: dest.add RevPoint(oid: h.oid, uninteresting: notMode)
 
-proc diagnoseIndexPath(repo: Repository, stage: int, path: string) =
-  ## Why `:1:file` or `:file` named nothing (`object-name.c:
-  ## diagnose_invalid_index_path`).  Three near misses are worth naming,
-  ## because each is a different mistake and the generic message would send
-  ## the user looking for the wrong one: the right path at the wrong stage,
-  ## the right path spelled relative to the wrong directory, and a file that
-  ## is on disk but was never added.
-  let idx = readIndex(repo.indexPath)
-  for st in 0 .. 3:
-    let k = idx.find(path, st)
-    if k >= 0:
-      fail("path '" & path & "' is in the index, but not at stage " & $stage &
-           "\nhint: Did you mean ':" & $st & ":" & path & "'?")
-  let full = repo.prefix & path
-  for st in 0 .. 3:
-    let k = idx.find(full, st)
-    if k >= 0:
-      fail("path '" & full & "' is in the index, but not '" & path &
-           "'\nhint: Did you mean ':" & $st & ":" & full & "' aka ':" & $st &
-           ":./" & path & "'?")
-  if fileExists(repo.workTreePath(path)) or fileExists(repo.workTreePath(full)):
-    fail("path '" & path & "' exists on disk, but not in the index")
-  fail("path '" & path & "' does not exist (neither on disk nor in the index)")
-
-proc diagnoseTreePath(repo: Repository, tree, path, name: string) =
-  ## The same, for `<tree-ish>:<path>` (`diagnose_invalid_oid_path`).
-  if fileExists(repo.workTreePath(path)):
-    fail("path '" & path & "' exists on disk, but not in '" & name & "'")
-  let full = repo.prefix & path
-  if full != path and repo.lookupInTree(repo.resolveTree(tree), full).ok:
-    fail("path '" & full & "' exists, but not '" & path & "'\nhint: Did you " &
-         "mean '" & name & ":" & full & "' aka '" & name & ":./" & path & "'?")
-  fail("path '" & path & "' does not exist in '" & name & "'")
-
 proc failAmbiguous*(repo: Repository, arg: string) =
-  ## The diagnosis every command that mixes revisions and paths shares
-  ## (`setup.c:die_verify_filename`).  An argument that names neither is an
-  ## error rather than an empty result, because the alternative is a command
-  ## that silently reports on nothing.
-  ##
-  ## An argument with a `:` in it was *meant* as an object name, so it gets
-  ## the specific diagnosis above rather than being called a bad path.
+  ## An argument that is neither a revision nor a path that exists: refuse
+  ## it, as git does, rather than guess.  git goes on to diagnose *which*
+  ## near-miss it was (`object-name.c:diagnose_invalid_index_path` and its
+  ## sibling, 46 lines of hints); the minimization pass kept the one
+  ## sentence that says what to do (docs/minimize.md §3, tier 3).
   if fileExists(repo.workTreePath(repo.prefix & arg)) or
      dirExists(repo.workTreePath(repo.prefix & arg)): return
+  # The two messages that say *what* was missing, without git's guesses at
+  # what was meant: `:<path>` names the index, `<rev>:<path>` names a tree.
   if arg.len > 1 and arg[0] == ':' and arg[1] != '/':
-    var stage = 0
-    var path = arg[1 .. ^1]
-    if arg.len > 2 and arg[1] in {'0' .. '3'} and arg[2] == ':':
-      stage = ord(arg[1]) - ord('0')
-      path = arg[3 .. ^1]
-    if not (path.startsWith("./") or path.startsWith("../")):
-      repo.diagnoseIndexPath(stage, path)
-  else:
-    let colon = arg.splitColon()
-    if colon > 0 and repo.looksLikeRev(arg[0 ..< colon]):
-      var path = arg[colon + 1 .. ^1]
-      if path.startsWith("./") or path.startsWith("../"):
-        path = normalizedPath(repo.prefix & path)
-      repo.diagnoseTreePath(arg[0 ..< colon], path, arg[0 ..< colon])
+    let staged = arg.len > 2 and arg[1] in {'0' .. '3'} and arg[2] == ':'
+    let path = if staged: arg[3 .. ^1] else: arg[1 .. ^1]
+    let idx = readIndex(repo.indexPath)
+    for st in 0 .. 3:
+      failIf(idx.find(path, st) >= 0, "path '" & path &
+             "' is in the index, but not at stage " & (if staged: $arg[1] else: "0"))
+    fail("path '" & path & "' does not exist (neither on disk nor in the index)")
+  let colon = arg.splitColon()
+  if colon > 0 and repo.looksLikeRev(arg[0 ..< colon]):
+    fail("path '" & arg[colon + 1 .. ^1] & "' does not exist in '" &
+         arg[0 ..< colon] & "'")
   fail("ambiguous argument '" & arg & "': unknown revision or path not in " &
        "the working tree.\nUse '--' to separate paths from revisions, like " &
        "this:\n'gittle <command> [<revision>...] -- [<file>...]'")
@@ -641,55 +602,77 @@ const pseudoOpt: array[RevPseudo, string] =
   ## The four spellings that stand for a namespace, as a table: they differ
   ## only in their prefix, which `pseudoPrefix` already holds.
 
-proc parseWalkOpt*(w: RevWalk, ri: var RevInput, a: string,
-                   valueFor: proc (a, dflt: string): string): bool =
-  ## One option from docs/04's commit-limiting, pseudo-ref and ordering
-  ## groups.  Returns false for anything it does not recognise, so the calling
-  ## command can go on to its own options.
+const walkOptions* = [
+  ## docs/04: the `rev-list` options `log` and `rev-list` share.  Revisions
+  ## interleave with these on the command line and the interleaving means
+  ## something (`--not`), so the command replays `occurrences` in order and
+  ## hands each option to `applyWalkOpt`.
+  opt("--first-parent", help = "follow only the first parent of a merge"),
+  opt("--not", help = "negate every revision after it"),
+  opt("--merges", help = "merge commits only"),
+  opt("--no-merges", help = "no merge commits"),
+  opt("--topo-order", help = "children before parents, branches kept together"),
+  opt("--date-order", help = "children before parents, by date"),
+  opt("--reverse", help = "oldest first"),
+  opt("--left-right", help = "mark which side of a symmetric difference each commit is on"),
+  opt("--count", help = "print how many commits, not which"),
+  opt("--objects", help = "list the trees and blobs reached, too"),
+  opt("--stdin", help = "read revisions from standard input as well"),
+  opt("--all", help = "every ref"),
+  opt("--branches", okOptValue, arg = "[=<glob>]", help = "every branch"),
+  opt("--tags", okOptValue, arg = "[=<glob>]", help = "every tag"),
+  opt("--remotes", okOptValue, arg = "[=<glob>]", help = "every remote-tracking branch"),
+  opt("-n|--max-count", okValue, key = "n", arg = "<n>", help = "stop after <n> commits; -<n> says the same"),
+  opt("--skip", okValue, arg = "<n>", help = "leave out the first <n>"),
+  opt("--since|--after", okValue, key = "since", arg = "<date>", help = "commits after the date"),
+  opt("--until|--before", okValue, key = "until", arg = "<date>", help = "commits before the date"),
+  opt("--no-walk", okOptValue, arg = "[=unsorted]", help = "the named commits only, no ancestry"),
+  opt("--do-walk"),
+  opt("--parents", help = "print each commit's parents too"),
+]
+
+proc applyWalkOpt*(w: RevWalk, ri: var RevInput, k, v: string): bool =
+  ## One occurrence from a parse against `walkOptions`, by key; false when
+  ## the key is not a walk option and the command should take it.
   let repo = w.repo
   result = true
-  case a
-  of "--first-parent": w.firstParent = true
-  of "--not": ri.notMode = true
-  of "--merges": w.minParents = 2
-  of "--no-merges": w.maxParents = 1
-  of "--topo-order": w.order = roTopo
-  of "--date-order": w.order = roDate
-  of "--reverse": ri.reverse = true
-  of "--left-right": ri.leftRight = true
-  of "--count":
-    # Accepted by `log` too, and ignored there -- `revision.c` parses it for
-    # every command and only `rev-list` acts on it, so `log --count` prints
-    # the log.  Not a nicety, but it is the wire.
-    ri.count = true
-  of "--objects": ri.objects = true
-  of "--stdin":
+  case k
+  of "first-parent": w.firstParent = true
+  of "not": ri.notMode = true
+  of "merges": w.minParents = 2
+  of "no-merges": w.maxParents = 1
+  of "topo-order": w.order = roTopo
+  of "date-order": w.order = roDate
+  of "reverse": ri.reverse = true
+  of "left-right": ri.leftRight = true
+  of "count": ri.count = true
+  of "objects": ri.objects = true
+  of "stdin":
+    # One revision, or one long option, per line.
     for line in stdin.readAll().splitLines():
-      if line.len > 0: discard w.parseWalkOpt(ri, line, valueFor) or
-                               repo.addRevArg(line, ri.notMode, ri.points)
-  else:
-    let name = if a.contains('='): a[0 ..< a.find('=')] else: a
-    let pattern = if a.contains('='): a[a.find('=') + 1 .. ^1] else: ""
-    var pseudo = false
-    for k, opt in pseudoOpt:
-      if opt == name:
-        repo.addPseudo(k, pattern, ri.notMode, ri.points)
-        pseudo = true
-    if pseudo: return
-    if name == "--max-count" or a == "-n": ri.maxCount = parseInt(valueFor(a, ""))
-    elif name == "--skip": ri.skip = parseInt(valueFor(a, ""))
-    elif name in ["--since", "--after"]: w.maxAge = parseTimestamp(valueFor(a, ""))
-    elif name in ["--until", "--before"]: w.minAge = parseTimestamp(valueFor(a, ""))
-    elif a == "--no-walk" or name == "--no-walk":
-      w.noWalk = true
-      w.noWalkSorted = pattern != "unsorted"
-    elif a == "--do-walk": w.noWalk = false
-    elif a == "--parents":
-      # `--parents` also *prints* them, which is the caller's business, so it
-      # is noted here and handed on rather than consumed.
-      w.rewriteParents = true
-      result = false
-    else: result = false
+      if line.len == 0: continue
+      if line.startsWith("--"):
+        let eq = line.find('=')
+        let key = if eq > 0: line[2 ..< eq] else: line[2 .. ^1]
+        if w.applyWalkOpt(ri, key, (if eq > 0: line[eq + 1 .. ^1] else: "")):
+          continue
+      discard repo.addRevArg(line, ri.notMode, ri.points)
+  of "all", "branches", "tags", "remotes":
+    for kind, name in pseudoOpt:
+      if name == "--" & k: repo.addPseudo(kind, v, ri.notMode, ri.points)
+  of "n": ri.maxCount = parseInt(v)
+  of "skip": ri.skip = parseInt(v)
+  of "since": w.maxAge = parseTimestamp(v)
+  of "until": w.minAge = parseTimestamp(v)
+  of "no-walk":
+    w.noWalk = true
+    w.noWalkSorted = v != "unsorted"
+  of "do-walk": w.noWalk = false
+  of "parents":
+    # Both sides want it: the walk rewrites parents, the command prints them.
+    w.rewriteParents = true
+    result = false
+  else: result = false
 
 proc addRevisionArg*(w: RevWalk, ri: var RevInput, arg: string) =
   ## One non-option argument.  A revision until proven otherwise: the first

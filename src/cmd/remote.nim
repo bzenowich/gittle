@@ -13,24 +13,17 @@ import std/[os, strutils]
 import ../cli, ../config, ../refname, ../refs, ../refspec, ../remotes,
        ../repository, ../util
 
-const usageText = """usage: gittle remote [-v]
-   or: gittle remote add <name> <url>
-   or: gittle remote remove <name>
-   or: gittle remote get-url <name>
-   or: gittle remote set-url <name> <newurl>
 
-   -v, --verbose   show the URL beside each name"""
+const
+  synopsis = "[-v]\nadd <name> <url>\nremove <name>\nget-url <name>\nset-url <name> <newurl>"
+  options = [opt("-v|--verbose", help = "show the URL beside each name")]
 
 proc cmdRemote*(c: Ctx, args: seq[string]): int =
-  var verbose = false
-  var rest: seq[string]
-  for a in args:
-    case a
-    of "-v", "--verbose": verbose = true
-    of "-h", "--help": (echo usageText; return 0)
-    else:
-      if a.startsWith("-"): fail("unknown option '" & a & "'\n" & usageText)
-      rest.add a
+  ## Entry point: parse, then the sub-verb -- a listing, or one edit of
+  ## `remote.<name>.*` in the config.
+  let o = parse(options, args, "remote", synopsis)
+  let verbose = o.has "verbose"
+  let rest = o.args
 
   let repo = c.repo
   let cfgPath = repo.commonDir / "config"
@@ -49,7 +42,7 @@ proc cmdRemote*(c: Ctx, args: seq[string]): int =
       else:
         echo n
   of "add":
-    failIf(rest.len != 3, usageText)
+    failIf(rest.len != 3, o.use)
     let name = rest[1]
     failIf(not isValidRefname(refsPrefix & "remotes/" & name & "/x"),
            "'" & name & "' is not a valid remote name")
@@ -60,7 +53,7 @@ proc cmdRemote*(c: Ctx, args: seq[string]): int =
     setConfigValue(cfgPath, "remote." & name & ".fetch",
                    defaultFetchRefspec(name))
   of "remove", "rm":
-    failIf(rest.len != 2, usageText)
+    failIf(rest.len != 2, o.use)
     let name = rest[1]
     if not repo.cfg.has("remote." & name & ".url"):
       stderr.write "error: No such remote: '" & name & "'\n"
@@ -79,14 +72,14 @@ proc cmdRemote*(c: Ctx, args: seq[string]): int =
       discard unsetConfigValue(cfgPath, "branch." & b & ".remote", all = true)
       discard unsetConfigValue(cfgPath, "branch." & b & ".merge", all = true)
   of "get-url":
-    failIf(rest.len != 2, usageText)
+    failIf(rest.len != 2, o.use)
     let url = repo.cfg.get("remote." & rest[1] & ".url")
     if url.len == 0:
       stderr.write "error: No such remote '" & rest[1] & "'\n"
       return 2
     echo url
   of "set-url":
-    failIf(rest.len != 3, usageText)
+    failIf(rest.len != 3, o.use)
     if not repo.cfg.has("remote." & rest[1] & ".url"):
       stderr.write "error: No such remote '" & rest[1] & "'\n"
       return 2
@@ -94,5 +87,5 @@ proc cmdRemote*(c: Ctx, args: seq[string]): int =
   of "rename", "set-head", "set-branches", "show", "prune", "update":
     fail("gittle remote " & verb & " is out of scope for v1 (docs/11)")
   else:
-    fail("unknown subcommand: " & verb & "\n" & usageText)
+    fail("unknown subcommand: " & verb & "\n" & o.use)
   0

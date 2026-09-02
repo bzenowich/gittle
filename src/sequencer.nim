@@ -50,6 +50,7 @@ const
   sequencerDir* = "sequencer"
 
 proc statePath*(repo: Repository, name: string): string =
+  ## A state file's path under `.git`.
   repo.gitDir / name
 
 proc readState*(repo: Repository, name: string): string =
@@ -60,10 +61,12 @@ proc readState*(repo: Repository, name: string): string =
   if fileExists(p): readFile(p) else: ""
 
 proc writeState*(repo: Repository, name, data: string) =
+  ## Write a state file, creating its directory.
   createDir(parentDir(repo.statePath(name)))
   writeFile(repo.statePath(name), data)
 
 proc removeState*(repo: Repository, names: varargs[string]) =
+  ## Remove state files or directories; missing ones are fine.
   for n in names:
     let p = repo.statePath(n)
     if dirExists(p): removeDir(p)
@@ -93,6 +96,7 @@ proc currentOp*(repo: Repository): Operation =
   else: opNone
 
 func opName*(op: Operation): string =
+  ## The command an in-progress operation belongs to, for messages.
   case op
   of opNone: ""
   of opMerge: "merge"

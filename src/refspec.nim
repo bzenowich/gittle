@@ -62,6 +62,7 @@ proc parseRefspec*(text: string, forPush: bool): Refspec =
          "invalid refspec '" & text & "': no source")
 
 func splitStar(pat: string): tuple[pre, post: string] =
+  ## The parts before and after the one `*` of a pattern.
   let star = pat.find('*')
   (pat[0 ..< star], pat[star + 1 .. ^1])
 
@@ -85,4 +86,5 @@ proc mapRef*(rs: Refspec, name: string): tuple[matched: bool, dst: string] =
   (true, dpre & middle & dpost)
 
 proc defaultFetchRefspec*(remote: string): string =
+  ## What `clone` configures: every branch into `refs/remotes/<name>/`.
   "+refs/heads/*:refs/remotes/" & remote & "/*"

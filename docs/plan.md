@@ -3,11 +3,12 @@
 A minimal git in Nim: small enough to read in an afternoon, compatible enough to
 share a repository with real git, and plausible in a busybox-class environment.
 
-Status: **v1 feature-complete (2026-09-02).** All nine phases of §7 are built
-(nine is empty, cut with the server); all 53 commands of §4 work and are
-compared against real git by `tests/oracle.sh`. 13,872 lines of code — §5.4.
-What remains is the optimisation and refactoring pass §5 defers to this point,
-and the v2 backlog in §8.
+Status: **v1 feature-complete and minimised (2026-09-02).** All nine phases
+of §7 are built (nine is empty, cut with the server), then the optimisation
+and refactoring pass §5 defers to this point ran: 44 commands, **11,724
+lines of code** (§5.5), every function documented, all compared against real
+git by `tests/oracle.sh`. [`minimize.md`](minimize.md) is that pass's record.
+What remains is the v2 backlog in §8.
 
 This document records the goals, the design rules that follow from them, and
 the scope. The per-command selections live in `01`–`15`; this file explains
@@ -28,7 +29,9 @@ the scope. The per-command selections live in `01`–`15`; this file explains
    order, without either noticing.
 4. **ssh-only remotes**, speaking enough of the git wire protocol to talk to an
    ordinary git server — GitHub, gitolite, a plain `sshd` with git installed.
-5. **Single static binary**, no runtime interpreter, no external tooling.
+5. **Single static binary**, no runtime interpreter. Two things on the
+   system are relied on: zlib, linked, and -- since the minimisation pass --
+   `diff(1)` on `PATH`, which busybox provides (`minimize.md` §5.4).
 
 ### Non-goals
 
@@ -104,7 +107,8 @@ writes any of them. Their presence in a repository must not confuse us, which
 costs nothing because they live in files we simply don't open.
 
 **R4 — One of everything.**
-One diff algorithm (Myers). One hash (SHA-1). One ref backend (`files`). One
+One diff algorithm (Myers, and since the minimisation pass the system
+`diff`'s -- `minimize.md` §5). One hash (SHA-1). One ref backend (`files`). One
 index version on write (v2, or v3 when extended flags are needed — matching
 git's own rule). One merge strategy. **One transport**: a program with a pipe
 on each end, speaking pkt-line. `ssh host "git-upload-pack '<path>'"` for a
@@ -240,11 +244,11 @@ and the sizes that costs are measured in §3.1's second table.
 
 ## 4. Recommended v1 scope
 
-**53 of 161 commands; 447 of 2,341 option entries (19%).** The option figure
-includes positional arguments (`<pathspec>`, `<commit>`), so the true "flag"
-fraction is nearer 12%.
+**44 of 161 commands** after the minimisation pass; 53 before it. The
+option count below is v1's; `minimize.md` §2.2 has what the pass found in
+use and what it trimmed.
 
-### Commands in v1
+### Commands in v1, as minimised
 
 | Group | Commands |
 |---|---|
@@ -253,14 +257,19 @@ fraction is nearer 12%.
 | Modify | `add` `stage` `rm` `mv` `restore` `reset` `clean` |
 | Commit | `commit` `tag` `stash` |
 | Branch | `branch` `checkout` `switch` `merge` `cherry-pick` `revert` `rebase` `worktree` |
-| Remote (client) | `fetch` `push` `pull` `remote` `ls-remote` |
+| Remote (client) | `fetch` `push` `pull` `remote` |
 | Config/admin | `config` `gc` `reflog` `help` `version` |
 | Plumbing (read) | `cat-file` `ls-files` `ls-tree` `rev-parse` `rev-list` `merge-base` `for-each-ref` `check-ignore` |
-| Plumbing (write) | `hash-object` `update-ref` `symbolic-ref` `update-index` `read-tree` `write-tree` `commit-tree` `merge-file` `index-pack` `pack-objects` |
+| Plumbing (write) | `hash-object` `update-ref` `write-tree` `merge-file` |
 
-The plumbing set is nearly free — each command is 20–40 lines of argument
-parsing over an engine that must exist anyway — and it makes the whole thing
-testable from a shell script without a test harness.
+The plumbing that is left is what makes the whole thing testable from a
+shell script: `cat-file` and `hash-object` probe the object store,
+`write-tree` the tree writer, `merge-file` the file merge, `update-ref` the
+ref writer. The nine wrappers the pass removed (`update-index`, `read-tree`,
+`commit-tree`, `symbolic-ref`, `pack-objects`, `index-pack`, `ls-remote`, and
+`update-ref --stdin`'s transaction grammar) had no caller; their engines are
+what `add`, `checkout`, `commit`, `fetch` and `push` run, and the oracle
+reads gittle's state through `git` instead (`minimize.md` §3, tier 1).
 
 ### The big cuts, and what each buys
 
@@ -524,6 +533,27 @@ did.
 the original 8,680 sketch.  Recorded, not cut against (§5's own rule); the
 optimisation and refactoring pass that plan.md defers to feature-completeness
 now has a baseline and four named things to look at.
+
+### 5.5 After the minimisation pass
+
+**11,724 lines**, from 13,872: −2,148, 15.5%. The pass and its arithmetic
+are in [`minimize.md`](minimize.md), §9 for what each step actually cost
+against its estimate. In §5's own terms:
+
+| | v1 | minimised |
+|---|---:|---:|
+| the command layer (47 → 44 files) | 5,770 | 4,155 |
+| the engines | 8,102 | 7,551 |
+| of which the diff (`diff` + `diffcore`) | 1,077 | 744 |
+| of which the shared output formatting (`pretty`, `diffcore`, `status`, `reffilter`) | 1,604 | 1,376 |
+
+Three things moved the number, and none of them is option surface either:
+the command layer's option parsing became one table-driven parser
+(`cli.nim`, 148 lines, for 46 commands); the diff algorithm became a call
+to `diff(1)`; and the output formatting that existed only to match git byte
+for byte -- the diffstat's column fitting, three date modes, the status
+advice layer, six paragraphs of push advice -- went, with the oracle
+comparing state and machine-readable output exactly and prose by content.
 
 ---
 

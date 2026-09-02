@@ -18,56 +18,47 @@
 ## default format.
 
 import std/strutils
-import ../cli, ../reffilter, ../refs, ../repository, ../revision, ../util
+import ../cli, ../reffilter, ../refs, ../repository, ../revision
 
 const
-  usageText = """usage: gittle for-each-ref [<options>] [<pattern>…]
-
-   --count=<n>       show at most <n> refs
-   --sort=<key>      sort by a field; repeatable, last key is primary
-   --format=<fmt>    print each ref through a format string
-   --contains [<commit>], --no-contains [<commit>]
-   --merged [<commit>], --no-merged [<commit>]
-   --points-at <object>"""
   defaultFormat = "%(objectname) %(objecttype)\t%(refname)"
+  filterOptions* = [
+    ## The ref-filter family (`ref-filter.c`), shared with `branch`: each
+    ## takes an optional commit, HEAD when none is given.
+    opt("--contains", okOptNext, arg = "[<commit>]", help = "only refs containing the commit"),
+    opt("--no-contains", okOptNext, arg = "[<commit>]", help = "only refs not containing it"),
+    opt("--merged", okOptNext, arg = "[<commit>]", help = "only refs reachable from the commit"),
+    opt("--no-merged", okOptNext, arg = "[<commit>]", help = "only refs not reachable from it"),
+    opt("--points-at", okOptNext, arg = "[<object>]", help = "only refs pointing at the object"),
+    opt("--sort", okValue, arg = "<key>", help = "sort by a field; repeatable, last key is primary"),
+  ]
+  options = [
+    opt("--count", okValue, arg = "<n>", help = "show at most <n> refs"),
+    opt("--format", okValue, arg = "<fmt>", help = "print each ref through a format string"),
+  ]
 
-proc parseFilterOpt*(c: Ctx, f: var RefFilter, a: string,
-                     valueFor: proc (a: string, dflt: string): string): bool =
-  ## The five selection options `for-each-ref`, `branch` and `tag` share.
-  ## Each takes an optional commit that defaults to HEAD, which is why the
-  ## value getter has to be handed a default rather than demanding one.
-  let name = if a.contains('='): a[0 ..< a.find('=')] else: a
-  case name
-  of "--contains": f.contains.add c.repo.resolveCommittish(valueFor(a, "HEAD"))
-  of "--no-contains": f.noContains.add c.repo.resolveCommittish(valueFor(a, "HEAD"))
-  of "--merged": f.merged.add c.repo.resolveCommittish(valueFor(a, "HEAD"))
-  of "--no-merged": f.noMerged.add c.repo.resolveCommittish(valueFor(a, "HEAD"))
-  of "--points-at": f.pointsAt.add c.repo.resolveRevish(valueFor(a, "HEAD"))
-  of "--sort": f.sortKeys.add valueFor(a, "")
-  else: return false
-  true
+proc applyFilterOpts*(c: Ctx, o: Opts, f: var RefFilter) =
+  ## The filter half of a parse, for any command whose table includes rows
+  ## from `filterOptions` (or a subset of them, as `branch`'s does).
+  for (k, v) in o.occurrences:
+    let at = if v.len == 0: "HEAD" else: v
+    case k
+    of "contains": f.contains.add c.repo.resolveCommittish(at)
+    of "no-contains": f.noContains.add c.repo.resolveCommittish(at)
+    of "merged": f.merged.add c.repo.resolveCommittish(at)
+    of "no-merged": f.noMerged.add c.repo.resolveCommittish(at)
+    of "points-at": f.pointsAt.add c.repo.resolveRevish(at)
+    of "sort": f.sortKeys.add v
+    else: discard
 
 proc cmdForEachRef*(c: Ctx, args: seq[string]): int =
-  var format = defaultFormat
-  var f = RefFilter(matchAsPath: true)
-  var i = 0
-  var noMoreOpts = false
-
-  optionValue(args, i)
-
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-': f.patterns.add a
-    elif a == "--": noMoreOpts = true
-    elif a.startsWith("--format"): format = valueFor(a, "")
-    elif a.startsWith("--count"): f.count = parseInt(valueFor(a, ""))
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif parseFilterOpt(c, f, a, valueFor): discard
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
+  ## Entry point: parse, collect the refs through the filter, expand each
+  ## through the format.
+  let o = parse(@options & @filterOptions, args, "for-each-ref", "[<options>] [<pattern>…]")
+  var f = RefFilter(matchAsPath: true, patterns: o.args)
+  applyFilterOpts(c, o, f)
+  if o.has "count": f.count = parseInt(o.val "count")
+  let format = o.val("format", defaultFormat)
   var rows = c.repo.collectRefs([refsPrefix], f)
   for i in 0 ..< rows.len:
     stdout.write c.repo.expand(rows[i], format), "\n"

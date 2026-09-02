@@ -41,6 +41,8 @@ func treeSortKey(name: string, mode: uint32): string =
   if mode == modeTree: name & "/" else: name
 
 proc sortTreeEntries(entries: var seq[TreeEntry]) =
+  ## git's tree order: by name, with a directory compared as if its name
+  ## ended in `/`.
   sort(entries, proc (a, b: TreeEntry): int =
     cmp(treeSortKey(a.name, a.mode), treeSortKey(b.name, b.mode)))
 
@@ -119,6 +121,8 @@ iterator walkTree*(repo: Repository, root: Oid, prefix = "",
   var stack: seq[TreeEntry]
 
   template pushChildren(oid: Oid, base: string) =
+    ## Queue a tree's entries for the walk, in order, with their paths
+    ## prefixed.
     var kids: seq[TreeEntry]
     for k in treeEntries(repo.readObject(oid).data): kids.add k
     for i in countdown(kids.high, 0):

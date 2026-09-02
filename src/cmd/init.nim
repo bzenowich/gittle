@@ -11,10 +11,19 @@
 ## out of scope by decision: sha256 and reftable are refused by the extension
 ## gate (plan.md 6.1), and the other two are layout variants nothing needs.
 
-import std/[os, strutils]
+import std/os
 import ../cli, ../config, ../refs, ../refname, ../util
 
-const usageText = """usage: gittle init [-q] [--bare] [-b <branch-name>] [<directory>]"""
+const
+  synopsis = "[-q] [--bare] [-b <branch-name>] [<directory>]"
+  options = [
+    opt("-q|--quiet", help = "say nothing"),
+    opt("--bare", help = "no working tree: the directory is the repository"),
+    opt("-b|--initial-branch", okValue, arg = "<name>",
+        help = "the name of the first branch; init.defaultBranch, else master"),
+    opt("--object-format|--ref-format|--template|--separate-git-dir|--shared",
+        okRefused, help = "gittle creates a sha1, 'files'-backend repository at the given path"),
+  ]
 
 const
   bareConfig = "[core]\n\trepositoryformatversion = 0\n" &
@@ -51,44 +60,14 @@ proc defaultInitialBranch*(): string =
   if result.len == 0: result = "master"
 
 proc cmdInit*(c: Ctx, args: seq[string]): int =
-  var quiet = false
-  var bare = c.bare
-  var branch = ""
-  var dirArg = ""
-  var i = 0
-  var noMoreOpts = false
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-':
-      failIf(dirArg.len > 0, "too many arguments\n" & usageText)
-      dirArg = a
-    elif a == "--": noMoreOpts = true
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "--bare": bare = true
-    elif a == "-b" or a == "--initial-branch":
-      inc i
-      failIf(i >= args.len, "option '" & a & "' requires a value")
-      branch = args[i]
-    elif a.startsWith("--initial-branch="):
-      branch = a["--initial-branch=".len .. ^1]
-    elif a.startsWith("-b"):
-      branch = a[2 .. ^1]
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif a in ["--object-format", "--ref-format", "--template",
-               "--separate-git-dir", "--shared"] or
-         a.startsWith("--object-format=") or a.startsWith("--ref-format=") or
-         a.startsWith("--template=") or a.startsWith("--separate-git-dir=") or
-         a.startsWith("--shared="):
-      fail(a.split('=')[0] & " is not supported by gittle\n" &
-           "  gittle creates a sha1, 'files'-backend repository at the given path")
-    else:
-      fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
-  # The working tree, then the git directory inside it -- or, when bare, the
-  # directory *is* the git directory.
+  ## Entry point: parse, resolve the directory and initial branch, create
+  ## the layout.
+  let o = parse(options, args, "init", synopsis)
+  failIf(o.args.len > 1, "too many arguments\n" & o.use)
+  let quiet = o.has "quiet"
+  let bare = c.bare or o.has "bare"
+  var branch = o.val "initial-branch"
+  let dirArg = if o.args.len > 0: o.args[0] else: ""
   let root = if dirArg.len > 0: absolutePath(dirArg, c.startDir).normalizedPath
              else: c.startDir
   let gitDir = if bare: root else: root / ".git"

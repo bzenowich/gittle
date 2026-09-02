@@ -18,6 +18,7 @@ type
     entries*: seq[ConfigEntry]
 
 func isNameChar(c: char): bool =
+  ## May the character appear in a variable name?  (`config.c:iskeychar`)
   c.isAlphaNumeric or c == '-'
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,8 @@ type
     valueAt: int        ## where the value starts, or -1 for an implicit true
 
 proc scanLines(lines: openArray[string], path: string): seq[ScannedLine] =
+  ## Classify every line -- section header, variable, or other -- and carry
+  ## the current section along, so an edit knows where it stands.
   var section = ""
   var subsection = ""
   var hasSub = false
@@ -97,6 +100,7 @@ proc scanLines(lines: openArray[string], path: string): seq[ScannedLine] =
     result.add sl
 
 func fullSection(sl: ScannedLine): string =
+  ## `section` or `section.subsection`, lower-cased as git compares them.
   if sl.hasSub: sl.section & "." & sl.subsection else: sl.section
 
 # ---------------------------------------------------------------------------
@@ -145,6 +149,8 @@ proc parseValue(line: string, start: int, path: string, lineNo: int,
   result.setLen(max(lastNonSpace, 0))
 
 proc parseConfig*(text, path: string): Config =
+  ## The whole parse: `scanLines`, then each variable line into an entry,
+  ## with continuation lines joined.
   let lines = text.splitLines
   let scanned = scanLines(lines, path)
   var i = 0
@@ -185,6 +191,8 @@ proc globalConfigPath*(): string =
   classic
 
 proc loadConfig*(path: string): Config =
+  ## Parse a file, or nothing when it does not exist -- an absent config
+  ## file is an empty one.
   if not fileExists(path): return
   parseConfig(readWholeFile(path), path)
 
@@ -209,12 +217,16 @@ iterator getAll*(c: Config, key: string): string =
     if e.key.toLowerAscii == k: yield e.value
 
 proc has*(c: Config, key: string): bool =
+  ## Is the key set at all?  Distinct from `get`, since an empty value is
+  ## legal.
   let k = key.toLowerAscii
   for e in c.entries:
     if e.key.toLowerAscii == k: return true
   false
 
 proc getBool*(c: Config, key: string, default: bool): bool =
+  ## A boolean the way git reads one: `true`/`yes`/`on`/`1` and the bare
+  ## key, `false`/`no`/`off`/`0`; anything else is the default.
   if not c.has(key): return default
   case c.get(key).toLowerAscii
   of "true", "yes", "on", "1", "": true
@@ -222,6 +234,7 @@ proc getBool*(c: Config, key: string, default: bool): bool =
   else: default
 
 proc getInt*(c: Config, key: string, default: int): int =
+  ## An integer, or the default when unset or malformed.
   if not c.has(key): return default
   try: parseInt(c.get(key).strip()) except ValueError: default
 
@@ -257,6 +270,8 @@ type
     name*: string
 
 proc splitKey*(key: string): SplitKey =
+  ## `section.subsection.name` taken apart, with git's rule that the
+  ## subsection is everything between the first and last dot, case kept.
   let first = key.find('.')
   failIf(first <= 0, "key does not contain a section: " & key)
   let last = key.rfind('.')
@@ -286,6 +301,8 @@ func quoteValue(v: string): string =
   if needsQuotes: "\"" & body & "\"" else: body
 
 func sectionHeader(k: SplitKey): string =
+  ## The header line for a section, with the subsection quoted as git
+  ## writes it.
   if k.hasSub: "[" & k.section & " \"" & k.subsection.replace("\\", "\\\\")
                                                     .replace("\"", "\\\"") & "\"]"
   else: "[" & k.section & "]"

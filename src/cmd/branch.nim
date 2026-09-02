@@ -23,6 +23,15 @@
 ## branch's own upstream, which is what makes deleting a pushed branch work).
 ## `-D` says do it anyway, and prints the object ID so the work can be found
 ## again -- the reflog entry `-d` writes is the other half of that promise.
+##
+## ## What was trimmed
+##
+## `--sort`, `--format`, `--points-at`, `--no-contains`, `--no-merged` and
+## `--edit-description` came out in the minimisation pass (docs/minimize.md
+## §3): a survey of use found none of them, and `for-each-ref refs/heads`
+## answers the first five.  Each refuses by name rather than being ignored.
+## `--contains`, `--merged`, `-vv` and `--show-current` -- everything the
+## survey did find -- stay.
 
 import std/[os, strutils]
 import ../cli, ../config, ../reffilter, ../refname, ../refs,
@@ -30,24 +39,6 @@ import ../cli, ../config, ../reffilter, ../refname, ../refs,
        ../worktrees
 import foreachref
 
-const usageText = """usage: gittle branch [<options>] [<pattern>…]
-   or: gittle branch [-f] <branch> [<start-point>]
-   or: gittle branch (-d | -D) [-r] <branch>…
-   or: gittle branch (-m | -M) [<old-branch>] <new-branch>
-
-   -l, --list                list branches (the default)
-   -a, --all                 list local and remote-tracking branches
-   -r, --remotes             list remote-tracking branches
-   -v, -vv, --verbose        show the tip commit, and with -vv the upstream
-   --show-current            print the branch HEAD is on
-   -d, --delete, -D          delete a branch
-   -m, --move, -M            rename a branch
-   -f, --force               overwrite an existing branch
-   -q, --quiet               say nothing on success
-   -t, --track, --no-track   set up (or do not set up) upstream tracking
-   -u, --set-upstream-to=<upstream>, --unset-upstream
-   --contains, --no-contains, --merged, --no-merged, --points-at
-   --sort=<key>, --format=<fmt>"""
 
 const heads = refsPrefix & "heads/"
 const remotes = refsPrefix & "remotes/"
@@ -112,7 +103,7 @@ proc trackText(repo: Repository, refName: string, brackets: bool): string =
   if brackets: "[" & inner & "]" else: inner
 
 proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
-                  verbose: int, format: string): int =
+                  verbose: int): int =
   ## `kinds` is which namespaces to list: 0 local, 1 remote-tracking.
   let repo = c.repo
   var prefixes: seq[string]
@@ -125,12 +116,10 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
   var rows = repo.collectRefs(prefixes, f)
 
   proc shownName(r: RefRow): string =
+    ## The name as the listing shows it: `main`, or `remotes/origin/main` when
+    ## both namespaces are on show.
     if r.rf.name.startsWith(heads): r.rf.name[heads.len .. ^1]
     else: remotePrefix & r.rf.name[remotes.len .. ^1]
-
-  if format.len > 0:
-    for i in 0 ..< rows.len: echo repo.expand(rows[i], format)
-    return 0
 
   # A detached HEAD is not a ref, so it is not in the listing -- but git shows
   # it, first, as a row of its own, and it counts toward the column width.
@@ -155,6 +144,8 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
   for r in rows: width = max(width, shownName(r).len)
 
   proc line(mark, name: string, r: RefRow, symTarget: string): string =
+    ## One listing row: the mark, the padded name, and under `-v` the tip,
+    ## the upstream state and the subject.
     result = mark & (if verbose > 0: name.alignLeft(width) else: name)
     if symTarget.len > 0:
       # A symbolic ref -- `origin/HEAD` -- names another ref, and that is all
@@ -197,6 +188,9 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
 
 proc createBranch*(c: Ctx, name, startPoint: string, force, quiet, track: bool,
                   trackGiven: bool) =
+  ## `branch <name> [<start>]`: refuse a bad or taken name, write the ref
+  ## with a reflog line naming where it came from, and set up tracking
+  ## when `branch.autoSetupMerge` says to.
   let repo = c.repo
   failIf(not isValidRefname(heads & name, {}),
          "'" & name & "' is not a valid branch name")
@@ -228,6 +222,8 @@ proc createBranch*(c: Ctx, name, startPoint: string, force, quiet, track: bool,
     if startRef.len > 0: setBranchUpstream(c, name, startRef, quiet)
 
 proc deleteBranches(c: Ctx, names: seq[string], force, quiet, remote: bool): int =
+  ## `-d`/`-D` over several names: every refusal is an `error:` and exit 1
+  ## rather than fatal, so the others are still tried.
   let repo = c.repo
   let prefix = if remote: remotes else: heads
   let head = repo.refs.resolveRef(headRef)
@@ -306,52 +302,57 @@ proc renameBranch(c: Ctx, oldName, newName: string, force: bool) =
 # Entry point
 # ---------------------------------------------------------------------------
 
+const
+  synopsis = "[<options>] [<pattern>…]\n[-f] <branch> [<start-point>]\n(-d | -D) [-r] <branch>…\n(-m | -M) [<old-branch>] <new-branch>"
+  options = [
+    opt("-l|--list", help = "list branches (the default)"),
+    opt("-a|--all", help = "list local and remote-tracking branches"),
+    opt("-r|--remotes", help = "list remote-tracking branches"),
+    opt("-v|--verbose", okCount, help = "show the tip commit, and with -vv the upstream"),
+    opt("--show-current", help = "print the branch HEAD is on"),
+    opt("-d|--delete", help = "delete a branch"),
+    opt("-D", help = "delete a branch even if it is not merged"),
+    opt("-m|--move", help = "rename a branch"),
+    opt("-M", help = "rename over an existing branch"),
+    opt("-f|--force", help = "overwrite an existing branch"),
+    opt("-q|--quiet", help = "say nothing on success"),
+    opt("-t|--track", help = "set up upstream tracking from the start point"),
+    opt("--no-track", help = "do not set up tracking"),
+    opt("-u|--set-upstream-to", okValue, arg = "<upstream>", help = "set the branch's upstream"),
+    opt("--unset-upstream", help = "remove the branch's upstream"),
+    opt("--contains", okOptNext, arg = "[<commit>]", help = "list only branches containing <commit> (HEAD by default)"),
+    opt("--merged", okOptNext, arg = "[<commit>]", help = "list only branches reachable from <commit>"),
+    opt("-c|--copy|-C|--create-reflog", okRefused, help = "docs/06"),
+    opt("--sort|--format|--points-at|--no-contains|--no-merged|--edit-description",
+        okRefused, help = "trimmed (docs/minimize.md §3); use for-each-ref refs/heads"),
+  ]
+
 proc cmdBranch*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse, then dispatch on which of the four jobs the
+  ## options and positionals add up to -- upstream bookkeeping, delete,
+  ## rename, create, or list.
+  let o = parse(options, args, "branch", synopsis)
   var f = RefFilter()
+  applyFilterOpts(c, o, f)
   var kinds: set[range[0 .. 1]] = {}
-  var verbose = 0
-  var format = ""
-  var force, quiet, del, move, list, showCurrent, unsetUpstream = false
   var track, trackGiven = false
-  var upstreamTo = ""
-  var rest: seq[string]
-  var i = 0
-  let a2 = expandShortOptions(args, {'u'})
-
-  optionValue(a2, i)
-
-  while i < a2.len:
-    let a = a2[i]
-    if a.len > 1 and a[0] == '-':
-      case a
-      of "-l", "--list": list = true
-      of "-a", "--all": kinds = {0, 1}
-      of "-r", "--remotes": kinds = {1}
-      of "-v", "--verbose": inc verbose
-      of "-q", "--quiet": quiet = true
-      of "-f", "--force": force = true
-      of "-d", "--delete": del = true
-      of "-D": (del = true; force = true)
-      of "-m", "--move": move = true
-      of "-M": (move = true; force = true)
-      of "-t", "--track": (track = true; trackGiven = true)
-      of "--no-track": (track = false; trackGiven = true)
-      of "--unset-upstream": unsetUpstream = true
-      of "--show-current": showCurrent = true
-      of "-h", "--help": (echo usageText; return 0)
-      of "-c", "--copy", "-C", "--edit-description", "--create-reflog":
-        fail(a & " is out of scope for gittle v1 (docs/06)")
-      else:
-        if a == "-u" or a.startsWith("--set-upstream-to"):
-          upstreamTo = valueFor(a, "")
-        elif a.startsWith("--format"): format = valueFor(a, "")
-        elif a == "-vv": verbose = 2
-        elif parseFilterOpt(c, f, a, valueFor): discard
-        else: fail("unknown option '" & a & "'\n" & usageText)
-    else:
-      rest.add a
-    inc i
-
+  for (k, _) in o.occurrences:        # the last of -a/-r, and of -t/--no-track, wins
+    case k
+    of "all": kinds = {0, 1}
+    of "remotes": kinds = {1}
+    of "track": (track = true; trackGiven = true)
+    of "no-track": (track = false; trackGiven = true)
+    else: discard
+  let verbose = o.count "verbose"
+  let list = o.has "list"
+  let quiet = o.has "quiet"
+  let force = o.has("force") or o.has("D") or o.has("M")
+  let del = o.has("delete") or o.has("D")
+  let move = o.has("move") or o.has("M")
+  let unsetUpstream = o.has "unset-upstream"
+  let showCurrent = o.has "show-current"
+  let upstreamTo = o.val "set-upstream-to"
+  var rest = o.args
   let repo = c.repo
   if kinds.card == 0: kinds = {0}
 
@@ -360,26 +361,24 @@ proc cmdBranch*(c: Ctx, args: seq[string]): int =
     if name.startsWith(heads): echo name[heads.len .. ^1]
     return 0
 
+  # The upstream and rename verbs act on the branch named, or failing that
+  # the one HEAD is on -- and a detached HEAD has no branch to act on.
+  proc named(orElse: string): string =
+    if rest.len > 0: return rest[0]
+    failIf(not repo.headRefName.startsWith(heads), orElse)
+    repo.headRefName[heads.len .. ^1]
+
   if unsetUpstream:
-    let name = if rest.len > 0: rest[0]
-               else:
-                 failIf(not repo.headRefName.startsWith(heads),
-                        "could not unset upstream of HEAD when it does not " &
-                        "point to any branch")
-                 repo.headRefName[heads.len .. ^1]
+    let name = named("could not unset upstream of HEAD when it does not " &
+                     "point to any branch")
     for key in ["remote", "merge"]:
       discard unsetConfigValue(repo.gitDir / "config",
                                "branch." & name & "." & key, all = true)
     return 0
 
   if upstreamTo.len > 0:
-    let name = if rest.len > 0: rest[0]
-               else:
-                 failIf(not repo.headRefName.startsWith(heads),
-                        "could not set upstream of HEAD when it does not " &
-                        "point to any branch")
-                 repo.headRefName[heads.len .. ^1]
-    setBranchUpstream(c, name, upstreamTo, quiet)
+    setBranchUpstream(c, named("could not set upstream of HEAD when it does " &
+                               "not point to any branch"), upstreamTo, quiet)
     return 0
 
   if del:
@@ -387,24 +386,21 @@ proc cmdBranch*(c: Ctx, args: seq[string]): int =
     return deleteBranches(c, rest, force, quiet, 1 in kinds)
 
   if move:
-    failIf(rest.len == 0 or rest.len > 2, usageText)
-    let (old, dest) =
-      if rest.len == 2: (rest[0], rest[1])
-      else:
-        failIf(not repo.headRefName.startsWith(heads),
-               "cannot rename a detached HEAD")
-        (repo.headRefName[heads.len .. ^1], rest[0])
-    renameBranch(c, old, dest, force)
+    failIf(rest.len == 0 or rest.len > 2, o.use)
+    # The last argument is the new name; what is left, if anything, is the old.
+    let dest = rest[^1]
+    rest.setLen(rest.len - 1)
+    renameBranch(c, named("cannot rename a detached HEAD"), dest, force)
     return 0
 
   # A bare name creates; anything else is a listing, and the leftovers are
   # patterns.  `--list` forces the listing reading, which is how a branch
   # whose name looks like a pattern is listed rather than created.
   if rest.len > 0 and not list and verbose == 0 and f.patterns.len == 0:
-    failIf(rest.len > 2, usageText)
+    failIf(rest.len > 2, o.use)
     createBranch(c, rest[0], (if rest.len > 1: rest[1] else: ""),
                  force, quiet, track, trackGiven)
     return 0
 
   f.patterns.add rest
-  listBranches(c, f, kinds, verbose, format)
+  listBranches(c, f, kinds, verbose)

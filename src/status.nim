@@ -97,11 +97,14 @@ const unmergedTable = [
   ## theirs, so mask 3 is "we have it, they deleted it".
 
 func unmergedLetters(mask: int): (char, char) =
+  ## The two columns of the short format for an unmerged path, from its
+  ## stage mask.
   for (m, letters, _) in unmergedTable:
     if m == mask: return (letters[0], letters[1])
   ('U', 'U')
 
 func unmergedLabel(mask: int): string =
+  ## The long format's label for an unmerged path, from its stage mask.
   for (m, _, label) in unmergedTable:
     if m == mask: return label
   "unmerged:"
@@ -294,6 +297,7 @@ proc shortLines*(st: Status, fmt: StatusFormat, branch: bool, nulTerm: bool,
   let sep = if nulTerm: "\0" else: "\n"
 
   proc name(p: string): string =
+    ## A path as the short formats print it: relative or not, quoted or not.
     # `-z` is the one mode with no quoting: the terminator already makes every
     # byte unambiguous, which is why it exists.
     let rel = if relative: relativeTo(p, prefix) else: p
@@ -377,6 +381,7 @@ const
   labelWidth = 12
 
 proc labelFor(c: char): string =
+  ## The long format's label for a change letter, padded to the column.
   for (k, text) in changeLabels:
     if k == c: return text.alignLeft(labelWidth)
   "unknown:".alignLeft(labelWidth)
@@ -384,69 +389,46 @@ proc labelFor(c: char): string =
 proc trackingLine*(t: Tracking): string =
   ## `Your branch is up to date with 'origin/main'.` and its three siblings.
   ## Printed by `checkout` and `status` alike, which is why it lives here
-  ## rather than in either (`wt-status.c:wt_status_print_tracking`).
+  ## rather than in either (`wt-status.c:wt_status_print_tracking`).  The
+  ## `(use "git pull" …)` lines under each are `advice.statusHints`, cut.
   if t.upstream.len == 0: return ""
   let name = t.upstream
   if t.gone:
-    return "Your branch is based on '" & name & "', but the upstream is gone.\n" &
-           "  (use \"gittle branch --unset-upstream\" to fixup)\n"
+    return "Your branch is based on '" & name & "', but the upstream is gone.\n"
   let ahead = t.ahead
   let behind = t.behind
 
+  # `1 commit`, `2 commits`.
   proc commits(n: int): string = $n & (if n == 1: " commit" else: " commits")
   if ahead == 0 and behind == 0:
     "Your branch is up to date with '" & name & "'.\n"
   elif behind == 0:
-    "Your branch is ahead of '" & name & "' by " & commits(ahead) & ".\n" &
-    "  (use \"gittle push\" to publish your local commits)\n"
+    "Your branch is ahead of '" & name & "' by " & commits(ahead) & ".\n"
   elif ahead == 0:
     "Your branch is behind '" & name & "' by " & commits(behind) &
-    ", and can be fast-forwarded.\n" &
-    "  (use \"gittle pull\" to update your local branch)\n"
+    ", and can be fast-forwarded.\n"
   else:
     # The plural is decided by the *sum* of the two counts, not by either of
     # them (`remote.c`, the `Q_()` around this string) -- so one commit each
     # way still says "commits".
     "Your branch and '" & name & "' have diverged,\nand have " &
     $ahead & " and " & $behind & " different commit" &
-    (if ahead + behind == 1: "" else: "s") & " each, respectively.\n" &
-    "  (use \"gittle pull\" if you want to integrate the remote branch with " &
-    "yours)\n"
+    (if ahead + behind == 1: "" else: "s") & " each, respectively.\n"
 
-proc inProgressBlock(st: Status, hints: bool, unmerged: bool): string =
-  ## "You have unmerged paths." and its four siblings, plus the hints that
-  ## name the way out.
-  ##
-  ## Every one of them differs on whether conflicts are still outstanding,
-  ## because that decides whether the next command is `--continue` or fixing
-  ## a file first -- so each is one line and a two-way hint
-  ## (`wt-status.c:show_merge_in_progress` and the three beside it).
-  proc hint(s: string): string = (if hints: s else: "")
+proc inProgressBlock(st: Status, unmerged: bool): string =
+  ## "You have unmerged paths." and its four siblings: which operation is in
+  ## progress, and where it stands (`wt-status.c:wt_longstatus_print_state`).
   case st.op
   of opNone: return ""
   of opMerge:
-    if unmerged:
-      result = "You have unmerged paths.\n" &
-        hint("  (fix conflicts and run \"git commit\")\n" &
-             "  (use \"git merge --abort\" to abort the merge)\n")
-    else:
-      result = "All conflicts fixed but you are still merging.\n" &
-        hint("  (use \"git commit\" to conclude merge)\n")
+    result = if unmerged: "You have unmerged paths.\n"
+             else: "All conflicts fixed but you are still merging.\n"
   of opCherryPick, opRevert:
-    let verb = st.op.opName
     let noun = if st.op == opCherryPick: "cherry-picking" else: "reverting"
-    result = "You are currently " & noun & " commit " & st.opHead & ".\n" &
-      hint((if unmerged: "  (fix conflicts and run \"git " & verb & " --continue\")\n"
-            else: "  (all conflicts fixed: run \"git " & verb & " --continue\")\n") &
-           "  (use \"git " & verb & " --skip\" to skip this patch)\n" &
-           "  (use \"git " & verb & " --abort\" to cancel the " & verb &
-           " operation)\n")
+    result = "You are currently " & noun & " commit " & st.opHead & ".\n"
   of opRebase:
-    # Every rebase runs through the interactive machinery now, so every one
-    # reports its todo list: what was done, and what is left
-    # (`wt-status.c:show_rebase_information`).  Two lines of each, which is
-    # what makes the report fit above the file list.
     func plural(n: int, one, many: string): string =
+      ## `1 command` / `2 commands`.
       $n & " " & (if n == 1: one else: many)
     if st.opDone.len == 0: result.add "No commands done.\n"
     else:
@@ -455,8 +437,6 @@ proc inProgressBlock(st: Status, hints: bool, unmerged: bool): string =
                  " done):\n"
       for k in max(st.opDone.len - 2, 0) ..< st.opDone.len:
         result.add "   " & st.opDone[k] & "\n"
-      if st.opDone.len > 2 and hints:
-        result.add "  (see more in file .git/rebase-merge/done)\n"
     if st.opTodo.len == 0: result.add "No commands remaining.\n"
     else:
       result.add "Next command" & (if st.opTodo.len == 1: "" else: "s") &
@@ -464,149 +444,61 @@ proc inProgressBlock(st: Status, hints: bool, unmerged: bool): string =
                                      "remaining commands") & "):\n"
       for k in 0 ..< min(2, st.opTodo.len):
         result.add "   " & st.opTodo[k] & "\n"
-      if hints: result.add "  (use \"git rebase --edit-todo\" to view and edit)\n"
     result.add (if st.opBranch.len > 0:
                 "You are currently rebasing branch '" & st.opBranch & "' on '" &
                 st.opOnto & "'.\n"
               else: "You are currently rebasing.\n")
-    result.add hint(
-      if unmerged:
-        "  (fix conflicts and then run \"git rebase --continue\")\n" &
-        "  (use \"git rebase --skip\" to skip this patch)\n" &
-        "  (use \"git rebase --abort\" to check out the original branch)\n"
-      else: "  (all conflicts fixed: run \"git rebase --continue\")\n")
   result.add "\n"
 
-proc longStatus*(st: Status, untracked: UntrackedMode, hints: bool,
-                 prefix: string): string =
-  ## The descriptive format, which is the default and is the only one whose
-  ## text is not machine-readable -- so every string in it is git's, verbatim
-  ## (`wt-status.c:wt_longstatus_print`).
-  ##
-  ## The hints in parentheses are not decoration: which one appears reports
-  ## something real.  "use git rm --cached" rather than "git restore --staged"
-  ## means there is no commit to restore *from*, and "git add/rm" rather than
-  ## "git add" means a file has been deleted and `add` alone would not record
-  ## it.
+proc longStatus*(st: Status, untracked: UntrackedMode, prefix: string): string =
+  ## The default format.  It is git's own with `advice.statusHints=false`:
+  ## the 26 parenthesised `(use "git …")` hints and the two decision trees
+  ## that chose between them went in the minimization pass (docs/minimize.md
+  ## §3, tier 3) -- the headings say what state a path is in, which is the
+  ## information, and the oracle compares against git with hints off.
   var staged, unstaged, unmerged: seq[Entry]
-  var anyDeleted = false
   for e in st.entries:
-    if e.stagemask != 0:
-      unmerged.add e
-      continue
-    if e.x != ' ': staged.add e
-    if e.y != ' ':
-      unstaged.add e
-      if e.y == 'D': anyDeleted = true
-
+    if e.stagemask != 0: unmerged.add e
+    else:
+      if e.x != ' ': staged.add e
+      if e.y != ' ': unstaged.add e
   if st.op == opRebase and st.opOnto.len > 0:
-    # Not `On branch` and not `HEAD detached`: during a rebase HEAD really is
-    # detached, and saying so would bury what the user needs to know
-    # (`wt-status.c` substitutes this line wholesale).
     result.add "interactive rebase in progress; onto " & st.opOnto & "\n"
   elif st.detached:
     result.add st.headDesc & "\n"
   else:
     result.add "On branch " & st.branch & "\n"
-    # A blank line closes the tracking paragraph, the same way every other
-    # section here is closed (`wt-status.c:wt_longstatus_print_tracking`).
     let track = st.tracking.trackingLine
     if track.len > 0: result.add track & "\n"
-  # Sections are separated by a blank line *after* each one, so the first
-  # follows `On branch …` directly and the last leaves a trailing blank.
   if st.initial:
     result.add "\nNo commits yet\n\n"
-
-  result.add inProgressBlock(st, hints, unmerged.len > 0)
-
-  if staged.len > 0:
-    result.add "Changes to be committed:\n"
-    # The unstage hint is suppressed in the middle of a merge or a cherry-pick:
-    # what is staged there was staged by the operation, and `restore --staged`
-    # would be the wrong advice.  Only those two, because `whence` is derived
-    # from `MERGE_HEAD` and `CHERRY_PICK_HEAD` alone -- a revert and a rebase
-    # get the hint (`builtin/commit.c:determine_whence`).
-    if hints and st.op notin {opMerge, opCherryPick}:
-      result.add (if st.initial:
-                    "  (use \"git rm --cached <file>...\" to unstage)\n"
-                  else:
-                    "  (use \"git restore --staged <file>...\" to unstage)\n")
-    for e in staged:
-      result.add "\t" & labelFor(e.x) & quotePath(relativeTo(e.path, prefix)) & "\n"
+  result.add inProgressBlock(st, unmerged.len > 0)
+  proc section(title: string, lines: seq[string]): string =
+    ## One block of the long format: a heading, then one tab-indented line
+    ## per path, then a blank line; nothing when there are no paths.
+    if lines.len == 0: return
+    result = title & ":\n"
+    for l in lines: result.add "\t" & l & "\n"
     result.add "\n"
-
-  if unmerged.len > 0:
-    result.add "Unmerged paths:\n"
-    # The same unstage hint the staged section carries, under the same rule:
-    # it is advice about `restore --staged`, so it is silent while an
-    # operation owns the index (`wt-status.c`'s unmerged header).
-    if hints and st.op notin {opMerge, opCherryPick}:
-      result.add (if st.initial:
-                    "  (use \"git rm --cached <file>...\" to unstage)\n"
-                  else:
-                    "  (use \"git restore --staged <file>...\" to unstage)\n")
-    if hints:
-      # Which hint appears says which resolutions are possible: a path deleted
-      # on one side needs `rm`, and one deleted on both needs nothing else.
-      var bothDeleted, delMod, notDeleted = false
-      for e in unmerged:
-        case e.stagemask
-        of 1: bothDeleted = true
-        of 3, 5: delMod = true
-        else: notDeleted = true
-      result.add (
-        if not bothDeleted:
-          if not delMod: "  (use \"git add <file>...\" to mark resolution)\n"
-          else: "  (use \"git add/rm <file>...\" as appropriate to mark resolution)\n"
-        elif not delMod and not notDeleted:
-          "  (use \"git rm <file>...\" to mark resolution)\n"
-        else: "  (use \"git add/rm <file>...\" as appropriate to mark resolution)\n")
-    for e in unmerged:
-      result.add "\t" & unmergedLabel(e.stagemask).alignLeft(labelWidth + 5) &
-                 quotePath(relativeTo(e.path, prefix)) & "\n"
-    result.add "\n"
-
-  if unstaged.len > 0:
-    result.add "Changes not staged for commit:\n"
-    if hints:
-      result.add (if anyDeleted:
-                    "  (use \"git add/rm <file>...\" to update what will be committed)\n"
-                  else:
-                    "  (use \"git add <file>...\" to update what will be committed)\n")
-      result.add "  (use \"git restore <file>...\" to discard changes in working directory)\n"
-    for e in unstaged:
-      result.add "\t" & labelFor(e.y) & quotePath(relativeTo(e.path, prefix)) & "\n"
-    result.add "\n"
-
-  if st.untracked.len > 0:
-    result.add "Untracked files:\n"
-    if hints:
-      result.add "  (use \"git add <file>...\" to include in what will be committed)\n"
-    for p in st.untracked:
-      result.add "\t" & quotePath(relativeTo(p, prefix)) & "\n"
-    result.add "\n"
-
-  # git mentions the suppressed untracked files only when there is something
-  # to commit -- otherwise the footer below already says what the state is
-  # (`wt-status.c`: the `else if (s->committable)` branch).
+  var rows: seq[string]
+  for e in staged: rows.add labelFor(e.x) & quotePath(relativeTo(e.path, prefix))
+  result.add section("Changes to be committed", rows)
+  rows = @[]
+  for e in unmerged:
+    rows.add unmergedLabel(e.stagemask).alignLeft(labelWidth + 5) &
+             quotePath(relativeTo(e.path, prefix))
+  result.add section("Unmerged paths", rows)
+  rows = @[]
+  for e in unstaged: rows.add labelFor(e.y) & quotePath(relativeTo(e.path, prefix))
+  result.add section("Changes not staged for commit", rows)
+  rows = @[]
+  for p in st.untracked: rows.add quotePath(relativeTo(p, prefix))
+  result.add section("Untracked files", rows)
   if untracked == umNo and staged.len > 0:
-    result.add "Untracked files not listed"
-    result.add (if hints: " (use -u option to show untracked files)\n" else: "\n")
-
-  # The footer, in git's order of precedence: what you would have to do next
-  # decides which sentence appears (`wt-status.c`, the `!s->committable` block).
+    result.add "Untracked files not listed\n"
   if staged.len == 0:
     result.add (
-      if unstaged.len > 0 or unmerged.len > 0:
-        if hints: "no changes added to commit (use \"git add\" and/or \"git commit -a\")\n"
-        else: "no changes added to commit\n"
-      elif st.untracked.len > 0:
-        if hints: "nothing added to commit but untracked files present (use \"git add\" to track)\n"
-        else: "nothing added to commit but untracked files present\n"
-      elif st.initial:
-        if hints: "nothing to commit (create/copy files and use \"git add\" to track)\n"
-        else: "nothing to commit\n"
-      elif untracked == umNo:
-        if hints: "nothing to commit (use -u to show untracked files)\n"
-        else: "nothing to commit\n"
+      if unstaged.len > 0 or unmerged.len > 0: "no changes added to commit\n"
+      elif st.untracked.len > 0: "nothing added to commit but untracked files present\n"
+      elif st.initial or untracked == umNo: "nothing to commit\n"
       else: "nothing to commit, working tree clean\n")

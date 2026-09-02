@@ -76,6 +76,7 @@ implementing anything.
 | `15-non-command-docs.md` | Guides, file formats, and user interfaces that are documentation, not commands. |
 | `plan.md` | Goals, design rules, recommended scope with rationale, budget, decisions, build order. |
 | `phase-1.md` … `phase-8.md`, `phase-10.md` | The finished phases: what was built, what it was verified against, what was left for later, and where the budget stands. |
+| `minimize.md` | The minimisation pass after v1: what was cut and why, the option table, the external `diff`, the server-assisted `gc`, and what each step cost (§9). |
 | `git-tool-calls-*.md` | Raw evidence: every `git` call from two projects' agent sessions. |
 
 ## Notation

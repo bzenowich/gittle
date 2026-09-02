@@ -32,7 +32,17 @@
 import std/[posix, tables]
 import ../cli, ../index, ../pathspec, ../repository, ../util, ../worktree
 
-const usageText = """usage: gittle rm [-f] [-n] [-r] [--cached] [-q] [--] <pathspec>…"""
+const
+  synopsis = "[-f] [-n] [-r] [--cached] [-q] [--] <pathspec>…"
+  options = [
+    opt("-f|--force", help = "remove despite local or staged changes"),
+    opt("-n|--dry-run", help = "report what would be removed, remove nothing"),
+    opt("-r", help = "recurse into directories"),
+    opt("--cached", help = "remove from the index only, leave the file"),
+    opt("-q|--quiet", help = "report nothing"),
+    opt("--ignore-unmatch|--sparse|--pathspec-from-file|--pathspec-file-nul",
+        okRefused, help = "docs/08"),
+  ]
 
 type Refusal = enum
   ## Which of the three things went wrong, in the order git reports them.
@@ -64,24 +74,12 @@ proc report(kind: Refusal, files: seq[string]): bool =
   true
 
 proc cmdRm*(c: Ctx, argv: seq[string]): int =
-  let args = expandShortOptions(argv, {})
-  var force, dryRun, recursive, cached, quiet = false
-  var specs: seq[string]
-  var noMoreOpts = false
-  for a in args:
-    if noMoreOpts or a.len == 0 or a[0] != '-': specs.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-f" or a == "--force": force = true
-    elif a == "-n" or a == "--dry-run": dryRun = true
-    elif a == "-r": recursive = true
-    elif a == "--cached": cached = true
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "-h" or a == "--help": (echo usageText; return 0)
-    elif a in ["--ignore-unmatch", "--sparse", "--pathspec-from-file",
-               "--pathspec-file-nul"]:
-      fail("gittle rm does not support '" & a & "' (docs/08)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-
+  ## Entry point: parse, check every path's safety before removing any,
+  ## then remove from the index and, unless `--cached`, the tree.
+  let o = parse(options, argv, "rm", synopsis)
+  let (force, dryRun, recursive, cached, quiet) =
+    (o.has "force", o.has "dry-run", o.has "r", o.has "cached", o.has "quiet")
+  let specs = o.args
   failIf(specs.len == 0, "No pathspec was given. Which files should I remove?")
 
   let repo = c.repo

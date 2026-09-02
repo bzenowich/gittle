@@ -48,6 +48,8 @@ var
   REG_STARTEND {.importc, header: "<regex.h>".}: cint
   REG_NOMATCH {.importc, header: "<regex.h>".}: cint
 
+# The three libc entry points (POSIX `regex.h`): compile, match, and the
+# text of an error code.  See plan.md 6.4 for why libc's engine and not ours.
 proc regcomp(preg: ptr RegexT, pattern: cstring, cflags: cint): cint
   {.importc, header: "<regex.h>".}
 proc regexec(preg: ptr RegexT, s: cstring, nmatch: csize_t,
@@ -108,6 +110,7 @@ proc execAt(re: Regex, data: string, start, stop: int, notBol: bool): Match =
   (true, int(m.rm_so), int(m.rm_eo))
 
 func fold(re: Regex, c: char): char =
+  ## The character lower-cased under `-i`.
   if re.icase: toLowerAscii(c) else: c
 
 proc execFixed(re: Regex, data: string, start, stop: int, from0: int): Match =

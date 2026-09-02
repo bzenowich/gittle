@@ -97,18 +97,22 @@ const
 # -- big-endian readers -----------------------------------------------------
 
 func be32(b: ptr UncheckedArray[byte], at: int): uint32 {.inline.} =
+  ## A big-endian 32-bit field of a mapped file.
   (uint32(b[at]) shl 24) or (uint32(b[at+1]) shl 16) or
   (uint32(b[at+2]) shl 8) or uint32(b[at+3])
 
 func be64(b: ptr UncheckedArray[byte], at: int): uint64 {.inline.} =
+  ## A big-endian 64-bit field of a mapped file.
   (uint64(be32(b, at)) shl 32) or uint64(be32(b, at + 4))
 
 func oidAtRaw(b: ptr UncheckedArray[byte], at: int): Oid {.inline.} =
+  ## Twenty bytes of a mapped file as an object ID.
   for i in 0 ..< OidLen: result.b[i] = b[at + i]
 
 # -- opening ----------------------------------------------------------------
 
 proc close*(p: Pack) =
+  ## Unmap both files; safe to call twice.
   if p.pack != nil:
     p.packMap.close()
     p.pack = nil
@@ -160,9 +164,12 @@ proc openPack*(idxPath: string): Pack =
 # -- index lookup -----------------------------------------------------------
 
 func oidAt*(p: Pack, i: int): Oid {.inline.} =
+  ## The `i`th object ID of the index, in sorted order.
   oidAtRaw(p.idx, p.oidsAt + i * OidLen)
 
 proc offsetAt*(p: Pack, i: int): int =
+  ## The pack offset of entry `i`: the 32-bit table, or the 64-bit one
+  ## when the high bit says so.
   let v = be32(p.idx, p.ofsAt + i * 4)
   if (v and 0x8000_0000'u32) == 0:
     int(v)
@@ -173,6 +180,7 @@ proc offsetAt*(p: Pack, i: int): int =
     int(be64(p.idx, p.bigOfsAt + big * 8))
 
 func fanout(p: Pack, b: byte): int {.inline.} =
+  ## How many objects have a first byte at or below `b`.
   int(be32(p.idx, fanoutAt + int(b) * 4))
 
 proc find*(p: Pack, o: Oid): int =
@@ -272,9 +280,12 @@ proc inflateEntryAt*(pack: ptr UncheckedArray[byte], packLen: int,
   inflateExact(addr pack[e.dataAt], packLen - e.dataAt, e.size)
 
 proc readEntry*(p: Pack, offset: int): PackEntry =
+  ## The header of the entry at `offset`: its type, size and, for a delta,
+  ## its base.
   readEntryAt(p.pack, p.packLen, offset, p.packPath)
 
 proc inflateEntry(p: Pack, e: PackEntry): string =
+  ## The stored bytes of an entry -- content, or a delta.
   inflateEntryAt(p.pack, p.packLen, e).data
 
 # -- deltas -----------------------------------------------------------------
@@ -399,6 +410,8 @@ const
     ## R3 is about the caches git writes to disk, none of which gittle reads.
 
 proc cacheBase(p: Pack, offset: int, obj: GitObject) =
+  ## Remember a resolved base, bounded in bytes, so a chain of deltas off
+  ## the same object does not re-apply it each time.
   if obj.data.len > baseCacheLimit div 4: return
   if p.baseCache.hasKey(offset): return
   p.baseCache[offset] = obj
@@ -411,6 +424,8 @@ proc cacheBase(p: Pack, offset: int, obj: GitObject) =
 
 proc readAtDepth(p: Pack, offset, depth: int,
                  findExternal: proc (o: Oid): GitObject {.closure.}): GitObject =
+  ## Read an object at `offset`, applying deltas recursively; a base the
+  ## pack lacks comes through `findExternal` (a thin pack, or another pack).
   failIf(depth > maxDeltaDepth, "delta chain too deep in " & p.packPath)
   if depth > 0:
     let hit = p.baseCache.getOrDefault(offset)

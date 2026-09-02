@@ -32,9 +32,6 @@ import ../cli, ../commitobj, ../diffcore, ../ident, ../index, ../mergetree,
        ../objects, ../oid, ../pathspec, ../refs, ../repository, ../revision,
        ../revwalk, ../sequencer, ../util, ../worktree
 
-const usageText = """usage: gittle merge [-m <msg>] [--ff|--no-ff|--ff-only] [--[no-]commit]
-                    [-e|--no-edit] [-s] [-q|-v] <commit>
-   or: gittle merge --abort | --quit | --continue"""
 
 const editTemplate = """
 # Please enter a commit message to explain why this merge is necessary,
@@ -103,56 +100,64 @@ proc commitMerge(repo: Repository, idx: Index, parents: seq[Oid],
   repo.removeState("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE")
 
 proc printStat(repo: Repository, oldTree, newTree: Oid) =
+  ## The diffstat between two trees, as `merge` prints it after a
+  ## fast-forward or a merge commit.
   stdout.write repo.mergeSummary(pairsTreeTree(repo, oldTree, newTree,
                                                parsePathspec(@[])))
   stdout.flushFile()
 
+const
+  synopsis = "[-m <msg>] [--ff|--no-ff|--ff-only] [--[no-]commit] [-e|--no-edit] [-s] [-q|-v] <commit>\n--abort | --quit | --continue"
+  options = [
+    opt("-m|--message", okValue, arg = "<msg>", help = "the merge commit's message"),
+    opt("--ff", help = "fast-forward when possible (the default)"),
+    opt("--no-ff", help = "always make a merge commit"),
+    opt("--ff-only", help = "refuse anything but a fast-forward"),
+    opt("--commit", help = "commit the result (the default)"),
+    opt("--no-commit", help = "stop before committing"),
+    opt("-e|--edit", help = "open the editor on the message"),
+    opt("--no-edit", help = "never open the editor"),
+    opt("-s|--signoff", help = "add a Signed-off-by trailer"),
+    opt("--no-signoff"),
+    opt("-q|--quiet", help = "print no summary"),
+    opt("-v|--verbose", help = "print the summary (the default)"),
+    opt("--abort", help = "undo an unfinished merge"),
+    opt("--quit", help = "forget an unfinished merge, keeping the tree as it is"),
+    opt("--continue", help = "conclude a merge whose conflicts are resolved"),
+    opt("-F|--file|--into-name|--overwrite-ignore|--no-overwrite-ignore|--cleanup|" &
+        "--strategy|-X|--strategy-option|--squash|--no-squash|--log|--no-log|--stat|-n|" &
+        "--no-stat|--compact-summary|--summary|--no-summary|--verify|--no-verify|" &
+        "--verify-signatures|--no-verify-signatures|--autostash|--no-autostash|" &
+        "--allow-unrelated-histories|--progress|--no-progress|--rerere-autoupdate",
+        okRefused, help = "docs/07"),
+  ]
+
 proc cmdMerge*(c: Ctx, argv: seq[string]): int =
-  let args = expandShortOptions(argv, {'m'})
-  var messages: seq[string]
+  ## Entry point: parse, then abort/quit/continue a stopped merge, or
+  ## merge the target: fast-forward when allowed, else the three-way
+  ## merge and a commit unless `--no-commit` or a conflict stops it.
+  let o = parse(options, argv, "merge", synopsis)
   var ff = ffAuto
-  var noCommit = false
-  var forceEdit, noEdit, signoff, quiet = false
-  var abort, quit0, cont = false
-  var targets: seq[string]
-  var i = 0
-  var noMoreOpts = false
-
-  optionValue(args, i)
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-': targets.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-m" or a.startsWith("--message"): messages.add valueFor(a)
-    elif a == "--ff": ff = ffAuto
-    elif a == "--no-ff": ff = ffNever
-    elif a == "--ff-only": ff = ffOnly
-    elif a == "--commit": noCommit = false
-    elif a == "--no-commit": noCommit = true
-    elif a == "-e" or a == "--edit": forceEdit = true
-    elif a == "--no-edit": noEdit = true
-    elif a == "-s" or a == "--signoff": signoff = true
-    elif a == "--no-signoff": signoff = false
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "-v" or a == "--verbose": quiet = false
-    elif a == "--abort": abort = true
-    elif a == "--quit": quit0 = true
-    elif a == "--continue": cont = true
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif a in ["-F", "--file", "--into-name", "--overwrite-ignore",
-               "--no-overwrite-ignore", "--cleanup", "--strategy", "-X",
-               "--strategy-option", "--squash", "--no-squash", "--log",
-               "--no-log", "--stat", "-n", "--no-stat", "--compact-summary",
-               "--summary", "--no-summary", "--verify", "--no-verify",
-               "--verify-signatures", "--no-verify-signatures", "--autostash",
-               "--no-autostash", "--allow-unrelated-histories", "--progress",
-               "--no-progress", "--rerere-autoupdate"]:
-      fail(a & " is out of scope for gittle v1 (docs/07)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
+  var noCommit, signoff, quiet = false
+  for (k, _) in o.occurrences:        # each pair: the last one given wins
+    case k
+    of "ff": ff = ffAuto
+    of "no-ff": ff = ffNever
+    of "ff-only": ff = ffOnly
+    of "commit": noCommit = false
+    of "no-commit": noCommit = true
+    of "signoff": signoff = true
+    of "no-signoff": signoff = false
+    of "quiet": quiet = true
+    of "verbose": quiet = false
+    else: discard
+  let messages = o.vals "message"
+  let forceEdit = o.has "edit"
+  let noEdit = o.has "no-edit"
+  let abort = o.has "abort"
+  let quit0 = o.has "quit"
+  let cont = o.has "continue"
+  let targets = o.args
   let repo = c.repo
   failIf(repo.workTree.len == 0, "merge is not possible in a bare repository")
   let idx = readIndex(repo.indexPath)
@@ -186,7 +191,7 @@ proc cmdMerge*(c: Ctx, argv: seq[string]): int =
     return 0
 
   repo.refuseIfInProgress(idx, "merge")
-  failIf(targets.len == 0, "no commit specified\n" & usageText)
+  failIf(targets.len == 0, "no commit specified\n" & o.use)
   failIf(targets.len > 1,
          "merging more than one commit at a time is out of scope for " &
          "gittle v1 (docs/05 cuts the octopus strategy)")

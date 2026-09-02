@@ -28,9 +28,12 @@ proc exitWith*(code: int) {.noreturn.} =
   cexit(cint(code))
 
 proc fail*(msg: string) {.noreturn.} =
+  ## A fatal error: the message is printed as `gittle: <msg>` and the exit
+  ## status is 128, as git's `die` does.
   raise newException(GittleError, msg)
 
 proc failIf*(cond: bool, msg: string) {.inline.} =
+  ## `fail` when the condition holds.
   if cond: fail(msg)
 
 const cEscapes* = [('\a', 'a'), ('\b', 'b'), ('\f', 'f'), ('\n', 'n'),

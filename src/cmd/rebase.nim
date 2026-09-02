@@ -57,8 +57,6 @@ import ../cli, ../commitobj, ../diffcore, ../ident, ../index, ../objects,
        ../oid, ../pathspec, ../refs, ../repository, ../revision, ../revwalk,
        ../sequencer, ../trees, ../util, ../worktree
 
-const usageText = """usage: gittle rebase [--onto <newbase>] [-q|-v] [<upstream>] [<branch>]
-   or: gittle rebase --continue | --skip | --abort | --quit"""
 
 const heads = refsPrefix & "heads/"
 
@@ -76,6 +74,7 @@ proc todoLine(repo: Repository, oid: Oid, msg: string): string =
   "pick " & $oid & " # " & subject(msg)
 
 func todoOid(line: string): string =
+  ## The object ID field of a `git-rebase-todo` line.
   let f = line.splitWhitespace
   if f.len >= 2: f[1] else: ""
 
@@ -86,6 +85,8 @@ func todoRest(line: string): string =
   if f.len >= 3: f[2 .. ^1].join(" ") else: ""
 
 proc readState(repo: Repository): State =
+  ## Read `rebase-merge/` back: which branch is being moved, onto what,
+  ## and what is done and still to do.
   result.headName = repo.readState(rebaseDir / "head-name").strip()
   result.onto = repo.stateOid(rebaseDir / "onto")
   result.origHead = repo.stateOid(rebaseDir / "orig-head")
@@ -119,14 +120,10 @@ proc finish(repo: Repository, st: State, quiet: bool): int =
   0
 
 proc conflictAdvice(repo: Repository) =
+  ## The `hint:` block git prints when a pick stops on a conflict.
   if not repo.cfg.getBool("advice.mergeConflict", true): return
-  stderr.write "hint: Resolve all conflicts manually, mark them as resolved with\n" &
-    "hint: \"gittle add/rm <conflicted_files>\", then run \"gittle rebase --continue\".\n" &
-    "hint: You can instead skip this commit: run \"gittle rebase --skip\".\n" &
-    "hint: To abort and get back to the state before \"gittle rebase\", run " &
-    "\"gittle rebase --abort\".\n" &
-    "hint: Disable this message with \"gittle config set " &
-    "advice.mergeConflict false\"\n"
+  stderr.write "hint: fix the conflicts and \"gittle add\" them, then \"gittle " &
+               "rebase --continue\"; or --skip this commit, or --abort\n"
 
 proc stopHere(repo: Repository, st: State, pick: Oid, line: string,
               msg: string, author: Ident) =
@@ -196,46 +193,42 @@ proc replay(c: Ctx, st0: State, quiet, verbose: bool): int =
                               "rebase (pick): " & subject(cm.message))
   repo.finish(st, quiet)
 
+const
+  synopsis = "[--onto <newbase>] [-q|-v] [<upstream>] [<branch>]\n--continue | --skip | --abort | --quit"
+  options = [
+    opt("--onto", okValue, arg = "<newbase>", help = "replay onto this commit rather than <upstream>"),
+    opt("-q|--quiet", help = "say nothing"),
+    opt("-v|--verbose", help = "report each step"),
+    opt("--continue", help = "go on after resolving conflicts"),
+    opt("--skip", help = "drop the current commit and go on"),
+    opt("--abort", help = "undo the rebase entirely"),
+    opt("--quit", help = "forget the rebase, keeping the tree as it is"),
+    opt("-i|--interactive|-r|--rebase-merges|-x|--exec|--autosquash|--no-autosquash|" &
+        "--autostash|--no-autostash|--update-refs|--no-update-refs|--keep-base|--root|" &
+        "--fork-point|--no-fork-point|-m|--merge|--apply|-s|--strategy|-X|--strategy-option|" &
+        "--ignore-whitespace|--whitespace|--empty|--keep-empty|--no-keep-empty|" &
+        "--reapply-cherry-picks|--no-reapply-cherry-picks|--no-ff|--force-rebase|-f|" &
+        "--edit-todo|--show-current-patch|--committer-date-is-author-date|--ignore-date|" &
+        "--reset-author-date|--signoff|--trailer|-S|--gpg-sign|--no-gpg-sign|--verify|" &
+        "--no-verify|--stat|-n|--no-stat|--rerere-autoupdate|--no-rerere-autoupdate",
+        okRefused, help = "docs/08"),
+  ]
+
 proc cmdRebase*(c: Ctx, argv: seq[string]): int =
-  let args = expandShortOptions(argv, {})
-  var onto = ""
+  ## Entry point: parse, then continue/skip/abort/quit a stopped rebase,
+  ## or start one: detach at `onto`, pick each commit, put the branch
+  ## back.
+  let o = parse(options, argv, "rebase", synopsis)
   var quiet, verbose = false
-  var cont, skip, abort, quit0 = false
-  var rest: seq[string]
-  var i = 0
-
-  optionValue(args, i)
-  while i < args.len:
-    let a = args[i]
-    if a.len == 0 or a[0] != '-': rest.add a
-    elif a == "--onto" or a.startsWith("--onto="): onto = valueFor(a)
-    elif a == "-q" or a == "--quiet": (quiet = true; verbose = false)
-    elif a == "-v" or a == "--verbose": (verbose = true; quiet = false)
-    elif a == "--continue": cont = true
-    elif a == "--skip": skip = true
-    elif a == "--abort": abort = true
-    elif a == "--quit": quit0 = true
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif a in ["-i", "--interactive", "-r", "--rebase-merges", "-x", "--exec",
-               "--autosquash", "--no-autosquash", "--autostash",
-               "--no-autostash", "--update-refs", "--no-update-refs",
-               "--keep-base", "--root", "--fork-point", "--no-fork-point",
-               "-m", "--merge", "--apply", "-s", "--strategy", "-X",
-               "--strategy-option", "--ignore-whitespace", "--whitespace",
-               "--empty", "--keep-empty", "--no-keep-empty",
-               "--reapply-cherry-picks", "--no-reapply-cherry-picks",
-               "--no-ff", "--force-rebase", "-f", "--edit-todo",
-               "--show-current-patch", "--committer-date-is-author-date",
-               "--ignore-date", "--reset-author-date", "--signoff",
-               "--trailer", "-S", "--gpg-sign", "--no-gpg-sign", "--verify",
-               "--no-verify", "--stat", "-n", "--no-stat",
-               "--rerere-autoupdate", "--no-rerere-autoupdate"]:
-      fail(a & " is out of scope for gittle v1 (docs/08)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
+  for (k, _) in o.occurrences:
+    if k == "quiet": (quiet = true; verbose = false)
+    elif k == "verbose": (verbose = true; quiet = false)
+  let onto = o.val "onto"
+  let cont = o.has "continue"
+  let skip = o.has "skip"
+  let abort = o.has "abort"
+  let quit0 = o.has "quit"
+  let rest = o.args
   let repo = c.repo
   failIf(repo.workTree.len == 0, "rebase is not possible in a bare repository")
   let idx = readIndex(repo.indexPath)

@@ -41,21 +41,25 @@ type
     members: HashSet[Oid]   ## what is going out at all
 
 proc put(w: var Writer, data: string) =
+  ## Write bytes to the pack: through the running checksum and out.
   if data.len == 0: return
   w.ctx.update(data)
   w.written += data.len
   w.sink(data)
 
 func be32str(v: uint32): string =
+  ## A 32-bit field, big-endian, as four bytes.
   result = newString(4)
   for i in 0 .. 3: result[i] = char((v shr ((3 - i) * 8)) and 0xFF)
 
 proc emit(w: var Writer, repo: Repository, o: Oid, depth: int) =
+  ## Write one object, once: a stored delta is copied through as a
+  ## `ref-delta` after its base (R2), anything else goes whole.
   if w.at.hasKey(o): return
   failIf(depth > 100, "delta chain too deep while writing a pack")
 
   # Reuse, if the object is already a delta here and its base is going too.
-  let (pack, offset) = repo.findPackedAt(o)
+  let (pack, offset) = repo.findPacked(o)
   if pack != nil:
     let d = pack.storedDelta(offset)
     if d.raw.len > 0 and d.base in w.members:

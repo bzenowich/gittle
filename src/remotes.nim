@@ -116,6 +116,7 @@ proc summaryColumn*(repo: Repository, oids: openArray[Oid]): int =
 # ---------------------------------------------------------------------------
 
 proc remoteNames*(repo: Repository): seq[string] =
+  ## Every remote the config names, in the order their keys appear.
   for e in repo.cfg.withPrefix("remote"):
     let rest = e.key[len("remote.") .. ^1]
     let dot = rest.rfind('.')
@@ -261,6 +262,7 @@ proc displayRefUpdate(d: var Display, code: char, summary, error,
   d.buffered.add (code, summary, error, remote, local)
 
 proc flush(d: var Display, rejected: bool) =
+  ## Print the buffered report lines with the column widths now known.
   for b in d.buffered:
     d.emitRefUpdate((if rejected: 0 else: d.summaryWidth),
                     b.code, b.summary, b.error, b.remote, b.local)
@@ -288,11 +290,18 @@ proc fetchHeadNote(name, url: string): string =
 # The operation
 # ---------------------------------------------------------------------------
 
-proc receivePack(repo: Repository, conn: Conn, wants, haves: seq[Oid],
-                 includeTag, quiet: bool) =
+proc receivePack*(repo: Repository, conn: Conn, wants, haves: seq[Oid],
+                  includeTag, quiet: bool, thin = true): Oid =
   ## Take the packfile, and put it in the object store only if it survives
   ## every check.  The temporary lives in `objects/pack/` so that the rename
-  ## that installs it never crosses a filesystem.
+  ## that installs it never crosses a filesystem.  Returns the name of the
+  ## pack installed -- its own checksum -- or the null ID when nothing new
+  ## arrived.
+  ##
+  ## `thin` is the one thing `gc` asks for differently (docs/minimize.md
+  ## §3.4): a fetch takes a thin pack and appends the bases it is missing,
+  ## while `gc` wants the file the server sends to stand on its own, so
+  ## that no base is copied out of the pack it is about to keep.
   let dir = repo.objDirs[0] / "pack"
   createDir(dir)
   let tmp = dir / ("tmp_gittle_" & $getCurrentProcessId() & ".pack")
@@ -300,7 +309,7 @@ proc receivePack(repo: Repository, conn: Conn, wants, haves: seq[Oid],
   failIf(not open(f, tmp, fmWrite), "cannot create '" & tmp & "'")
   var bytes = 0
   try:
-    conn.fetchPack(wants, haves, thin = true, includeTag = includeTag,
+    conn.fetchPack(wants, haves, thin = thin, includeTag = includeTag,
                    quiet = quiet,
                    sink = proc (data: string) =
                      if data.len > 0:
@@ -312,8 +321,8 @@ proc receivePack(repo: Repository, conn: Conn, wants, haves: seq[Oid],
     f.close()
   if bytes == 0:
     removeFile(tmp)
-    return
-  let r = installPack(repo, tmp, fixThin = true)
+    return nullOid
+  let r = installPack(repo, tmp, fixThin = thin)
   repo.reopenPacks()
   if r.nObjects == 0:
     # Nothing new after all; an empty pack in the object store is a file every
@@ -322,6 +331,8 @@ proc receivePack(repo: Repository, conn: Conn, wants, haves: seq[Oid],
     removeFile(base & ".pack")
     removeFile(base & ".idx")
     repo.reopenPacks()
+    return nullOid
+  r.hash
 
 proc negotiationHaves(repo: Repository): seq[Oid] =
   ## What to offer as already present: the tip of every local ref, newest
@@ -427,9 +438,9 @@ proc fetchFrom*(repo: Repository, rem: Remote, opt: FetchOpts):
     # Progress is asked for only when there is a terminal to draw it on, which
     # is what makes a scripted fetch silent; git decides the same way and
     # `--progress`, which overrides it, is cut (docs/03).
-    receivePack(repo, conn, wants, negotiationHaves(repo),
-                includeTag = not opt.noTags,
-                quiet = opt.quiet or isatty(2) == 0)
+    discard receivePack(repo, conn, wants, negotiationHaves(repo),
+                        includeTag = not opt.noTags,
+                        quiet = opt.quiet or isatty(2) == 0)
     var tips: seq[Oid]
     for w in wants: tips.add w
     checkConnected(repo, tips)
@@ -539,11 +550,15 @@ proc fetchFrom*(repo: Repository, rem: Remote, opt: FetchOpts):
 
   # ---- FETCH_HEAD -----------------------------------------------------
   if opt.writeFetchHead:
+    # Merge candidates first, then the rest: that is what lets `FETCH_HEAD`
+    # be used as a revision naming the thing to merge, which is how `pull`
+    # reads it (`builtin/fetch.c:store_updated_refs`).
     var text: string
-    for e in map:
-      if not e.fetchHead: continue
-      text.add $e.remote.oid & "\t" & (if e.merge: "" else: "not-for-merge") &
-               "\t" & fetchHeadNote(e.remote.name, d.url) & "\n"
+    for wantMerge in [true, false]:
+      for e in map:
+        if not e.fetchHead or e.merge != wantMerge: continue
+        text.add $e.remote.oid & "\t" & (if e.merge: "" else: "not-for-merge") &
+                 "\t" & fetchHeadNote(e.remote.name, d.url) & "\n"
     writeFile(repo.gitDir / "FETCH_HEAD", text)
 
   result.failed = failed

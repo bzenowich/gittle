@@ -67,6 +67,7 @@ proc flatten*(repo: Repository, tree: Oid): TreeMap =
       result[e.name] = Version(mode: canonMode(e.mode), oid: e.oid)
 
 proc versionOf*(idx: Index, path: string): Version =
+  ## What the index holds for a path, or nothing.
   let k = idx.find(path)
   if k >= 0: Version(mode: canonMode(idx.entries[k].mode), oid: idx.entries[k].oid)
   else: Version()
@@ -216,18 +217,6 @@ proc applyPlan*(repo: Repository, idx: Index, plan: Plan, newTree: TreeMap,
       continue
     repo.writeWorkingPath(path, v)
     repo.applyToIndex(idx, path, v)
-
-proc refusedPlumbing*(plan: Plan): bool =
-  ## The same three refusals in `unpack-trees`' *plumbing* words, which are not
-  ## the porcelain ones: `read-tree` is a script's tool and names the one entry
-  ## that stopped it, where `checkout` groups them under an explanation and
-  ## some advice.
-  for (paths, text) in [(plan.staged, "Entry '$1' would be overwritten by merge. Cannot merge."),
-                        (plan.modified, "Entry '$1' not uptodate. Cannot merge."),
-                        (plan.untracked, "Untracked working tree file '$1' would be overwritten by merge.")]:
-    for p in paths:
-      result = true
-      stderr.write "error: " & text.replace("$1", p) & "\n"
 
 proc refused*(plan: Plan, verb: string): bool =
   ## The refusals, in git's words (`unpack-trees.c` carries one message per

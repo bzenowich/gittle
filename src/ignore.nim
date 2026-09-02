@@ -122,6 +122,8 @@ func trimTrailingSpaces(line: string): string =
   if lastSpace >= 0: line[0 ..< lastSpace] else: line
 
 proc parsePattern(raw: string): Pattern =
+  ## One `.gitignore` line into a pattern: the `!`, the trailing `/`, the
+  ## anchoring slash, and the escapes.
   var p = raw
   if p.len > 0 and p[0] == '!':
     result.negated = true
@@ -135,6 +137,8 @@ proc parsePattern(raw: string): Pattern =
   result.pat = p
 
 proc readPatternList(path, base, src: string): PatternList =
+  ## Every pattern in one file, with the directory it is relative to and a
+  ## name for `check-ignore -v` to report.
   result.base = base
   result.src = src
   if not fileExists(path): return
@@ -276,4 +280,5 @@ proc decide*(ig: Ignore, path: string, isDir: bool): Decision =
   ig.lastMatch(path, isDir)
 
 proc isIgnored*(ig: Ignore, path: string, isDir: bool): bool =
+  ## Is the path ignored?  `decide` says by which pattern.
   ig.decide(path, isDir).ignored

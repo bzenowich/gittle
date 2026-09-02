@@ -49,14 +49,10 @@ proc readGitLink(path: string): string =
   failIf(target.len == 0, "invalid gitfile format: " & path)
   if isAbsolute(target): target else: parentDir(path) / target
 
-proc ceilings(): seq[string] =
-  for p in getEnv("GIT_CEILING_DIRECTORIES").split(':'):
-    if p.len > 0: result.add p.normalizedPath
-
 proc discoverGitDir(startDir: string): tuple[gitDir, workTree: string] =
   ## Walk up looking for `.git`, or for a bare repository at the directory
-  ## itself.  Stops at the filesystem root or a GIT_CEILING_DIRECTORIES entry.
-  let stops = ceilings()
+  ## itself, stopping at the filesystem root.  (`GIT_CEILING_DIRECTORIES`
+  ## went in the minimization pass: nothing set it.)
   var dir = absolutePath(startDir).normalizedPath
   while true:
     let dotGit = dir / ".git"
@@ -71,7 +67,6 @@ proc discoverGitDir(startDir: string): tuple[gitDir, workTree: string] =
       return (dir, "")
     let parent = parentDir(dir)
     if parent.len == 0 or parent == dir: break
-    if parent in stops: break
     dir = parent
   fail("not a git repository (or any of the parent directories): .git")
 
@@ -106,6 +101,8 @@ const
     ## `git config --worktree`.
 
 proc gateRefusal(key, value, why: string): string =
+  ## The message the extension gate refuses with: what was found and what
+  ## to do about it (plan.md §6.1).
   "cannot operate on this repository\n  " & key & " = " & value & "\n  " & why
 
 proc checkExtensions(r: Repository) =
@@ -136,9 +133,12 @@ proc checkExtensions(r: Repository) =
 # -- opening ----------------------------------------------------------------
 
 proc loadObjDirs(r: Repository) =
-  r.objDirs = @[getEnv("GIT_OBJECT_DIRECTORY", r.commonDir / "objects")]
-  for p in getEnv("GIT_ALTERNATE_OBJECT_DIRECTORIES").split(':'):
-    if p.len > 0: r.objDirs.add p
+  ## The object directories: this repository's, then any alternates named
+  ## in `objects/info/alternates` -- which a `git clone --shared` writes, so
+  ## a repository git made that way still opens.  (The two environment
+  ## variables git also reads went in the minimization pass: nothing set
+  ## them.)
+  r.objDirs = @[r.commonDir / "objects"]
   # objects/info/alternates: one directory per line, relative to objects/.
   let altFile = r.objDirs[0] / "info" / "alternates"
   if fileExists(altFile):
@@ -203,6 +203,7 @@ proc openRepository*(gitDirOpt, workTreeOpt, startDir: string,
 # -- object lookup ----------------------------------------------------------
 
 proc loadPacks(r: Repository) =
+  ## Open every pack in every object directory, once, on first need.
   if r.packsLoaded: return
   r.packsLoaded = true
   for objDir in r.objDirs:
@@ -225,26 +226,23 @@ proc reopenPacks*(r: Repository) =
   r.packs.setLen(0)
   r.packsLoaded = false
 
-proc findPacked(r: Repository, o: Oid): tuple[pack: Pack, offset: int] =
+proc findPacked*(r: Repository, o: Oid): tuple[pack: Pack, offset: int] =
+  ## Which pack holds the object, and where in it; `(nil, 0)` if none.
   r.loadPacks()
   for p in r.packs:
     let i = p.find(o)
     if i >= 0: return (p, p.offsetAt(i))
   (nil, 0)
 
-proc findPackedAt*(r: Repository, o: Oid): tuple[pack: Pack, offset: int] =
-  ## Where an object lies packed, if it does.  Only `pack-objects` needs this:
-  ## reusing a delta means reading the bytes as *stored*, which every other
-  ## caller is deliberately insulated from.
-  r.findPacked(o)
-
 proc findLoose(r: Repository, o: Oid): string =
+  ## The loose file holding the object, or the empty string.
   for d in r.objDirs:
     let p = loosePath(d, o)
     if fileExists(p): return p
   ""
 
 proc hasObject*(r: Repository, o: Oid): bool =
+  ## Is the object anywhere, loose or packed?
   r.findLoose(o).len > 0 or r.findPacked(o).pack != nil
 
 proc readObject*(r: Repository, o: Oid): GitObject =
@@ -345,6 +343,15 @@ proc headerField*(data, name: string): string =
     if eol < 0: break
     i = eol + 1
   ""
+
+proc peelTags*(r: Repository, start: Oid): Oid =
+  ## Follow tag objects to whatever they point at; anything else comes back
+  ## as it is.  `peelTo` wants a particular type; this wants "not a tag".
+  result = start
+  for _ in 0 .. 15:
+    if r.objectInfo(result).kind != otTag: return
+    result = parseOid(headerField(r.readObject(result).data, "object"))
+  fail($start & ": tag chain too deep")
 
 proc peelTo*(r: Repository, start: Oid, want: ObjectType):
     tuple[oid: Oid, obj: GitObject] =

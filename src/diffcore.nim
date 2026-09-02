@@ -40,8 +40,8 @@
 ## family; `log`/`show` print a merge commit with no diff at all, which is what
 ## `--diff-merges=off` does and what git did by default before 1.5.
 
-import std/[os, posix, strutils, algorithm]
-import diff, index, objects, oid, pathspec, repository, trees, util
+import std/[os, posix, strutils, algorithm, unicode]
+import cli, diff, index, objects, oid, pathspec, repository, trees, util
 
 type
   DiffFormat* = enum
@@ -77,9 +77,12 @@ type
     unmerged*: bool            ## the index holds stages here, not one entry
 
 func oldName(p: DiffPair): string =
+  ## The path on the old side: only `--no-index` names the two apart.
   if p.oldPath.len > 0: p.oldPath else: p.path
 
 func defaultDiffOpts*(): DiffOpts =
+  ## The options with nothing given: three lines of context, exact
+  ## whitespace, an automatic abbreviation width.
   DiffOpts(ctxLen: 3, ws: wsExact, abbrev: 0)
 
 func status*(p: DiffPair): char =
@@ -101,33 +104,42 @@ func status*(p: DiffPair): char =
 # Option parsing, shared by diff, log and show
 # ---------------------------------------------------------------------------
 
-const diffDeferred = [
-  "-M", "--find-renames", "-C", "--find-copies", "--find-copies-harder",
-  "-B", "--break-rewrites", "-D", "--irreversible-delete",
-  "--diff-algorithm", "--minimal", "--patience", "--histogram", "--anchored",
-  "--indent-heuristic", "--no-indent-heuristic",
-  "-c", "--cc", "--dd", "--diff-merges", "--remerge-diff", "--combined-all-paths",
-  "--word-diff", "--color-words", "--word-diff-regex", "--color-moved",
-  "--dirstat", "-X", "--cumulative", "--compact-summary", "--summary",
-  "--binary", "--check", "--ws-error-highlight", "--ignore-blank-lines",
-  "-I", "--ignore-matching-lines", "--function-context", "-W",
-  "--inter-hunk-context", "--src-prefix", "--dst-prefix", "--default-prefix",
-  "--relative", "--no-relative", "--textconv", "--no-textconv",
-  "--ext-diff", "--no-ext-diff", "--submodule", "--ignore-submodules",
-  "-G", "--pickaxe-regex", "--pickaxe-all", "--find-object",
-  "-O", "--skip-to", "--rotate-to", "--output", "--line-prefix",
-  "--ita-invisible-in-index", "--no-renames", "--rename-empty",
-  "-t", "--patch-with-raw", "--patch-with-stat", "--no-stat"]
-  ## Everything in docs/03 that gittle does not implement, so each refuses by
-  ## name instead of being silently ignored.  `--no-renames` is in the list
-  ## because gittle never detects renames: accepting the flag would imply the
-  ## other setting exists.
-
-proc checkDiffDeferred(a: string) =
-  let name = if a.contains('='): a[0 ..< a.find('=')] else: a
-  for n in diffDeferred:
-    if n == name:
-      fail(a & " is out of scope for gittle v1 (docs/03)")
+const diffOptions* = [
+  ## docs/03: the `diff-options` family that `diff`, `log` and `show` share.
+  ## A command concatenates this with its own table and hands the parse to
+  ## `applyDiffOpts`.
+  opt("-p|-u|--patch", help = "the patch (the default)"),
+  opt("-s|--no-patch", help = "no patch; cancels every format given before it"),
+  opt("--raw", help = "the raw format"),
+  opt("--stat", okOptValue, arg = "[=<width>]", help = "the diffstat"),
+  opt("--numstat", help = "added and deleted line counts per file"),
+  opt("--shortstat", help = "the diffstat's last line only"),
+  opt("--name-only", help = "changed paths"),
+  opt("--name-status", help = "changed paths with their status letter"),
+  opt("--full-index", help = "full object IDs on the index line"),
+  opt("--no-prefix", help = "no a/ and b/ on the paths"),
+  opt("-a|--text", help = "never call a file binary"),
+  opt("-R", help = "swap the two sides"),
+  opt("-z", help = "NUL after each path"),
+  opt("--exit-code", help = "exit 1 when there were differences"),
+  opt("--quiet", help = "no output; implies --exit-code"),
+  opt("-w|--ignore-all-space", help = "ignore whitespace entirely"),
+  opt("-b|--ignore-space-change", help = "ignore changes in the amount of whitespace"),
+  opt("--ignore-space-at-eol", help = "ignore whitespace at the end of a line"),
+  opt("--ignore-cr-at-eol", help = "ignore a carriage return at the end of a line"),
+  opt("-U|--unified", okValue, arg = "<n>", help = "lines of context"),
+  opt("--diff-filter", okValue, arg = "<letters>", help = "only these kinds of change: A D M T"),
+  opt("-S", okValue, arg = "<string>", help = "changes that add or remove the string"),
+  opt("--abbrev", okValue, arg = "<n>", help = "abbreviate object IDs to <n> digits"),
+  opt("--color", okOptValue, arg = "[=<when>]", help = "colour: always, never or auto"),
+  opt("--no-color"),
+  # Everything in docs/03 that gittle does not implement, so each refuses by
+  # name instead of being silently ignored.  `--no-renames` is in the list
+  # because gittle never detects renames: accepting the flag would imply the
+  # other setting exists.
+  opt("-M|--find-renames|-C|--find-copies|--find-copies-harder|-B|--break-rewrites|-D|--irreversible-delete|--diff-algorithm|--minimal|--patience|--histogram|--anchored|--indent-heuristic|--no-indent-heuristic|-c|--cc|--dd|--diff-merges|--remerge-diff|--combined-all-paths|--word-diff|--color-words|--word-diff-regex|--color-moved|--dirstat|-X|--cumulative|--compact-summary|--summary|--binary|--check|--ws-error-highlight|--ignore-blank-lines|-I|--ignore-matching-lines|--function-context|-W|--inter-hunk-context|--src-prefix|--dst-prefix|--default-prefix|--relative|--no-relative|--textconv|--no-textconv|--ext-diff|--no-ext-diff|--submodule|--ignore-submodules|-G|--pickaxe-regex|--pickaxe-all|--find-object|-O|--skip-to|--rotate-to|--output|--line-prefix|--ita-invisible-in-index|--no-renames|--rename-empty|-t|--patch-with-raw|--patch-with-stat|--no-stat",
+      okRefused, help = "docs/03"),
+]
 
 proc checkDiffOpts*(o: DiffOpts) =
   ## The one combination git rejects rather than resolving, checked where git
@@ -138,76 +150,66 @@ proc checkDiffOpts*(o: DiffOpts) =
          ({dfNameOnly, dfNameStatus} * o.formats).card > 0,
          "options '--name-only', '--name-status' and '-s' cannot be used together")
 
-proc parseDiffOpt*(a: string, o: var DiffOpts,
-                   valueFor: proc (a, dflt: string): string): bool =
-  ## Consume one option from the shared `diff-options` family, or say it is
-  ## not one of ours.  `diff`, `log` and `show` all call this first and then
-  ## parse only what is genuinely theirs.
-  checkDiffDeferred(a)
-  case a
-  of "-p", "-u", "--patch":
-    # `-p` after `-s` turns the patch back on: git's `enable_patch_output`
-    # clears `DIFF_FORMAT_NO_OUTPUT` before setting the patch bit, so the two
-    # are order-sensitive and `-s -p` prints a patch where `-p -s` does not.
-    o.formats.excl dfNone
-    o.formats.incl dfPatch
-  of "-s", "--no-patch":
-    # An *assignment*, not a suppression: git's `-s` is
-    # `options->output_format = DIFF_FORMAT_NO_OUTPUT`, which wipes whatever
-    # came before it.  So `--stat -s` prints nothing and `-s --stat` prints a
-    # stat, and the order is the whole difference.
-    o.formats = {dfNone}
-  of "--raw": o.formats.incl dfRaw
-  of "--numstat": o.formats.incl dfNumstat
-  of "--shortstat": o.formats.incl dfShortstat
-  of "--name-only": o.formats.incl dfNameOnly
-  of "--name-status": o.formats.incl dfNameStatus
-  of "--full-index": o.fullIndex = true
-  of "--no-prefix": o.noPrefix = true
-  of "-a", "--text": o.text = true
-  of "-R": o.reverse = true
-  of "-z": o.nulTerminate = true
-  of "--exit-code": o.exitCode = true
-  of "--quiet":
-    o.quiet = true
-    o.exitCode = true
-    o.formats = {dfNone}
-  of "-w", "--ignore-all-space": o.ws = wsIgnoreAll
-  of "-b", "--ignore-space-change": o.ws = wsIgnoreChange
-  of "--ignore-space-at-eol": o.ws = wsIgnoreEol
-  of "--ignore-cr-at-eol": o.ws = wsIgnoreCr
-  of "--no-color": o.color = false
-  else:
-    if a.startsWith("--stat"):
+proc applyDiffOpts*(p: Opts, o: var DiffOpts) =
+  ## Replay the diff options in command-line order.  The order matters for
+  ## one pair: `-s` is an *assignment* -- git's
+  ## `options->output_format = DIFF_FORMAT_NO_OUTPUT` -- which wipes whatever
+  ## came before it, and `-p` after it turns the patch back on
+  ## (`enable_patch_output` clears the bit first).  So `--stat -s` prints
+  ## nothing and `-s --stat` prints a stat.
+  for (k, v) in p.occurrences:
+    case k
+    of "patch": (o.formats.excl dfNone; o.formats.incl dfPatch)
+    of "no-patch": o.formats = {dfNone}
+    of "raw": o.formats.incl dfRaw
+    of "stat":
       o.formats.incl dfStat
       # `--stat=<width>[,<name-width>[,<count>]]`; only the total width is in
       # scope, and the rest is refused rather than accepted and ignored.
-      if a.len > 6 and a[6] == '=':
-        let parts = a[7 .. ^1].split(',')
+      if v.len > 0:
+        let parts = v.split(',')
         failIf(parts.len > 1,
                "--stat=<width>,<name-width> is out of scope for gittle v1")
         o.statWidth = parseInt(parts[0])
-    elif a.startsWith("--unified"): o.ctxLen = parseInt(valueFor(a, ""))
-    elif a.len > 2 and a[0] == '-' and a[1] == 'U': o.ctxLen = parseInt(a[2 .. ^1])
-    elif a.startsWith("--diff-filter"):
-      o.filter = valueFor(a, "").toUpperAscii
+    of "numstat": o.formats.incl dfNumstat
+    of "shortstat": o.formats.incl dfShortstat
+    of "name-only": o.formats.incl dfNameOnly
+    of "name-status": o.formats.incl dfNameStatus
+    of "full-index": o.fullIndex = true
+    of "no-prefix": o.noPrefix = true
+    of "text": o.text = true
+    of "R": o.reverse = true
+    of "z": o.nulTerminate = true
+    of "exit-code": o.exitCode = true
+    of "quiet":
+      o.quiet = true
+      o.exitCode = true
+      o.formats = {dfNone}
+    of "ignore-all-space": o.ws = wsIgnoreAll
+    of "ignore-space-change": o.ws = wsIgnoreChange
+    of "ignore-space-at-eol": o.ws = wsIgnoreEol
+    of "ignore-cr-at-eol": o.ws = wsIgnoreCr
+    of "unified":
+      # `-U<n>` implies the patch (`diff.c`: `--unified` sets DIFF_FORMAT_PATCH).
+      o.ctxLen = parseInt(v)
+      o.formats.incl dfPatch
+    of "diff-filter":
+      o.filter = v.toUpperAscii
       for c in o.filter:
         failIf(c notin {'A', 'D', 'M', 'T', '*'},
                "unsupported --diff-filter character '" & c &
                "'\n  gittle detects no renames or copies, so only A, D, M " &
                "and T can occur")
-    elif a.startsWith("-S"): o.pickaxe = (if a.len > 2: a[2 .. ^1] else: valueFor(a, ""))
-    elif a.startsWith("--abbrev"): o.abbrev = parseInt(valueFor(a, ""))
-    elif a.startsWith("--color"):
-      let w = if a.contains('='): a[a.find('=') + 1 .. ^1] else: "always"
-      o.color = case w
+    of "S": o.pickaxe = v
+    of "abbrev": o.abbrev = parseInt(v)
+    of "no-color": o.color = false
+    of "color":
+      o.color = case (if v.len == 0: "always" else: v)
         of "always": true
         of "never": false
         of "auto": isatty(stdout.getFileHandle()) != 0
-        else: fail("invalid --color argument: " & w)
-    else:
-      return false
-  true
+        else: fail("invalid --color argument: " & v)
+    else: discard
 
 # ---------------------------------------------------------------------------
 # The four sources of pairs
@@ -311,17 +313,21 @@ proc join(old, new: seq[FileEntry]): seq[DiffPair] =
     result.add p
 
 proc pairsTreeTree*(repo: Repository, a, b: Oid, ps: Pathspec): seq[DiffPair] =
+  ## The pairs between two trees (`diff A B`).
   join(listTree(repo, a, ps), listTree(repo, b, ps))
 
 proc pairsTreeIndex*(repo: Repository, tree: Oid, idx: Index,
                      ps: Pathspec): seq[DiffPair] =
+  ## The pairs between a tree and the index (`diff --cached`).
   join(listTree(repo, tree, ps), listIndex(idx, ps, withUnmerged = true))
 
 proc pairsIndexWork*(repo: Repository, idx: Index, ps: Pathspec): seq[DiffPair] =
+  ## The pairs between the index and the working tree (plain `diff`).
   join(listIndex(idx, ps), listWorkTree(repo, idx, ps))
 
 proc pairsTreeWork*(repo: Repository, tree: Oid, idx: Index,
                     ps: Pathspec): seq[DiffPair] =
+  ## The pairs between a tree and the working tree (`diff <commit>`).
   join(listTree(repo, tree, ps), listWorkTree(repo, idx, ps))
 
 # ---------------------------------------------------------------------------
@@ -338,11 +344,13 @@ proc fileText(repo: Repository, path: string): string =
   readWorkingFile(full, st)
 
 proc oldText(repo: Repository, p: DiffPair): string =
+  ## The old side's content: nothing, a file, or a blob.
   if p.oldMode == 0: ""
   elif p.oldFromWork: repo.fileText(p.oldName)
   else: repo.readObject(p.oldOid).data
 
 proc newText(repo: Repository, p: DiffPair): string =
+  ## The new side's content: nothing, a file, or a blob.
   if p.newMode == 0: ""
   elif p.newFromWork: repo.fileText(p.path)
   else: repo.readObject(p.newOid).data
@@ -376,6 +384,7 @@ proc changed*(repo: Repository, p: DiffPair): bool =
 # ---------------------------------------------------------------------------
 
 func countOccurrences(hay, needle: string): int =
+  ## How many times `needle` occurs in `hay`, for `-S`.
   if needle.len == 0: return 0
   var i = 0
   while true:
@@ -463,6 +472,7 @@ proc writePatch(repo: Repository, p0: DiffPair, o: DiffOpts, out0: var string) =
   let bPre = if o.noPrefix: "" elif o.reverse: "a/" else: "b/"
 
   template meta(s: string) =
+    ## One header line, coloured when colour is on.
     if o.color: out0.add colMeta & s & colReset & "\n" else: out0.add s & "\n"
 
   meta "diff --git " & quoteTwo(aPre, p.oldName) & " " & quoteTwo(bPre, p.path)
@@ -562,29 +572,6 @@ proc splitTypeChange(pairs: seq[DiffPair]): seq[DiffPair] =
                           newMode: p.newMode, newOid: p.newOid,
                           newValid: p.newValid, newFromWork: p.newFromWork)
 
-func displayWidth(s: string): int =
-  ## How wide a path prints.  git uses `utf8_strwidth`, which consults a
-  ## wcwidth table so that an East Asian character counts two columns; gittle
-  ## counts *characters*, which agrees for every ASCII path and can leave a
-  ## diffstat bar a column out for one that is not.  The table is several
-  ## hundred lines and the stat bar is decoration.
-  for c in s:
-    if (byte(c) and 0xC0'u8) != 0x80'u8: inc result
-
-func decimalWidth(n: int): int =
-  result = 1
-  var v = n
-  while v >= 10:
-    v = v div 10
-    inc result
-
-func scaleLinear(it, width, maxChange: int): int =
-  ## git's `diff.c:scale_linear`.  The `1 +` and the `width - 1` together
-  ## guarantee that any change at all shows at least one character, which is
-  ## the point: a one-line change to a file in a commit that rewrote another
-  ## must not scale to nothing.
-  if it == 0: 0 else: 1 + (it * (width - 1) div maxChange)
-
 func summaryLine(files, insertions, deletions: int): string =
   ## ` N files changed, X insertions(+), Y deletions(-)`, with git's three
   ## rules: the singular forms, `0 files changed` on its own, and a zero count
@@ -602,108 +589,69 @@ func summaryLine(files, insertions, deletions: int): string =
 
 proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
                out0: var string) =
-  ## The histogram (`diff.c:show_stats`), which is mostly column arithmetic.
+  ## `--stat`: one line per file -- the name, the number of changed lines,
+  ## and a bar of `+` and `-` scaled so the widest fits the line.
   ##
-  ## The widths: the total is 80 unless `--stat=<n>` says otherwise (git asks
-  ## the terminal, but gittle never writes a diffstat to one without being
-  ## piped somewhere in the tests, and 80 is what git falls back to). The name
-  ## gets what it needs and the bar gets the rest, and when they do not both
-  ## fit the name is capped at 5/8 of the width and the bar at 3/8.
+  ## git fits the *name* column too, truncating a long path from the left
+  ## to `...`, and lets `--stat=<width>` move the right edge
+  ## (`diff.c:show_stats`, and the 5/8 : 3/8 split between name and bar).
+  ## That arithmetic went in the minimization pass (docs/minimize.md §3,
+  ## tier 3): the count is the information and the bar is a picture of it,
+  ## so a long path pushes its bar to the right rather than losing its head.
+  ## The scaling rule for the bar is git's (`scale_linear`), so a diff that
+  ## fits comes out identical.
   type Row = object
     name: string
     added, deleted: int
-    binary: bool
-    unmerged: bool
+    binary, unmerged: bool
   var rows: seq[Row]
-  var maxChange = 0
-  var maxLen = 0
-  var binWidth = 0
-  var numberWidth = 0
-
+  var maxChange, maxLen, numberWidth = 0
   for p in pairs:
-    var r = Row(name: quotePath(p.path))
-    if p.unmerged:
-      r.unmerged = true
-      maxLen = max(maxLen, displayWidth(r.name))
-      rows.add r
-      continue
-    let a = repo.oldText(p)
-    let b = repo.newText(p)
-    if not o.text and (isBinary(a) or isBinary(b)):
-      r.binary = true
-      r.deleted = a.len
-      r.added = b.len
-      let w = 14 + decimalWidth(r.added) + decimalWidth(r.deleted)
-      binWidth = max(binWidth, w)
-      numberWidth = 3          # the counts line up under "Bin"
-    else:
-      let c = diffCounts(a, b, o.ws)
-      r.added = c.added
-      r.deleted = c.deleted
-      maxChange = max(maxChange, r.added + r.deleted)
-    maxLen = max(maxLen, displayWidth(r.name))
+    var r = Row(name: quotePath(p.path), unmerged: p.unmerged)
+    if not p.unmerged:
+      let a = repo.oldText(p)
+      let b = repo.newText(p)
+      if not o.text and (isBinary(a) or isBinary(b)):
+        r.binary = true
+        r.deleted = a.len
+        r.added = b.len
+        numberWidth = 3          # the counts line up under "Bin"
+      else:
+        (r.added, r.deleted) = diffCounts(a, b, o.ws)
+        maxChange = max(maxChange, r.added + r.deleted)
+    maxLen = max(maxLen, r.name.runeLen)
     rows.add r
   if rows.len == 0: return
-
-  var width = if o.statWidth > 0: o.statWidth else: 80
-  numberWidth = max(decimalWidth(maxChange), numberWidth)
-  if width < 16 + 6 + numberWidth: width = 16 + 6 + numberWidth
-  var graphWidth = if maxChange + 4 > binWidth: maxChange else: binWidth - 4
-  var nameWidth = maxLen
-  if nameWidth + numberWidth + 6 + graphWidth > width:
-    if graphWidth > width * 3 div 8 - numberWidth - 6:
-      graphWidth = max(width * 3 div 8 - numberWidth - 6, 6)
-    if nameWidth > width - numberWidth - 6 - graphWidth:
-      nameWidth = width - numberWidth - 6 - graphWidth
-    else:
-      graphWidth = width - numberWidth - 6 - nameWidth
-
-  var totalAdd = 0
-  var totalDel = 0
+  numberWidth = max(numberWidth, ($maxChange).len)
+  let width = if o.statWidth > 0: o.statWidth else: 80
+  let graphWidth = max(width - 6 - numberWidth - maxLen, 10)
+  var totalAdd, totalDel = 0
   for r in rows:
-    # A name too long for its column is replaced by `...` plus its tail, cut
-    # back to a `/` when there is one so the result is still a path.
-    var name = r.name
-    var prefix = ""
-    if nameWidth < displayWidth(name):
-      prefix = "..."
-      var keep = max(nameWidth - 3, 0)
-      while displayWidth(name) > keep and name.len > 0:
-        var k = 1
-        while k < name.len and (byte(name[k]) and 0xC0'u8) == 0x80'u8: inc k
-        name = name[k .. ^1]
-      let slash = name.find('/')
-      if slash >= 0: name = name[slash .. ^1]
-    let padding = max(nameWidth - 3 * ord(prefix.len > 0) - displayWidth(name), 0)
-
+    out0.add " " & r.name & repeat(' ', maxLen - r.name.runeLen) & " | "
     if r.unmerged:
-      out0.add " " & prefix & name & repeat(' ', padding) & " | Unmerged\n"
+      out0.add "Unmerged\n"
       continue
-
     if r.binary:
-      out0.add " " & prefix & name & repeat(' ', padding) & " | " &
-               align("Bin", numberWidth)
-      if r.added == 0 and r.deleted == 0:
-        out0.add "\n"
-        continue
-      out0.add " " & $r.deleted & " -> " & $r.added & " bytes\n"
+      out0.add align("Bin", numberWidth)
+      if r.added + r.deleted > 0:
+        out0.add " " & $r.deleted & " -> " & $r.added & " bytes"
+      out0.add "\n"
       continue
-
+    # `scale_linear`: a change that would not fit is scaled to the bar, and
+    # one that has both kinds keeps at least one of each.
     var add = r.added
     var del = r.deleted
-    if graphWidth <= maxChange and maxChange > 0:
-      var total = scaleLinear(add + del, graphWidth, maxChange)
-      if total < 2 and add > 0 and del > 0: total = 2
-      if add < del:
-        add = scaleLinear(add, graphWidth, maxChange)
-        del = total - add
-      else:
-        del = scaleLinear(del, graphWidth, maxChange)
-        add = total - del
+    if graphWidth < maxChange:
+      proc scale(it: int): int =
+        ## git's `scale_linear`: a zero stays zero, anything else takes at least
+        ## one column.
+        if it == 0: 0 else: 1 + (it * (graphWidth - 1) div maxChange)
+      var total = max(scale(add + del), (if add > 0 and del > 0: 2 else: 0))
+      if add < del: (add = scale(add); del = total - add)
+      else: (del = scale(del); add = total - del)
     totalAdd += r.added
     totalDel += r.deleted
-    out0.add " " & prefix & name & repeat(' ', padding) & " | " &
-             align($(r.added + r.deleted), numberWidth) &
+    out0.add align($(r.added + r.deleted), numberWidth) &
              (if r.added + r.deleted > 0: " " else: "")
     if o.color:
       if add > 0: out0.add colNew & repeat('+', add) & colReset
@@ -711,7 +659,6 @@ proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
     else:
       out0.add repeat('+', add) & repeat('-', del)
     out0.add "\n"
-
   out0.add summaryLine(rows.len, totalAdd, totalDel)
 
 func pathField(o: DiffOpts, path: string): string =
@@ -732,6 +679,7 @@ proc writeRaw(repo: Repository, p: DiffPair, o: DiffOpts, out0: var string) =
   out0.add pathField(o, p.path)
 
 proc writeNumstat(repo: Repository, p: DiffPair, o: DiffOpts, out0: var string) =
+  ## `--numstat`: added, deleted, path -- `-` for binary, `0 0` for unmerged.
   if p.unmerged:
     out0.add "0\t0\t" & pathField(o, p.path)
     return
@@ -745,12 +693,15 @@ proc writeNumstat(repo: Repository, p: DiffPair, o: DiffOpts, out0: var string) 
   out0.add pathField(o, p.path)
 
 proc writeNames(p: DiffPair, o: DiffOpts, withStatus: bool, out0: var string) =
+  ## `--name-only` and `--name-status`: the path, with its letter first
+  ## for the latter.
   if withStatus:
     out0.add p.status
     out0.add (if o.nulTerminate: "\0" else: "\t")
   out0.add pathField(o, p.path)
 
 proc shortstat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts): string =
+  ## `--shortstat`: the summary line alone.
   var add = 0
   var del = 0
   var files = 0

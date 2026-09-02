@@ -1,9 +1,10 @@
 ## `stash` -- set aside uncommitted work and get a clean tree back.
 ##
-## In scope (docs/08): `push` (the default), `list`, `show`, `pop`, `apply`,
-## `drop`, `clear`, `<stash>`, `-k`/`--keep-index`, `-u`/`--include-untracked`,
-## `-m <message>`, `-q`, and a pathspec for `push`.  Cut: `save`, `branch`,
-## `create`, `store`, `export`/`import`, `-p`, `-S`, `-a`, `--index`.
+## In scope (docs/08): `push` (the default), `list`, `pop`, `apply`, `drop`,
+## `clear`, `<stash>`, `-u`/`--include-untracked`, `-m <message>`, `-q`, and a
+## pathspec for `push`.  Cut: `show` (it is `diff stash@{0}^ stash@{0}`),
+## `-k`/`--keep-index`, `save`, `branch`, `create`, `store`, `export`/`import`,
+## `-p`, `-S`, `-a`, `--index`.
 ##
 ## ## A stash entry is a commit with two or three parents
 ##
@@ -15,8 +16,8 @@
 ##
 ## Nothing else records the state: the *tree* of `w_commit` is the working
 ## tree, the tree of its second parent is the index, and its first parent says
-## what all of that was relative to.  That is why `stash show` is a plain diff
-## between two trees, and why `git log --graph` shows a stash as a merge.
+## what all of that was relative to.  That is why `git stash show` is a plain
+## diff between two trees, and why `git log --graph` shows a stash as a merge.
 ##
 ## ## The stack is a reflog
 ##
@@ -40,16 +41,11 @@
 ## before, which stay staged because there is nowhere else to put them.
 
 import std/[os, strutils, tables]
-import ../cli, ../commitobj, ../diffcore, ../dir, ../ident, ../ignore,
+import ../cli, ../commitobj, ../dir, ../ident, ../ignore,
        ../index, ../mergetree, ../objects, ../oid, ../pathspec, ../refs,
        ../repository, ../revision, ../revwalk, ../sequencer, ../status,
        ../trees, ../util, ../worktree
 
-const usageText = """usage: gittle stash [push] [-k] [-u] [-q] [-m <message>] [--] [<pathspec>…]
-   or: gittle stash list
-   or: gittle stash show [<stash>]
-   or: gittle stash (pop|apply|drop) [<stash>]
-   or: gittle stash clear"""
 
 const stashRef = refsPrefix & "stash"
 
@@ -63,6 +59,8 @@ type Entry = object
   message: string
 
 proc readEntry(repo: Repository, oid: Oid): Entry =
+  ## A stash commit taken apart: the base, the tree, the index tree and,
+  ## with `-u`, the untracked tree.
   let c = repo.readCommit(oid)
   failIf(c.parents.len < 2, $oid & " is not a stash-like commit")
   result = Entry(oid: oid, base: c.parents[0], workTree: c.tree,
@@ -90,6 +88,7 @@ proc resolveStash(repo: Repository, name: string): tuple[oid: Oid, idx: int] =
     if log[i].newOid == result.oid: return (result.oid, log.high - i)
 
 proc branchName(repo: Repository): string =
+  ## The branch for the `WIP on <branch>` message, or `(no branch)`.
   const heads = refsPrefix & "heads/"
   let h = repo.headRefName
   if h.startsWith(heads): h[heads.len .. ^1] else: "(no branch)"
@@ -155,8 +154,11 @@ proc workTree(repo: Repository, idx: Index, ps: Pathspec): tuple[oid: Oid,
       result.dirty = true
   result.oid = repo.writeTree(scratch)
 
-proc doPush(c: Ctx, message: string, keepIndex, includeUntracked, quiet: bool,
+proc doPush(c: Ctx, message: string, includeUntracked, quiet: bool,
             specs: seq[string]): int =
+  ## `stash push`: snapshot the index and the working tree (and the
+  ## untracked files) as commits, record them in the reflog, then reset
+  ## the tree to HEAD.
   let repo = c.repo
   let idx = readIndex(repo.indexPath)
   for e in idx.entries:
@@ -233,17 +235,13 @@ proc doPush(c: Ctx, message: string, keepIndex, includeUntracked, quiet: bool,
     # leaves both of its traces even though HEAD does not move.
     repo.writeState("ORIG_HEAD", $head.oid & "\n")
     repo.refs.updateRef(headRef, head.oid, msg = "reset: moving to HEAD")
-  if keepIndex:
-    # `-k`: the index goes back to what it was, and the working tree with it,
-    # so that what was staged is still staged and still on disk.
-    let staged = repo.flatten(indexTree)
-    discard repo.checkoutPaths(idx, staged, parsePathspec(@[]),
-                               toWorktree = true, toIndex = true)
   idx.writeIndex()
   if not quiet: echo "Saved working directory and index state " & msg
   0
 
 proc doApply(c: Ctx, name: string, drop, quiet: bool): int =
+  ## `stash apply`/`pop`: the three-way merge the module comment
+  ## describes, then restore the index, then drop the entry for `pop`.
   let repo = c.repo
   let idx = readIndex(repo.indexPath)
   for e in idx.entries:
@@ -291,9 +289,7 @@ proc doApply(c: Ctx, name: string, drop, quiet: bool): int =
     # user needs next is the list of what has landed and what has not.
     let s = computeStatus(repo, readIndex(repo.indexPath),
                           parsePathspec(@[], repo.prefix), umNormal)
-    stdout.write longStatus(s, umNormal,
-                            repo.cfg.getBool("advice.statusHints", true),
-                            (if repo.cfg.getBool("status.relativePaths", true):
+    stdout.write longStatus(s, umNormal, (if repo.cfg.getBool("status.relativePaths", true):
                                repo.prefix else: ""))
     stdout.flushFile()
   if res.conflicts > 0:
@@ -305,47 +301,41 @@ proc doApply(c: Ctx, name: string, drop, quiet: bool): int =
          " (" & $oid & ")"
   0
 
+const
+  synopsis = "[push] [-u] [-q] [-m <message>] [--] [<pathspec>…]\nlist\n(pop|apply|drop) [<stash>]\nclear"
+  options = [
+    opt("-u|--include-untracked", help = "stash untracked files as well"),
+    opt("--no-include-untracked"),
+    opt("-q|--quiet", help = "say nothing"),
+    opt("-m|--message", okValue, arg = "<message>", help = "the stash's description"),
+    opt("-k|--keep-index|--no-keep-index", okRefused, help = "docs/minimize.md §3.5"),
+    opt("-p|--patch|-S|--staged|-a|--all|--only-untracked|--index|--label-ours|" &
+        "--label-theirs|--label-base|--print|--to-ref|--pathspec-from-file|--pathspec-file-nul",
+        okRefused, help = "docs/08"),
+  ]
+
 proc cmdStash*(c: Ctx, argv: seq[string]): int =
-  let args = expandShortOptions(argv, {'m'})
+  ## Entry point: parse, find the sub-verb, dispatch.
+  let o = parse(options, argv, "stash", synopsis)
+  var includeUntracked = false
+  for (k, _) in o.occurrences:
+    if k == "include-untracked": includeUntracked = true
+    elif k == "no-include-untracked": includeUntracked = false
+  let quiet = o.has "quiet"
+  let message = o.val "message"
+  # The sub-verb is the first positional, unless it came after `--`.
   var sub = ""
-  var message = ""
-  var keepIndex, includeUntracked, quiet = false
-  var rest: seq[string]
-  var seenDashDash = false
-  var i = 0
-
-  optionValue(args, i)
-  while i < args.len:
-    let a = args[i]
-    if seenDashDash or a.len == 0 or a[0] != '-':
-      if sub.len == 0 and not seenDashDash and
-         a in ["push", "list", "show", "pop", "apply", "drop", "clear"]:
-        sub = a
-      else: rest.add a
-    elif a == "--": seenDashDash = true
-    elif a == "-k" or a == "--keep-index": keepIndex = true
-    elif a == "--no-keep-index": keepIndex = false
-    elif a == "-u" or a == "--include-untracked": includeUntracked = true
-    elif a == "--no-include-untracked": includeUntracked = false
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "-m" or a.startsWith("--message"): message = valueFor(a)
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif a in ["-p", "--patch", "-S", "--staged", "-a", "--all",
-               "--only-untracked", "--index", "--label-ours", "--label-theirs",
-               "--label-base", "--print", "--to-ref",
-               "--pathspec-from-file", "--pathspec-file-nul"]:
-      fail(a & " is out of scope for gittle v1 (docs/08)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
+  var rest = o.args
+  if rest.len > 0 and o.dashDashAt != 0 and
+     rest[0] in ["push", "list", "show", "pop", "apply", "drop", "clear"]:
+    sub = rest[0]
+    rest.delete(0)
   let repo = c.repo
   failIf(repo.workTree.len == 0, "stash is not possible in a bare repository")
   if sub.len == 0: sub = (if rest.len == 0: "push" else: "push")
 
   case sub
-  of "push": return c.doPush(message, keepIndex, includeUntracked, quiet, rest)
+  of "push": return c.doPush(message, includeUntracked, quiet, rest)
   of "clear":
     if repo.refs.readRef(stashRef).found:
       repo.refs.deleteRef(stashRef)
@@ -357,15 +347,8 @@ proc cmdStash*(c: Ctx, argv: seq[string]): int =
     for i in countdown(log.high, 0):
       echo "stash@{" & $(log.high - i) & "}: " & log[i].message
     return 0
-  of "show":
-    let (oid, _) = repo.resolveStash(if rest.len > 0: rest[0] else: "")
-    let st = repo.readEntry(oid)
-    var o = defaultDiffOpts()
-    o.formats = {dfStat}
-    stdout.write repo.renderDiff(pairsTreeTree(repo,
-      repo.peelTo(st.base, otTree).oid, st.workTree, parsePathspec(@[])), o).text
-    stdout.flushFile()
-    return 0
+  of "show": fail("gittle stash show is not supported; use " &
+                  "'gittle diff stash@{0}^ stash@{0}'")
   of "drop":
     let name = if rest.len > 0: rest[0] else: ""
     let (oid, pos) = repo.resolveStash(name)
@@ -376,4 +359,4 @@ proc cmdStash*(c: Ctx, argv: seq[string]): int =
     return 0
   of "pop", "apply":
     return c.doApply((if rest.len > 0: rest[0] else: ""), sub == "pop", quiet)
-  else: fail("unknown subcommand '" & sub & "'\n" & usageText)
+  else: fail("unknown subcommand '" & sub & "'\n" & o.use)

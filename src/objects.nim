@@ -36,6 +36,7 @@ func `$`*(t: ObjectType): string =
   of otBad: "bad"
 
 func parseObjectType*(s: string): ObjectType =
+  ## The type a name on the command line means; `otBad` when it is none.
   case s
   of "commit": otCommit
   of "tree": otTree
@@ -43,9 +44,11 @@ func parseObjectType*(s: string): ObjectType =
   of "tag": otTag
   else: otBad
 
+# Is this a pack-only delta type rather than a real object type?
 func isDelta*(t: ObjectType): bool = t == otOfsDelta or t == otRefDelta
 
 func packTypeFromInt*(n: int): ObjectType =
+  ## The three-bit type field of a pack entry header.
   case n
   of 1: otCommit
   of 2: otTree
@@ -64,11 +67,14 @@ const firstFewBytes = 8000
   ## git as well as here -- which is why `diff` and `grep` can share it.
 
 func isBinary*(s: string): bool =
+  ## git's guess without attributes: a NUL in the first 8000 bytes.
   for i in 0 ..< min(s.len, firstFewBytes):
     if s[i] == '\0': return true
   false
 
 func objectHeader*(kind: ObjectType, size: int): string =
+  ## The `<type> <size>\0` header every object's hash and loose file start
+  ## with.
   $kind & " " & $size & "\0"
 
 proc hashObject*(kind: ObjectType, data: openArray[byte]): Oid =
@@ -79,6 +85,7 @@ proc hashObject*(kind: ObjectType, data: openArray[byte]): Oid =
   toOid(c.finish())
 
 proc hashObject*(kind: ObjectType, data: string): Oid {.inline.} =
+  ## The object ID: SHA-1 over the header and the content.
   hashObject(kind, data.toOpenArrayByte(0, data.len - 1))
 
 proc parseLooseHeader*(buf: string): tuple[kind: ObjectType, size, bodyAt: int] =
@@ -110,6 +117,7 @@ const maxLooseHeader = 64
   ## "commit " plus a 20-digit size and a NUL fits with room to spare.
 
 func loosePath*(objdir: string, o: Oid): string =
+  ## `objects/ab/cdef…`: the first two hex digits are the directory.
   let h = $o
   objdir / h[0 ..< 2] / h[2 ..< OidHexLen]
 
@@ -123,6 +131,8 @@ proc readLooseHeaderAt*(path: string): tuple[kind: ObjectType, size: int] =
   (p.kind, p.size)
 
 proc readLooseAt*(path: string): GitObject =
+  ## Read and inflate a loose object, checking the declared size against
+  ## what came out.
   let raw = readWholeFile(path)
   if raw.len == 0: fail("loose object file is empty: " & path)
   let all = inflateAll(unsafeAddr raw[0], raw.len)
@@ -210,6 +220,7 @@ func formatMode*(mode: uint32): string =
   while result.len < 6: result = "0" & result
 
 iterator treeEntries*(data: string): TreeEntry =
+  ## Each `<mode> <name>\0<20 bytes>` entry of a tree's content, in order.
   var i = 0
   while i < data.len:
     let sp = data.find(' ', i)

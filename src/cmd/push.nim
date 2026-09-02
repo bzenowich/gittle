@@ -33,19 +33,8 @@
 import std/[os, strutils]
 import ../cli, ../oid, ../packwrite, ../refspec, ../remotes, ../repository,
        ../revwalk, ../transport, ../util
+import gc as cmdgc
 
-const usageText = """usage: gittle push [<options>] [<repository> [<refspec>…]]
-
-   --tags                     also push every tag
-   -d, --delete               delete the named refs on the remote
-   -f, --force                allow a non-fast-forward update
-   --force-with-lease[=<ref>[:<expect>]]
-                              force only if the remote is where we last saw it
-   -n, --dry-run              do everything except send
-   --receive-pack <exec>      the command to run on the far end
-   -u, --set-upstream         record the pushed branch as this branch's upstream
-   -q, --quiet                report nothing but errors
-   -v, --verbose              also report refs that were already up to date"""
 
 type
   Update = object
@@ -63,64 +52,59 @@ type
 
 const advice: array[Reject, string] = [
   "",
-  "Updates were rejected because the tip of your current branch is behind\n" &
-  "its remote counterpart. If you want to integrate the remote changes,\n" &
-  "use 'gittle pull' before pushing again.\n" &
-  "See the 'Note about fast-forwards' in 'gittle push --help' for details.",
-  "Updates were rejected because a pushed branch tip is behind its remote\n" &
-  "counterpart. If you want to integrate the remote changes, use 'gittle pull'\n" &
-  "before pushing again.\n" &
-  "See the 'Note about fast-forwards' in 'gittle push --help' for details.",
-  "Updates were rejected because the remote contains work that you do not\n" &
-  "have locally. This is usually caused by another repository pushing to\n" &
-  "the same ref. If you want to integrate the remote changes, use\n" &
-  "'gittle pull' before pushing again.\n" &
-  "See the 'Note about fast-forwards' in 'gittle push --help' for details.",
-  "Updates were rejected because the tag already exists in the remote.",
-  "Updates were rejected because the tip of the remote-tracking branch has\n" &
-  "been updated since the last checkout. If you want to integrate the\n" &
-  "remote changes, use 'gittle pull' before pushing again.\n" &
-  "See the 'Note about fast-forwards' in 'gittle push --help' for details."]
+  "the tip of your current branch is behind its remote counterpart; " &
+  "'gittle pull' first, or push with --force",
+  "a pushed branch tip is behind its remote counterpart; 'gittle pull' " &
+  "first, or push with --force",
+  "the remote contains work you do not have locally; 'gittle pull' first, " &
+  "or push with --force",
+  "the tag already exists in the remote; push with --force to replace it",
+  "the remote-tracking branch has moved since the last fetch; 'gittle " &
+  "fetch' and look before pushing with --force-with-lease again"]
+  ## One sentence per way a ref update can be refused.  git prints a
+  ## paragraph of `hint:` lines for each (`transport.c:transport_push`,
+  ## `advise_pull_before_push` and siblings); the minimization pass kept the
+  ## cause and the way out (docs/minimize.md §3, tier 3).
+
+const
+  synopsis = "[<options>] [<repository> [<refspec>…]]"
+  options = [
+    opt("--tags", help = "also push every tag"),
+    opt("-d|--delete", help = "delete the named refs on the remote"),
+    opt("-f|--force", help = "allow a non-fast-forward update"),
+    opt("--force-with-lease", okOptValue, help = "force only if the remote is where we last saw it"),
+    opt("--no-force-with-lease"),
+    opt("-n|--dry-run", help = "do everything except send"),
+    opt("--receive-pack|--exec", okValue, arg = "<exec>", help = "the command to run on the far end"),
+    opt("-u|--set-upstream", help = "record the pushed branch as this branch's upstream"),
+    opt("-q|--quiet", help = "report nothing but errors"),
+    opt("-v|--verbose", help = "also report refs that were already up to date"),
+    opt("--all|--branches|--mirror|--prune|--atomic|--porcelain|--follow-tags|--signed|" &
+        "--thin|--no-thin|--force-if-includes", okRefused, help = "docs/08"),
+  ]
 
 proc cmdPush*(c: Ctx, args: seq[string]): int =
-  var force, dryRun, quiet, verbose, setUpstream, delete, pushTags = false
+  ## Entry point: parse, work out the ref updates the refspecs ask for,
+  ## check each against what the remote advertises, send the pack, and
+  ## report.
+  let o = parse(options, args, "push", synopsis)
   var lease = false
-  var receivePack = ""
-  var positional: seq[string]
-  var i = 0
-  while i < args.len:
-    let a = args[i]
-    template value(): string =
-      inc i
-      failIf(i >= args.len, "option '" & a & "' requires a value")
-      args[i]
-    case a
-    of "-f", "--force": force = true
-    of "--force-with-lease": lease = true
-    of "--no-force-with-lease": lease = false
-    of "-n", "--dry-run": dryRun = true
-    of "-q", "--quiet": quiet = true
-    of "-v", "--verbose": verbose = true
-    of "-u", "--set-upstream": setUpstream = true
-    of "-d", "--delete": delete = true
-    of "--tags": pushTags = true
-    of "--receive-pack", "--exec": receivePack = value()
-    of "-h", "--help": (echo usageText; return 0)
-    of "--all", "--branches", "--mirror", "--prune", "--atomic", "--porcelain",
-       "--follow-tags", "--signed", "--thin", "--no-thin", "--force-if-includes":
-      fail(a & " is out of scope for gittle v1 (docs/08)")
-    else:
-      if a.startsWith("--receive-pack="): receivePack = a["--receive-pack=".len .. ^1]
-      elif a.startsWith("--exec="): receivePack = a["--exec=".len .. ^1]
-      elif a.startsWith("--force-with-lease="):
-        fail("gittle implements --force-with-lease only in its bare form,\n" &
+  for (k, v) in o.occurrences:
+    if k == "force-with-lease":
+      failIf(v.len > 0, "gittle implements --force-with-lease only in its bare form,\n" &
              "  which compares the remote against this repository's " &
              "remote-tracking ref (docs/08)")
-      elif a.startsWith("-") and a.len > 1:
-        fail("unknown option '" & a & "'\n" & usageText)
-      else: positional.add a
-    inc i
-
+      lease = true
+    elif k == "no-force-with-lease": lease = false
+  let force = o.has "force"
+  let dryRun = o.has "dry-run"
+  let quiet = o.has "quiet"
+  let verbose = o.has "verbose"
+  let setUpstream = o.has "set-upstream"
+  let delete = o.has "delete"
+  let pushTags = o.has "tags"
+  let receivePack = o.val "receive-pack"
+  let positional = o.args
   let repo = c.repo
   let head = repo.headRefName()
   let branch = if head.startsWith("refs/heads/"):
@@ -174,6 +158,7 @@ proc cmdPush*(c: Ctx, args: seq[string]): int =
   let advertised = conn.lsRefs([])
 
   proc advertisedOid(n: string): Oid =
+    ## What the remote says a ref holds, or null when it has none.
     for r in advertised:
       if r.name == n: return r.oid
     nullOid
@@ -293,6 +278,7 @@ proc cmdPush*(c: Ctx, args: seq[string]): int =
                  "forced update", u.shown, u.dst)
 
   proc report() =
+    ## The `To <url>` report, one line per update, on stderr like git's.
     if lines.len == 0:
       if not quiet and not rejected: stderr.write "Everything up-to-date\n"
     else:
@@ -368,4 +354,15 @@ proc cmdPush*(c: Ctx, args: seq[string]): int =
       if not quiet:
         stderr.write "branch '" & b & "' set up to track '" &
                      rem.name & "/" & prettify(u.dst) & "'.\n"
-  if rejected: 1 else: 0
+  if rejected: return 1
+  # Automatic housekeeping, where git runs `maintenance run --auto` after a
+  # commit or a fetch: the end of a successful push is the moment the server
+  # holds everything worth packing, and the threshold is git's own
+  # (`gc.auto`, 6700 by default; 0 turns it off).
+  let threshold = repo.cfg.getInt("gc.auto", 6700)
+  if not dryRun and rem.name.len > 0 and threshold > 0 and
+     cmdgc.looseObjectEstimate(repo) > threshold:
+    if not quiet:
+      stderr.write "Auto packing the repository with " & rem.name & "'s help.\n"
+    cmdgc.gcRepository(c, rem.name, full = false, quiet = true)
+  0

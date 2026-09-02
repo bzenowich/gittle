@@ -59,11 +59,8 @@ func `$`*(o: Oid): string =
     result[i*2] = hexChars[int(o.b[i] shr 4)]
     result[i*2+1] = hexChars[int(o.b[i] and 0x0F)]
 
-func abbrev*(o: Oid, n: int): string =
-  ## The first `n` hex digits, for display.
-  ($o)[0 ..< clamp(n, 1, OidHexLen)]
-
 func hexVal(c: char): int {.inline.} =
+  ## The value of a hex digit, or -1.
   case c
   of '0'..'9': ord(c) - ord('0')
   of 'a'..'f': ord(c) - ord('a') + 10
@@ -81,6 +78,7 @@ func tryParseOid*(s: string, o: var Oid): bool =
   true
 
 proc parseOid*(s: string): Oid =
+  ## Forty hex digits or a fatal error.
   if not tryParseOid(s, result):
     fail("not a valid object name: " & s)
 
@@ -117,5 +115,6 @@ func lowerBound*(p: OidPrefix): Oid =
   result.b = p.b
 
 func toOid*(d: Sha1Digest): Oid =
+  ## A finished SHA-1 digest as an object ID.
   for i in 0 ..< OidLen: result.b[i] = d[i]
 

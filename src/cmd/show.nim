@@ -24,14 +24,9 @@ import std/strutils
 import ../cli, ../commitobj, ../diffcore, ../ident, ../pathspec, ../pretty,
        ../repository, ../revision, ../util
 
-const usageText = """usage: gittle show [<options>] [<object>…]
-
-   --pretty=<fmt>, --format=<fmt>, --oneline, --abbrev-commit, --abbrev=<n>,
-   --date=<fmt>, --decorate[=…]                  -- as for `log`
-   -p, -s, --stat, --numstat, --raw, --name-only, -U<n>, -w, --color …
-                                                -- as for `gittle diff`"""
 
 proc showTree(repo: Repository, name: string, tree: Oid) =
+  ## `show` on a tree: its name, then one entry per line as git prints it.
   echo "tree " & name & "\n"
   for e in treeEntries(repo.readObject(tree).data):
     echo e.name & (if modeType(e.mode) == otTree: "/" else: "")
@@ -59,40 +54,41 @@ proc showTag(repo: Repository, o: Oid, obj: GitObject, opts: PrettyOpts) =
   let blank = obj.data.find("\n\n")
   if blank >= 0: stdout.write obj.data[blank + 2 .. ^1]
 
+const
+  synopsis = "[<options>] [<object>…]"
+  options = [
+    opt("--oneline", help = "one line per commit: abbreviated ID and subject"),
+    opt("--abbrev-commit", help = "abbreviate the commit ID"),
+    opt("--no-abbrev-commit"),
+    opt("--relative-date", okRefused, help = "docs/minimize.md §3"),
+    opt("--decorate", okOptValue, arg = "[=short]", help = "show the refs at each commit"),
+    opt("--no-decorate"),
+    opt("--abbrev", okValue, arg = "<n>", help = "abbreviate object IDs to <n> digits"),
+    opt("--date", okValue, arg = "<format>", help = "the date format"),
+    opt("--pretty|--format", okOptValue, key = "format", arg = "[=<format>]",
+        help = "the commit format: oneline, medium, full, fuller, raw, format:<fmt>"),
+  ]
+
 proc cmdShow*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse, then show each object by type -- a commit with
+  ## its diff, a tag with what it points at, a tree's entries, a blob's
+  ## bytes.
+  let p = parse(@options & @diffOptions, args, "show", synopsis)
   var opts = PrettyOpts(kind: pkMedium, now: dateNow())
   var dopts = defaultDiffOpts()
+  applyDiffOpts(p, dopts)
   var abbrevLen = 0
-  var names: seq[string]
-  var i = 0
-
-  optionValue(args, i)
-
-  while i < args.len:
-    let a = args[i]
-    if a.len == 0 or a[0] != '-':
-      names.add a
-    elif a == "--": discard
-    elif a == "--oneline":
-      opts.kind = pkOneline
-      opts.abbrevCommit = true
-    elif a == "--abbrev-commit": opts.abbrevCommit = true
-    elif a == "--no-abbrev-commit": opts.abbrevCommit = false
-    elif a == "--relative-date": opts.dateMode = DateMode(kind: dkRelative)
-    elif a == "--no-decorate": discard
-    elif a.startsWith("--abbrev"): abbrevLen = parseInt(valueFor(a))
-    elif a.startsWith("--date"): opts.dateMode = parseDateMode(valueFor(a))
-    elif a.startsWith("--decorate"): opts.decorate = true
-    elif a.startsWith("--pretty") or a.startsWith("--format"):
-      parsePretty((if a.contains('='): a[a.find('=') + 1 .. ^1] else: ""), opts)
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif parseDiffOpt(a, dopts, valueFor): discard
-    else:
-      fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
+  for (k, v) in p.occurrences:
+    case k
+    of "oneline": (opts.kind = pkOneline; opts.abbrevCommit = true)
+    of "abbrev-commit": opts.abbrevCommit = true
+    of "no-abbrev-commit": opts.abbrevCommit = false
+    of "abbrev": abbrevLen = parseInt(v)
+    of "date": opts.dateMode = parseDateMode(v)
+    of "decorate": opts.decorate = true
+    of "format": parsePretty(v, opts)
+    else: discard
+  var names = p.args
   if names.len == 0: names.add headRef
   # `show` patches by default; `log` does not.  That single difference is the
   # whole of what distinguishes them once the walk is limited to one commit.
@@ -108,6 +104,8 @@ proc cmdShow*(c: Ctx, args: seq[string]): int =
   let ps = parsePathspec(@[], repo.prefix)
 
   proc withDiff(o: Oid, commit: Commit): string =
+    ## A commit's text followed by its diff against its first parent (none
+    ## for a merge, as `--diff-merges=off` says).
     result = formatOne(repo, o, commit, opts)
     if dopts.formats == {dfNone} or commit.parents.len > 1: return
     let old = if commit.parents.len == 1:

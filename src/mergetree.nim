@@ -83,6 +83,7 @@ type
     paths*: seq[Merged]          ## sorted by path
     conflicts*: int
 
+# Is there a path on this side at all?  A mode of zero is the absence.
 func exists(v: Version): bool = v.mode != 0
 
 func isRegular(v: Version): bool = (v.mode and 0o170000'u32) == 0o100000'u32

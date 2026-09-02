@@ -12,8 +12,17 @@ import std/[strutils]
 import ../cli, ../objects, ../oid, ../repository, ../revision,
        ../trees, ../util
 
-const usageText = "usage: gittle ls-tree [-d] [-r] [-t] [-l] [-z] " &
-                  "[--name-only] [--abbrev[=<n>]] <tree-ish> [<path>…]"
+const
+  synopsis = "[-d] [-r] [-t] [-l] [-z] [--name-only] [--abbrev[=<n>]] <tree-ish> [<path>…]"
+  options = [
+    opt("-d", help = "trees only"),
+    opt("-r", help = "recurse into subtrees"),
+    opt("-t", help = "show trees even when recursing"),
+    opt("-l|--long", help = "add the object size"),
+    opt("-z", help = "NUL after each entry, and no quoting"),
+    opt("--name-only|--name-status", help = "names only"),
+    opt("--abbrev", okOptValue, arg = "[=<n>]", help = "abbreviate object IDs"),
+  ]
 
 proc matchesPaths(name: string, mode: uint32, paths: seq[string]): bool =
   ## Does this entry match one of the path arguments?
@@ -36,36 +45,18 @@ proc matchesPaths(name: string, mode: uint32, paths: seq[string]): bool =
   false
 
 proc cmdLsTree*(c: Ctx, args: seq[string]): int =
-  var recurse = false
-  var showTrees = false
-  var dirsOnly = false
-  var long = false
-  var nameOnly = false
-  var nulTerminated = false
-  var abbrevLen = 0
-  var rest: seq[string]
-  var i = 0
-  var noMoreOpts = false
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-':
-      rest.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-r": recurse = true
-    elif a == "-t": showTrees = true
-    elif a == "-d": dirsOnly = true
-    elif a == "-l" or a == "--long": long = true
-    elif a == "-z": nulTerminated = true
-    elif a == "--name-only" or a == "--name-status": nameOnly = true
-    elif a == "--abbrev": abbrevLen = -1   # resolved below, once the repo is open
-    elif a.startsWith("--abbrev="): abbrevLen = parseInt(a["--abbrev=".len .. ^1])
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
-  failIf(rest.len < 1, usageText)
+  ## Entry point: parse, then walk the tree, descending only where `-r`
+  ## or a path argument reaches.
+  let o = parse(options, args, "ls-tree", synopsis)
+  let (recurse, dirsOnly, long, nameOnly, nulTerminated) =
+    (o.has "r", o.has "d", o.has "long", o.has "name-only", o.has "z")
+  var showTrees = o.has "t"
+  # `--abbrev` with no number is resolved below, once the repo is open.
+  var abbrevLen = if not o.has "abbrev": 0
+                  elif o.val("abbrev").len == 0: -1
+                  else: parseInt(o.val "abbrev")
+  let rest = o.args
+  failIf(rest.len < 1, o.use)
   let repo = c.repo
   let root = repo.resolveTree(rest[0])
   let paths = rest[1 .. ^1]

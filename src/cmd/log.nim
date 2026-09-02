@@ -28,33 +28,6 @@ import std/strutils
 import ../cli, ../commitobj, ../diffcore, ../ident, ../oid, ../pretty,
        ../regex, ../repository, ../revision, ../revwalk, ../util
 
-const usageText = """usage: gittle log [<options>] [<commit>…] [[--] <path>…]
-
-   -n <n>, --max-count=<n>   stop after <n> commits
-   --skip=<n>                skip the first <n>
-   --since=<date>, --until=<date>
-   --merges, --no-merges     only, or never, commits with two or more parents
-   --reverse                 oldest first
-   --first-parent            follow only the first parent of a merge
-   --not                     invert `^` for every following argument
-   --all, --branches[=<pat>], --tags[=<pat>], --remotes[=<pat>], --stdin
-   --topo-order, --date-order
-   --no-walk                 show the named commits only
-   --left-right              mark which side of an A...B a commit came from
-   --parents                 also print each commit's parents
-   --oneline                 one line each, abbreviated
-   --pretty=<fmt>            oneline|medium|full|fuller|raw|format:…|tformat:…
-   --format=<fmt>            same as --pretty=<fmt>
-   --abbrev-commit           abbreviate object names
-   --abbrev=<n>              use at least <n> digits
-   --date=<fmt>              default|relative|iso8601|rfc2822|short|raw|unix|
-                             human|iso8601-strict|format:<strftime>
-   --decorate[=short|full|auto|no]
-   --grep=<pat>              limit to commits whose message matches
-   --author=<pat>, --committer=<pat>
-   -i, -E, -F, --all-match, --invert-grep
-   -p, --stat, --numstat, --shortstat, --raw, --name-only, --name-status,
-   -U<n>, -w, -b, --diff-filter, -S<string>, --color …  -- see `gittle diff`"""
 
 type Limiters = object
   ## `--grep`, `--author` and `--committer`, and how they combine.
@@ -69,11 +42,13 @@ type Limiters = object
   allMatch, invertGrep: bool
 
 proc anyMatch(pats: seq[Regex], s: string): bool =
+  ## Does any pattern match?
   for p in pats:
     if p.matches(s): return true
   false
 
 proc allMatchOf(pats: seq[Regex], s: string): bool =
+  ## Do all patterns match? (`--all-match`)
   for p in pats:
     if not p.matches(s): return false
   true
@@ -93,88 +68,74 @@ proc selects(l: Limiters, c: Commit): bool =
     if hit == l.invertGrep: return false
   true
 
-const deferred = @[
-  "--full-diff", "--follow", "--graph", "--min-parents", "--max-parents",
-  "--ancestry-path", "--cherry-pick", "--cherry-mark", "--boundary",
-  "--simplify-by-decoration", "--simplify-merges", "--objects",
-  "--walk-reflogs", "--author-date-order", "--children", "--source"]
-  ## What `log` does not do, as a table, so that each refuses by name rather
-  ## than being silently ignored -- which would answer a different question
-  ## from the one asked, and look like it had answered.
-
-proc checkDeferred(a: string) =
-  let name = if a.contains('='): a[0 ..< a.find('=')] else: a
-  for n in deferred:
-    if n == name:
-      fail(a & " is out of scope for gittle v1 (docs/04)")
+const
+  synopsis = "[<options>] [<commit>…] [[--] <path>…]"
+  options = [
+    opt("--full-diff|--follow|--graph|--min-parents|--max-parents|--ancestry-path|--cherry-pick|--cherry-mark|--boundary|--simplify-by-decoration|--simplify-merges|--objects|--walk-reflogs|--author-date-order|--children|--source", okRefused, help = "docs/04, docs/07"),
+    opt("--oneline", help = "one line per commit: abbreviated ID and subject"),
+    opt("--abbrev-commit", help = "abbreviate the commit ID"),
+    opt("--no-abbrev-commit"),
+    opt("--relative-date", okRefused, help = "docs/minimize.md §3"),
+    opt("--decorate", okOptValue, arg = "[=short|no|auto]", help = "show the refs at each commit"),
+    opt("--no-decorate"),
+    opt("--abbrev", okValue, arg = "<n>", help = "abbreviate object IDs to <n> digits"),
+    opt("--date", okValue, arg = "<format>", help = "the date format"),
+    opt("--pretty|--format", okOptValue, key = "format", arg = "[=<format>]",
+        help = "the commit format: oneline, medium, full, fuller, raw, format:<fmt>"),
+    opt("--grep", okValue, arg = "<pattern>", help = "commits whose message matches; repeatable"),
+    opt("--author", okValue, arg = "<pattern>", help = "commits whose author matches"),
+    opt("--committer", okValue, arg = "<pattern>", help = "commits whose committer matches"),
+    opt("-i|--regexp-ignore-case", help = "match case-insensitively"),
+    opt("-F|--fixed-strings", help = "patterns are literal strings"),
+    opt("-E|--extended-regexp", help = "POSIX ERE, which is what gittle always uses (plan.md 6.4)"),
+    opt("-G|--basic-regexp|-P|--perl-regexp", okRefused,
+        help = "patterns are POSIX extended regular expressions, always (docs/07)"),
+    opt("--all-match", help = "every --grep must match, not any"),
+    opt("--invert-grep", help = "commits whose message does not match"),
+  ]
 
 proc cmdLog*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse, replay the walk options and revisions in order,
+  ## then walk and print each commit that the limiters admit.
   let repo = c.repo
+  let p = parse(@options & @walkOptions & @diffOptions, args, "log", synopsis,
+                numeric = true)
   let w = newRevWalk(repo)
   var ri = initRevInput()
   var opts = PrettyOpts(kind: pkMedium, now: dateNow())
   var decorateMode = "auto"
   var abbrevLen = 0
   var dopts = defaultDiffOpts()
+  applyDiffOpts(p, dopts)
   var lim = Limiters()
   var greps, authors, committers: seq[string]
   var icase = false
   var fixed = false
-  var i = 0
-
-  optionValue(args, i)
-
-  while i < args.len:
-    let a = args[i]
-    if ri.seenDashDash:
-      ri.specs.add a
-    elif a == "--":
-      ri.seenDashDash = true
-    elif a.len > 1 and a[0] == '-':
-      checkDeferred(a)
-      if w.parseWalkOpt(ri, a, valueFor): discard
-      elif a == "--parents": opts.showParents = true
-      elif a == "--oneline":
-        opts.kind = pkOneline
-        opts.abbrevCommit = true
-      elif a == "--abbrev-commit": opts.abbrevCommit = true
-      elif a == "--no-abbrev-commit": opts.abbrevCommit = false
-      elif a == "--relative-date": opts.dateMode = DateMode(kind: dkRelative)
-      elif a == "--no-decorate": decorateMode = "no"
-      elif a.len > 2 and a[1] == 'n' and a[2] in {'0' .. '9'}:
-        ri.maxCount = parseInt(a[2 .. ^1])    # `-n5`, which git also accepts
-      elif a.startsWith("--abbrev"): abbrevLen = parseInt(valueFor(a))
-      elif a.startsWith("--date"): opts.dateMode = parseDateMode(valueFor(a))
-      elif a.startsWith("--decorate"):
-        decorateMode = if a.contains('='): a[a.find('=') + 1 .. ^1] else: "short"
-      elif a.startsWith("--pretty") or a.startsWith("--format"):
-        parsePretty((if a.contains('='): a[a.find('=') + 1 .. ^1] else: ""), opts)
-      elif a == "-h" or a == "--help":
-        echo usageText
-        return 0
-      elif a.startsWith("--grep"): greps.add valueFor(a)
-      elif a.startsWith("--author"): authors.add valueFor(a)
-      elif a.startsWith("--committer"): committers.add valueFor(a)
-      elif a == "-i" or a == "--regexp-ignore-case": icase = true
-      elif a == "-F" or a == "--fixed-strings": fixed = true
-      elif a == "-E" or a == "--extended-regexp":
-        discard   # gittle's patterns are always ERE -- plan.md 6.4
-      elif a == "-G" or a == "--basic-regexp" or a == "-P" or a == "--perl-regexp":
-        fail(a & " is out of scope for gittle v1 (docs/07): patterns are " &
-             "POSIX extended regular expressions, always")
-      elif a == "--all-match": lim.allMatch = true
-      elif a == "--invert-grep": lim.invertGrep = true
-      elif a.len > 1 and a[1] in {'0' .. '9'}:
-        ri.maxCount = parseInt(a[1 .. ^1])    # the bare `-5` form
-      elif parseDiffOpt(a, dopts, valueFor): discard
-      else:
-        fail("unknown option '" & a & "'\n" & usageText)
+  # In order: a revision, a walk option and `--not` all depend on what came
+  # before them.
+  for (k, v) in p.occurrences:
+    if k == "": w.addRevisionArg(ri, v)
+    elif k == "--": ri.seenDashDash = true
+    elif w.applyWalkOpt(ri, k, v): discard
     else:
-      w.addRevisionArg(ri, a)
-    inc i
-
-  # Compiled once, after parsing, because `-i` and `-F` may follow the pattern
-  # they modify: `log --grep=x -i` is an ordinary thing to type.
+      case k
+      of "parents": opts.showParents = true
+      of "oneline": (opts.kind = pkOneline; opts.abbrevCommit = true)
+      of "abbrev-commit": opts.abbrevCommit = true
+      of "no-abbrev-commit": opts.abbrevCommit = false
+      of "no-decorate": decorateMode = "no"
+      of "decorate": decorateMode = if v.len == 0: "short" else: v
+      of "abbrev": abbrevLen = parseInt(v)
+      of "date": opts.dateMode = parseDateMode(v)
+      of "format": parsePretty(v, opts)
+      of "grep": greps.add v
+      of "author": authors.add v
+      of "committer": committers.add v
+      of "regexp-ignore-case": icase = true
+      of "fixed-strings": fixed = true
+      of "all-match": lim.allMatch = true
+      of "invert-grep": lim.invertGrep = true
+      else: discard
   for g in greps: lim.grep.add compileRegex(g, icase, fixed)
   for g in authors: lim.author.add compileRegex(g, icase, fixed)
   for g in committers: lim.committer.add compileRegex(g, icase, fixed)

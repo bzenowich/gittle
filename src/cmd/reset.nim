@@ -31,37 +31,37 @@ import std/[strutils, tables]
 import ../cli, ../index, ../pathspec, ../refs,
        ../repository, ../revision, ../revwalk, ../util, ../worktree
 
-const usageText = """usage: gittle reset [--soft | --mixed | --hard] [<commit>]
-   or: gittle reset [<tree-ish>] [--] <pathspec>…
-
-   --soft            move HEAD only
-   --mixed           move HEAD and reset the index (the default)
-   --hard            move HEAD and reset the index and the working tree
-   -q, --quiet       report only errors"""
 
 type Mode = enum mSoft, mMixed, mHard
 
+const
+  synopsis = "[--soft | --mixed | --hard] [-q] [<commit>]\n[<tree-ish>] [--] <pathspec>…"
+  options = [
+    opt("--soft", help = "move HEAD only"),
+    opt("--mixed", help = "move HEAD and reset the index (the default)"),
+    opt("--hard", help = "move HEAD and reset the index and the working tree"),
+    opt("-q|--quiet", help = "report only errors"),
+    opt("--merge|--keep|-N|-p|--patch|--refresh|--no-refresh", okRefused, help = "docs/08"),
+  ]
+
 proc cmdReset*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse, tell a revision from a path, then either the
+  ## path form (unstage) or the mode form (move HEAD, and the index and
+  ## tree as the mode says).
+  let o = parse(options, args, "reset", synopsis)
   var mode = mMixed
-  var modeGiven, quiet, seenDashDash = false
-  var rest, specs: seq[string]
-
-  for a in args:
-    if seenDashDash: specs.add a
-    elif a == "--": seenDashDash = true
-    elif a.len > 1 and a[0] == '-':
-      case a
-      of "--soft": (mode = mSoft; modeGiven = true)
-      of "--mixed": (mode = mMixed; modeGiven = true)
-      of "--hard": (mode = mHard; modeGiven = true)
-      of "-q", "--quiet": quiet = true
-      of "-h", "--help": (echo usageText; return 0)
-      of "--merge", "--keep", "-N", "-p", "--patch", "--refresh",
-         "--no-refresh":
-        fail(a & " is out of scope for gittle v1 (docs/08)")
-      else: fail("unknown option '" & a & "'\n" & usageText)
-    else: rest.add a
-
+  var modeGiven = false
+  for (k, _) in o.occurrences:
+    case k
+    of "soft": (mode = mSoft; modeGiven = true)
+    of "mixed": (mode = mMixed; modeGiven = true)
+    of "hard": (mode = mHard; modeGiven = true)
+    else: discard
+  let quiet = o.has "quiet"
+  let seenDashDash = o.dashDash
+  # Before `--` a word may be a revision or a path; after it, only a path.
+  var rest = if o.dashDashAt >= 0: o.args[0 ..< o.dashDashAt] else: o.args
+  var specs = if o.dashDashAt >= 0: o.args[o.dashDashAt .. ^1] else: @[]
   let repo = c.repo
   # A leading argument is the commit only if it names one; otherwise it, and
   # everything after it, is a path.

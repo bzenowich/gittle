@@ -116,11 +116,13 @@ func `<`(a, b: QItem): bool =
   if a.date != b.date: a.date > b.date else: a.order < b.order
 
 proc newRevWalk*(repo: Repository): RevWalk =
+  ## A walk over the repository with nothing queued and no limits.
   RevWalk(repo: repo, queue: initHeapQueue[QItem](),
           flags: initTable[Oid, set[WalkFlag]](),
           maxParents: -1, maxAge: -1, minAge: -1)
 
 proc readCommit*(repo: Repository, o: Oid): Commit =
+  ## Read and parse a commit object.
   parseCommit(repo.readObject(o).data)
 
 proc headLine*(repo: Repository, oid: Oid): string =
@@ -132,6 +134,8 @@ proc headLine*(repo: Repository, oid: Oid): string =
     subject(repo.readCommit(oid).message)
 
 proc meta(w: RevWalk, o: Oid): CommitMeta =
+  ## A commit's tree, parents and date, read once and cached: the walk
+  ## asks for them repeatedly.
   if w.meta.hasKey(o): return w.meta[o]
   let c = w.repo.readCommit(o)
   result = (c.tree, c.parents, c.committer.when0)
@@ -274,6 +278,7 @@ proc treesDiffer*(repo: Repository, a, b: Oid, ps: Pathspec,
   for e in treeEntries(repo.readObject(b).data): bn.add e
 
   proc find(s: seq[TreeEntry], name: string): int =
+    ## The entry of that name, or -1.
     result = -1
     for i, e in s:
       if e.name == name: return i
@@ -341,6 +346,8 @@ proc rewriteParent(w: RevWalk, start: Oid): Oid =
     result = follow[0]
 
 proc everybodyUninteresting(w: RevWalk): bool =
+  ## Is nothing left in the queue that could still be shown?  The walk's
+  ## stopping rule.
   for i in 0 ..< w.queue.len:
     if wfUninteresting notin w.flags.getOrDefault(w.queue[i].oid): return false
   true
@@ -436,6 +443,8 @@ proc topoSort(w: RevWalk, list: seq[RevEntry]): seq[RevEntry] =
   var heap = initHeapQueue[QItem]()
   var counter = 0
   proc put(o: Oid) =
+    ## Queue a commit for output in the chosen order: a stack for
+    ## `--topo-order`, the date heap otherwise.
     if w.order == roTopo: stack.add o
     else:
       inc counter
@@ -620,25 +629,20 @@ proc mergeBase*(repo: Repository, a, b: Oid): Oid =
   let m = repo.mergeBases(a, [b])
   if m.len > 0: m[0] else: nullOid
 
+proc ancestry*(repo: Repository, tips: seq[Oid],
+               exclude = initHashSet[Oid]()): HashSet[Oid] =
+  ## Every commit reachable from `tips`, never entering `exclude`.  The one
+  ## explicit-stack walk that `--merged`, `--contains`' cutoff and the
+  ## ahead/behind counts all need; a `RevWalk` is for *ordered* output and
+  ## costs more than this.
+  var stack = tips
+  while stack.len > 0:
+    let o = stack.pop()
+    if o in result or o in exclude: continue
+    result.incl o
+    for p in repo.readCommit(o).parents: stack.add p
+
 proc countRange*(repo: Repository, tip, other: Oid): int =
-  ## How many commits are reachable from `tip` but not from `other`: the left
-  ## half of `rev-list --count --left-right other...tip`, and the "ahead" in
-  ## `[ahead 3, behind 1]`.
-  var seen: HashSet[Oid]
-  var stack = @[other]
-  # Painting the excluded side first is the cheap approximation git makes in
-  # `commit-reach.c`: mark everything reachable from `other`, then count what
-  # a walk from `tip` reaches without crossing into it.
-  while stack.len > 0:
-    let o = stack.pop()
-    if o in seen: continue
-    seen.incl o
-    for p in repo.readCommit(o).parents: stack.add p
-  var visited: HashSet[Oid]
-  stack = @[tip]
-  while stack.len > 0:
-    let o = stack.pop()
-    if o in seen or o in visited: continue
-    visited.incl o
-    inc result
-    for p in repo.readCommit(o).parents: stack.add p
+  ## How many commits `tip` has that `other` does not: `other..tip`, which is
+  ## what `ahead 3` in a tracking line counts.
+  repo.ancestry(@[tip], repo.ancestry(@[other])).len

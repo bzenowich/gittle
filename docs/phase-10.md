@@ -135,28 +135,23 @@ in the repository — and rewriting a pack means re-deltifying it, which gittle
 repository whose 304 MiB pack came from a clone would come out of a naive
 `gittle gc` at 3,122 MiB (plan.md §3.1, measured).
 
-So `gittle gc` folds **loose objects** into a new pack and leaves the packs
-that were already there alone. The result has more packs than git would
-leave, all of them optimally deltified, and a real `git gc` run later in the
-same repository restores git's own layout exactly. The only thing gittle must
-never do is undo it, and the oracle tests exactly that: pack with git, commit
-with gittle, `gittle gc`, and assert the inherited pack is still there.
-
-**The roots are wider than "the refs",** and each extra one is a way work has
-actually been lost:
-
-| root | what only it keeps |
-|---|---|
-| every ref | the obvious half |
-| every **reflog** entry, in every worktree | what `reset --hard` moved off — the entire reason `reset --hard ORIG_HEAD` works |
-| every worktree's **index** | a blob that has been `add`ed and not committed: no tree names it yet |
-| every worktree's **HEAD** | a detached checkout in a linked worktree that no branch reaches |
-
-git collects the same four (`reachable.c:mark_reachable_objects`). Unreachable
-loose objects are deleted only when they are also older than the expiry — two
-weeks by default, as in git — and not at all when
-`extensions.preciousObjects` is set, which is the promise plan.md §6 made when
-it decided to accept that extension.
+Phase 10 therefore shipped a `gc` that folded **loose objects** into a new
+pack of its own — a copy of every object at full size — and left the packs
+that were already there alone. **The refactoring pass replaced that packer
+with the server** (docs/minimize.md §3.4): the remote always runs full git,
+so `gittle gc` now opens it the way `fetch` does and runs one fetch whose
+wants are every tip the remote advertises that is already here and whose
+haves are the commits at the edge of the *largest existing pack*. The
+server's `pack-objects` sends everything outside that pack — including what
+gittle held loose — properly deltified, non-thin, through the same
+`installPack` checks a fetch gets, and no ref moves. Then a delete pass with
+one rule: a loose object or a smaller pack goes only when every object in it
+exists in a pack being kept. `--full` offers no haves and leaves one pack;
+what was never pushed stays loose until the first `gc` after a push; nothing
+unreachable is ever pruned; `extensions.preciousObjects` skips the delete
+pass; and the pack a clone received is still there afterwards, which the
+oracle tests exactly (**R2a**). The reflog-as-root, index-as-root and
+`--prune=<date>` machinery below went with the packer.
 
 ## What `gc` deliberately does not do
 

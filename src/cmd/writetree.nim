@@ -7,14 +7,10 @@
 
 import ../cli, ../index, ../repository, ../trees, ../util
 
-const usageText = "usage: gittle write-tree"
-
 proc cmdWriteTree*(c: Ctx, args: seq[string]): int =
-  for a in args:
-    if a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    fail("unknown option '" & a & "'\n" & usageText)
+  ## Entry point: write the index as a tree and print its ID.
+  let o = parse([], args, "write-tree", "")
+  failIf(o.args.len > 0, o.use)
   let repo = c.repo
   echo $repo.writeTree(readIndex(repo.indexPath))
   0

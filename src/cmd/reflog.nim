@@ -24,34 +24,23 @@ import std/strutils
 import ../cli, ../commitobj, ../refs, ../repository, ../revision,
        ../revwalk, ../util
 
-const usageText = """usage: gittle reflog [show] [<ref>]
-
-Only `show` is implemented; `expire`, `delete`, `drop`, `exists` and `write`
-are out of scope for gittle v1 (docs/11)."""
+const
+  synopsis = "[show] [-n <count>] [<ref>]"
+  options = [
+    opt("-n|--max-count", okValue, key = "n", arg = "<count>",
+        help = "show only the newest <count> entries; -<count> says the same"),
+  ]
 
 proc cmdReflog*(c: Ctx, args: seq[string]): int =
+  ## Only `show` is implemented; `expire`, `delete`, `drop`, `exists` and
+  ## `write` are out of scope (docs/11).
+  let o = parse(options, args, "reflog", synopsis, numeric = true)
   var rest: seq[string]
-  var i = 0
-  var maxCount = -1
-  while i < args.len:
-    let a = args[i]
+  for a in o.args:
     if a in ["expire", "delete", "drop", "exists", "write", "list"]:
       fail("'reflog " & a & "' is out of scope for gittle v1 (docs/11)")
-    elif a == "show": discard
-    elif a == "-h" or a == "--help": (echo usageText; return 0)
-    elif a == "-n" or a.startsWith("--max-count"):
-      if a.contains('='): maxCount = parseInt(a[a.find('=') + 1 .. ^1])
-      else:
-        inc i
-        failIf(i >= args.len, "option '" & a & "' requires a value")
-        maxCount = parseInt(args[i])
-    elif a.len > 1 and a[0] == '-' and a[1] in {'0' .. '9'}:
-      maxCount = parseInt(a[1 .. ^1])
-    elif a.len > 1 and a[0] == '-':
-      fail("unknown option '" & a & "'\n" & usageText)
-    else: rest.add a
-    inc i
-
+    elif a != "show": rest.add a
+  let maxCount = if o.has "n": parseInt(o.val "n") else: -1
   let repo = c.repo
   # A bare name is a ref, and `HEAD` is the default -- the same DWIM every
   # other command uses, so `reflog main` and `reflog refs/heads/main` agree.

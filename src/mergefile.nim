@@ -108,6 +108,8 @@ proc append(regions: var seq[Region], mode, i0, chg0, i1, chg1, i2, chg2: int) =
                        i2: i2, chg2: chg2)
 
 proc sameLines(ours, theirs: seq[string], i1, i2, count: int): bool =
+  ## Are `count` lines of the two sides identical, starting at `i1` and
+  ## `i2`?  The identical-edit case of `xdl_do_merge`.
   for k in 0 ..< count:
     if ours[i1 + k] != theirs[i2 + k]: return false
   true
@@ -214,6 +216,8 @@ proc refine(regions: var seq[Region], ours, theirs: seq[string]) =
   regions = out0
 
 func containsAlnum(lines: seq[string], start, count: int): bool =
+  ## Does any of the lines hold a letter or a digit?  What
+  ## `XDL_MERGE_ZEALOUS_ALNUM` asks of a gap before keeping it.
   for i in start ..< start + count:
     for ch in lines[i]:
       if ch in {'0' .. '9', 'A' .. 'Z', 'a' .. 'z'}: return true
@@ -279,6 +283,8 @@ func copyRecs(recs: seq[string], start, count: int,
     result.add '\n'
 
 func marker(ch: char, size: int, label: string, cr: bool): string =
+  ## One conflict marker line: the character `size` times, the label, and
+  ## a CR when the file uses CRLF.
   result = repeat(ch, size)
   if label.len > 0: result.add ' ' & label
   if cr: result.add '\r'

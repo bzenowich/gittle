@@ -84,13 +84,16 @@ type
     refChildren: Table[Oid, seq[int]]
 
 func be32(b: ptr UncheckedArray[byte], at: int): uint32 {.inline.} =
+  ## A big-endian 32-bit field of a mapped pack.
   (uint32(b[at]) shl 24) or (uint32(b[at+1]) shl 16) or
   (uint32(b[at+2]) shl 8) or uint32(b[at+3])
 
 func put32(s: var string, v: uint32) =
+  ## Append a big-endian 32-bit field.
   for i in countdown(3, 0): s.add char((v shr (i * 8)) and 0xFF)
 
 func put64(s: var string, v: uint64) =
+  ## Append a big-endian 64-bit field.
   for i in countdown(7, 0): s.add char((v shr (i * 8)) and 0xFF)
 
 # ---------------------------------------------------------------------------
@@ -126,12 +129,15 @@ proc verifyChecksum(path: string): Oid =
   want
 
 proc remap(ix: Indexer) =
+  ## Map the pack again after it grew (a thin pack's appended bases).
   if ix.pack != nil: ix.map.close()
   ix.map = memfiles.open(ix.path)
   ix.pack = cast[ptr UncheckedArray[byte]](ix.map.mem)
   ix.len = ix.map.size
 
 proc packObjectCount(ix: Indexer): int =
+  ## Check the `PACK` signature and version, and read the object count
+  ## from the header.
   for i in 0 ..< 4:
     failIf(char(ix.pack[i]) != "PACK"[i], "bad packfile signature in " & ix.path)
   let v = be32(ix.pack, 4)
@@ -167,6 +173,8 @@ proc scan(ix: Indexer, count: int) =
          " bytes after the last object")
 
 proc buildChildLists(ix: Indexer) =
+  ## Index every delta by its base, so resolving a base can resolve what
+  ## hangs off it without a second scan.
   ix.ofsChildren.clear()
   ix.refChildren.clear()
   ix.byOid.clear()
@@ -182,6 +190,7 @@ proc buildChildLists(ix: Indexer) =
 # ---------------------------------------------------------------------------
 
 proc objectAt(ix: Indexer, i: int): string =
+  ## Inflate entry `i` as stored -- a delta's bytes are the delta.
   inflateEntryAt(ix.pack, ix.len, readEntryAt(ix.pack, ix.len,
                                               ix.entries[i].offset,
                                               ix.path)).data
@@ -202,6 +211,8 @@ proc resolveOne(ix: Indexer, i: int, kind: ObjectType, base: string,
 
 proc resolveChildren(ix: Indexer, i: int, kind: ObjectType, data: string,
                      pending: var int) =
+  ## Every delta whose base is entry `i`: apply it, record the object, and
+  ## recurse into its own children.
   for c in ix.ofsChildren.getOrDefault(ix.entries[i].offset):
     if not ix.entries[c].resolved: ix.resolveOne(c, kind, data, pending)
   for c in ix.refChildren.getOrDefault(ix.entries[i].oid):
@@ -263,6 +274,9 @@ proc appendObjects(ix: Indexer, objs: seq[GitObject]) =
 
 proc resolve(ix: Indexer, fixThin: bool,
              findExternal: proc (o: Oid): GitObject) =
+  ## Resolve every delta: the ones whose base is in the pack from their
+  ## base, and under `fixThin` the ones whose base is not by fetching it
+  ## through `findExternal` and appending it to the pack.
   var pending = 0
   for e in ix.entries:
     if not e.resolved: inc pending

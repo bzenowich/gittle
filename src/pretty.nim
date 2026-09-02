@@ -17,21 +17,16 @@
 ## | `--date=` | example |
 ## |---|---|
 ## | `default` | `Tue Sep 1 14:48:08 2026 -0400` |
-## | `relative` | `3 weeks ago` |
 ## | `iso8601` | `2026-09-01 14:48:08 -0400` |
 ## | `iso8601-strict` | `2026-09-01T14:48:08-04:00` |
 ## | `rfc2822` | `Tue, 1 Sep 2026 14:48:08 -0400` |
 ## | `short` | `2026-09-01` |
 ## | `raw` | `1788288488 -0400` |
 ## | `unix` | `1788288488` |
-## | `human` | drops what the reader can infer -- see below |
-## | `format:<strftime>` | whatever you asked for |
 ##
-## `human` is the only one with judgement in it (`date.c:show_date_normal`): it
-## drops the year when it is this year, the date as well when it is today, the
-## timezone when it is yours, and the seconds always -- and a time today
-## degrades to the relative form.  Reproduced rather than approximated, because
-## an approximation is right until the reader is in a different month.
+## `relative`, `human` and `format:<strftime>` were removed in the
+## minimization pass (docs/minimize.md §3, tier 3): display conveniences no
+## script depends on, and a quarter of this module between them.
 ##
 ## ## Why the month and weekday names are here
 ##
@@ -47,50 +42,37 @@ const
   weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
   monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-  fullWeekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday",
-                      "Friday", "Saturday"]
-  fullMonthNames = ["January", "February", "March", "April", "May", "June",
-                    "July", "August", "September", "October", "November",
-                    "December"]
 
 type
   DateKind* = enum
-    dkDefault, dkRelative, dkIso, dkIsoStrict, dkRfc, dkShort, dkRaw,
-    dkUnix, dkHuman, dkStrftime
+    dkDefault, dkIso, dkIsoStrict, dkRfc, dkShort, dkRaw, dkUnix
 
   DateMode* = object
     kind*: DateKind
     local*: bool        ## render in *our* timezone, not the recorded one
-    strftime*: string
 
 proc parseDateMode*(spec: string): DateMode =
-  ## `--date=<format>`, including the `-local` suffix every named format
-  ## accepts (`date.c:parse_date_format`).
+  ## `--date=<mode>[-local]`.  `relative`, `human` and `format:<strftime>`
+  ## were removed in the minimization pass (docs/minimize.md §3, tier 3):
+  ## each is a display convenience no script can depend on, and together
+  ## they were a quarter of this module.
   var s = spec
   if s.endsWith("-local"):
     result.local = true
     s = s[0 ..< s.len - 6]
-  if s.startsWith("format:") or s.startsWith("format-local:"):
-    result.local = result.local or s.startsWith("format-local:")
-    result.kind = dkStrftime
-    result.strftime = s[s.find(':') + 1 .. ^1]
-    return
   result.kind = case s
     of "", "default", "normal": dkDefault
     of "local": (result.local = true; dkDefault)
-    of "relative": dkRelative
     of "iso", "iso8601": dkIso
     of "iso-strict", "iso8601-strict": dkIsoStrict
     of "rfc", "rfc2822": dkRfc
     of "short": dkShort
     of "raw": dkRaw
     of "unix": dkUnix
-    of "human": dkHuman
-    else: fail("unknown date format '" & spec & "'")
-
-# ---------------------------------------------------------------------------
-# Rendering one instant
-# ---------------------------------------------------------------------------
+    else:
+      fail((if s in ["relative", "human"] or s.startsWith("format"):
+              "--date=" & s & " is out of scope for gittle (docs/minimize.md §3)"
+            else: "unknown date format '" & spec & "'"))
 
 type Broken = object
   year, mon, mday, hour, min, sec, wday, yday: int
@@ -114,96 +96,6 @@ proc localOffset(when0: int64): int =
   ## in, and what `human` compares against.
   -(local(fromUnix(when0)).utcOffset div 60)
 
-proc relativeDate(when0, now0: int64): string =
-  ## `date.c:show_date_relative`, unit for unit and rounding for rounding.
-  ## The thresholds are not round numbers (90 seconds, 36 hours, 10 weeks) and
-  ## every one of them shows up in output somebody compares.
-  if now0 < when0: return "in the future"
-  proc plural(n: int64, unit: string): string =
-    $n & " " & unit & (if n == 1: "" else: "s") & " ago"
-  var diff = now0 - when0
-  if diff < 90: return plural(diff, "second")
-  diff = (diff + 30) div 60
-  if diff < 90: return plural(diff, "minute")
-  diff = (diff + 30) div 60
-  if diff < 36: return plural(diff, "hour")
-  diff = (diff + 12) div 24
-  if diff < 14: return plural(diff, "day")
-  if diff < 70: return plural((diff + 3) div 7, "week")
-  if diff < 365: return plural((diff + 15) div 30, "month")
-  if diff < 1825:
-    let totalMonths = (diff * 12 * 2 + 365) div (365 * 2)
-    let years = totalMonths div 12
-    let months = totalMonths mod 12
-    if months == 0: return plural(years, "year")
-    return $years & " year" & (if years == 1: "" else: "s") & ", " &
-           $months & " month" & (if months == 1: "" else: "s") & " ago"
-  plural((diff + 183) div 365, "year")
-
-proc strftimeLike(fmt: string, b: Broken, tzMinutes: int,
-                  when0: int64): string =
-  ## The `format:` directives worth having, as a table (R7).  An unrecognised
-  ## one is emitted verbatim rather than guessed at.
-  var i = 0
-  while i < fmt.len:
-    if fmt[i] != '%' or i + 1 >= fmt.len:
-      result.add fmt[i]
-      inc i
-      continue
-    case fmt[i + 1]
-    of 'Y': result.add $b.year
-    of 'y': result.add pad2(b.year mod 100)
-    of 'm': result.add pad2(b.mon + 1)
-    of 'd': result.add pad2(b.mday)
-    of 'e': result.add (if b.mday < 10: " " else: "") & $b.mday
-    of 'H': result.add pad2(b.hour)
-    of 'M': result.add pad2(b.min)
-    of 'S': result.add pad2(b.sec)
-    of 'a': result.add weekdayNames[b.wday]
-    of 'A': result.add fullWeekdayNames[b.wday]
-    of 'b', 'h': result.add monthNames[b.mon]
-    of 'B': result.add fullMonthNames[b.mon]
-    of 'j': result.add align($(b.yday + 1), 3, '0')
-    of 'z': result.add tzString(tzMinutes)
-    of 'F': result.add $b.year & "-" & pad2(b.mon + 1) & "-" & pad2(b.mday)
-    of 'T': result.add pad2(b.hour) & ":" & pad2(b.min) & ":" & pad2(b.sec)
-    of 's': result.add $when0
-    of '%': result.add '%'
-    else:
-      result.add fmt[i]
-      result.add fmt[i + 1]
-    i += 2
-
-proc humanDate(b: Broken, tzMinutes: int, when0, now0: int64): string =
-  ## `date.c:show_date_normal` with the "human" comparison filled in: drop
-  ## whatever the reader can infer from today's date, and fall back to the
-  ## relative form for anything from today.
-  let nowTz = localOffset(now0)
-  let n = breakDown(now0, nowTz)
-  var hideTz = tzMinutes == nowTz
-  let hideYear = b.year == n.year
-  var hideDate = false
-  var hideWday = false
-  if hideYear and b.mon == n.mon:
-    if b.mday > n.mday: discard          # in the future: leave everything on
-    elif b.mday == n.mday: (hideDate = true; hideWday = true)
-    elif b.mday + 5 > n.mday: hideDate = true
-  # Anything from today degrades to the relative form, which is more useful
-  # than a clock time the reader can already see.
-  if hideWday: return relativeDate(when0, now0)
-  # Seconds always go; the timezone goes whenever the date is shown; and the
-  # weekday *and* the time go whenever the year has to be shown, because a
-  # date that old makes the hour noise.
-  hideTz = hideTz or not hideDate
-  hideWday = not hideYear
-  let hideTime = not hideYear
-  if not hideWday: result.add weekdayNames[b.wday] & " "
-  if not hideDate: result.add monthNames[b.mon] & " " & $b.mday & " "
-  if not hideTime: result.add pad2(b.hour) & ":" & pad2(b.min)
-  else: result = result.strip(leading = false)
-  if not hideYear: result.add " " & $b.year
-  if not hideTz: result.add " " & tzString(tzMinutes)
-
 proc formatDate*(when0: int64, tzMinutes: int, mode: DateMode,
                  now0: int64): string =
   ## `now0` is passed in rather than read from the clock so that a single
@@ -213,7 +105,6 @@ proc formatDate*(when0: int64, tzMinutes: int, mode: DateMode,
   var tz = tzMinutes
   if mode.local: tz = localOffset(when0)
   if mode.kind == dkRaw: return $when0 & " " & tzString(tz)
-  if mode.kind == dkRelative: return relativeDate(when0, now0)
   let b = breakDown(when0, tz)
   case mode.kind
   of dkShort:
@@ -232,10 +123,6 @@ proc formatDate*(when0: int64, tzMinutes: int, mode: DateMode,
     weekdayNames[b.wday] & ", " & $b.mday & " " & monthNames[b.mon] & " " &
       $b.year & " " & pad2(b.hour) & ":" & pad2(b.min) & ":" & pad2(b.sec) &
       " " & tzString(tz)
-  of dkStrftime:
-    strftimeLike(mode.strftime, b, tz, when0)
-  of dkHuman:
-    humanDate(b, tz, when0, now0)
   else:
     # The default format, and the one place `-local` changes more than the
     # numbers: rendering in the reader's own zone makes the offset noise, so
@@ -417,29 +304,6 @@ proc expandFormat(repo: Repository, o: Oid, c: Commit, fmt: string,
         if k > 0: result.add ' '
         result.add repo.uniqueAbbrev(p, opts.abbrev)
     of 's': result.add subject(c.message)
-    of 'f':
-      # The subject "sanitised for a filename" (`pretty.c:format_sanitized_
-      # subject`): runs of anything but a letter, digit, `.` or `_` become one
-      # dash, with no dash at either end -- so it can be a file name without
-      # further quoting, which is what `format-patch` uses it for.
-      let start = result.len
-      var space = 2       # 2 means "at the start", so no leading dash
-      let subj = subjectLine(c.message)
-      var k = 0
-      while k < subj.len:
-        let ch = subj[k]
-        if ch.isAlphaNumeric or ch == '.' or ch == '_':
-          if space == 1: result.add '-'
-          space = 0
-          result.add ch
-          # A run of dots collapses to one: `...` in a subject would otherwise
-          # survive into something meant to be a file name.
-          if ch == '.':
-            while k + 1 < subj.len and subj[k + 1] == '.': inc k
-        else: space = space or 1
-        inc k
-      while result.len > start and result[^1] in {'.', '-'}:
-        result.setLen(result.len - 1)
     of 'b': result.add body(c.message)
     of 'B': result.add c.message
     of 'e': discard          # encoding; gittle writes only UTF-8
@@ -472,7 +336,6 @@ proc expandFormat(repo: Repository, o: Oid, c: Commit, fmt: string,
         of 'd': result.add formatDate(id.when0, id.tzOffset, opts.dateMode, opts.now)
         of 'D': result.add formatDate(id.when0, id.tzOffset,
                                       DateMode(kind: dkRfc), opts.now)
-        of 'r': result.add relativeDate(id.when0, opts.now)
         of 't': result.add $id.when0
         of 'i': result.add formatDate(id.when0, id.tzOffset,
                                       DateMode(kind: dkIso), opts.now)

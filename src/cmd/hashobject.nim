@@ -2,51 +2,32 @@
 ##
 ## In scope (docs/10): `<file>...`, `-t`, `-w`, `--stdin`.
 
-import std/[strutils, os]
+import std/os
 import ../cli, ../objects, ../oid, ../repository, ../util
 
-const usageText = "usage: gittle hash-object [-t <type>] [-w] [--stdin] [--] <file>..."
+const
+  synopsis = "[-t <type>] [-w] [--stdin] [--] <file>..."
+  options = [
+    opt("-t", okValue, arg = "<type>", help = "the object type; blob by default"),
+    opt("-w", help = "write the object into the repository as well"),
+    opt("--stdin", help = "read the content from standard input"),
+  ]
 
 proc hashOne(c: Ctx, kind: ObjectType, data: string, write: bool) =
+  ## Hash one blob, and store it under `-w`.
   let o = if write: c.repo.writeObject(kind, data)
           else: hashObject(kind, data)
   echo $o
 
 proc cmdHashObject*(c: Ctx, args: seq[string]): int =
-  var kind = otBlob
-  var write = false
-  var fromStdin = false
-  var files: seq[string]
-  var i = 0
-  var noMoreOpts = false
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-' or a == "-":
-      files.add a
-    elif a == "--":
-      noMoreOpts = true
-    elif a == "-t":
-      inc i
-      failIf(i >= args.len, "option '-t' requires a value\n" & usageText)
-      kind = parseObjectType(args[i])
-      failIf(kind == otBad, "invalid object type '" & args[i] & "'")
-    elif a.startsWith("-t"):
-      kind = parseObjectType(a[2 .. ^1])
-      failIf(kind == otBad, "invalid object type '" & a[2 .. ^1] & "'")
-    elif a == "-w":
-      write = true
-    elif a == "--stdin":
-      fromStdin = true
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    else:
-      fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
-  failIf(not fromStdin and files.len == 0, usageText)
-
-  # git hashes stdin first, then the file arguments (builtin/hash-object.c).
+  ## Entry point: parse, then hash stdin or each named file.
+  let o = parse(options, args, "hash-object", synopsis)
+  let kind = if o.has "t": parseObjectType(o.val "t") else: otBlob
+  failIf(kind == otBad, "invalid object type '" & o.val("t") & "'")
+  let write = o.has "w"
+  let fromStdin = o.has "stdin"
+  let files = o.args
+  failIf(not fromStdin and files.len == 0, o.use)
   if fromStdin:
     hashOne(c, kind, readAll(stdin), write)
   for f in files:

@@ -38,16 +38,6 @@ import ../cli, ../diffcore, ../index, ../objects, ../pathspec,
 import branch as cmdbranch
 
 const
-  usageText = """usage: gittle checkout [<options>] <branch>
-   or: gittle checkout [<options>] [<tree-ish>] [--] <pathspec>…
-
-   -b <branch>               create a branch and switch to it
-   -B <branch>               as -b, resetting the branch if it exists
-   -d, --detach              check out a commit, leaving HEAD detached
-   -f, --force               throw away local changes while switching
-   -q, --quiet               say nothing on success
-   -t, --track, --no-track   set up (or do not set up) upstream tracking
-   --ours, --theirs          for unmerged paths, take stage 2 or stage 3"""
 
   detachedAdvice = """
 
@@ -262,51 +252,56 @@ proc doRestore(c: Ctx, source: string, sourceGiven: bool, specs: seq[string],
   idx.writeIndex()
   0
 
+const
+  synopses: array[Mode, string] = [
+    "[<options>] <branch>\n[<options>] [<commit>] [--] <pathspec>…\n-b|-B <new-branch> [<start-point>]",
+    "[<options>] <branch>\n-c|-C <new-branch> [<start-point>]\n-d <commit>",
+    "[-s <tree-ish>] [-S] [-W] [--ours | --theirs] [--] <pathspec>…"]
+  options = [
+    opt("-f|--force|--discard-changes", help = "throw away local changes in the way"),
+    opt("-q|--quiet", help = "say nothing"),
+    opt("-d|--detach", help = "detach HEAD at the commit"),
+    opt("-t|--track", help = "set up upstream tracking from the start point"),
+    opt("--no-track", help = "do not set up tracking"),
+    opt("-b|-c|--create", okValue, arg = "<branch>", help = "create a branch first"),
+    opt("-B|-C|--force-create", okValue, arg = "<branch>", help = "create or reset a branch first"),
+    opt("-s|--source", okValue, arg = "<tree-ish>", help = "restore from this tree"),
+    opt("-S|--staged", help = "restore the index"),
+    opt("-W|--worktree", help = "restore the working tree (the default)"),
+    opt("--ours", help = "take our side of a conflict"),
+    opt("--theirs", help = "take their side of a conflict"),
+    opt("-m|--merge|-p|--patch|--orphan|--overlay|--no-overlay|--conflict|--guess|--no-guess",
+        okRefused, help = "docs/06"),
+  ]
+  names: array[Mode, string] = ["checkout", "switch", "restore"]
+
 proc run(c: Ctx, args: seq[string], mode: Mode): int =
-  var newBranch = ""
-  var source = ""
-  var specs: seq[string]
-  var rest: seq[string]
-  var forceBranch, detach, force, quiet, track, trackGiven = false
-  var sourceGiven, staged, worktreeGiven, seenDashDash = false
+  ## The one body behind `checkout`, `switch` and `restore`: parse against
+  ## the mode's synopsis, decide whether the positionals are a branch or
+  ## paths, and hand off to the branch switch or the path restore.
+  let o = parse(options, args, names[mode], synopses[mode])
+  var track, trackGiven = false
   var stage = 0
-  var i = 0
-  let a2 = expandShortOptions(args, {'b', 'B', 'c', 'C', 's'})
-
-  optionValue(a2, i)
-
-  while i < a2.len:
-    let a = a2[i]
-    if seenDashDash: specs.add a
-    elif a == "--": seenDashDash = true
-    elif a.len > 1 and a[0] == '-':
-      case a
-      of "-f", "--force", "--discard-changes": force = true
-      of "-q", "--quiet": quiet = true
-      of "-d", "--detach": detach = true
-      of "-t", "--track": (track = true; trackGiven = true)
-      of "--no-track": (track = false; trackGiven = true)
-      of "-S", "--staged": staged = true
-      of "-W", "--worktree": worktreeGiven = true
-      of "-h", "--help": (echo usageText; return 0)
-      of "--ours": stage = 2
-      of "--theirs": stage = 3
-      of "-m", "--merge", "-p", "--patch", "--orphan", "--overlay",
-         "--no-overlay", "--conflict", "--guess", "--no-guess":
-        fail(a & " is out of scope for gittle v1 (docs/06)")
-      else:
-        if a == "-b" or a == "-c" or a == "--create": newBranch = valueFor(a)
-        elif a == "-B" or a == "-C" or a == "--force-create":
-          newBranch = valueFor(a)
-          forceBranch = true
-        elif a == "-s" or a.startsWith("--source"):
-          source = valueFor(a)
-          sourceGiven = true
-        else: fail("unknown option '" & a & "'\n" & usageText)
-    else:
-      rest.add a
-    inc i
-
+  for (k, _) in o.occurrences:
+    case k
+    of "track": (track = true; trackGiven = true)
+    of "no-track": (track = false; trackGiven = true)
+    of "ours": stage = 2
+    of "theirs": stage = 3
+    else: discard
+  let force = o.has "force"
+  let quiet = o.has "quiet"
+  let detach = o.has "detach"
+  let staged = o.has "staged"
+  let worktreeGiven = o.has "worktree"
+  let forceBranch = o.has "force-create"
+  var newBranch = if forceBranch: o.val "force-create" else: o.val "create"
+  var sourceGiven = o.has "source"
+  var source = o.val "source"
+  let seenDashDash = o.dashDash
+  # Before `--` a word may be a revision or a path; after it, only a path.
+  var rest = if o.dashDashAt >= 0: o.args[0 ..< o.dashDashAt] else: o.args
+  var specs = if o.dashDashAt >= 0: o.args[o.dashDashAt .. ^1] else: @[]
   let repo = c.repo
 
   if mode == mRestore:
@@ -343,11 +338,11 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
     return c.doRestore(tree, given, specs, toWorktree = true, toIndex = given,
                        stage = stage, report = not quiet and not seenDashDash)
 
-  failIf(rest.len > 1, usageText)
+  failIf(rest.len > 1, o.use)
   var target = if rest.len > 0: rest[0]
                elif newBranch.len > 0: "HEAD"
                else:
-                 failIf(mode == mCheckout, usageText)
+                 failIf(mode == mCheckout, o.use)
                  fail("you must specify a branch to switch to")
   # `checkout -` and `switch -` are `@{-1}`: the branch you were on before.
   if target == "-": target = "@{-1}"
@@ -370,6 +365,9 @@ proc run(c: Ctx, args: seq[string], mode: Mode): int =
   c.doSwitch(target, newBranch, forceBranch, detach, force, quiet,
              track, trackGiven)
 
+# Entry point for `checkout`.
 proc cmdCheckout*(c: Ctx, args: seq[string]): int = run(c, args, mCheckout)
+# Entry point for `switch`.
 proc cmdSwitch*(c: Ctx, args: seq[string]): int = run(c, args, mSwitch)
+# Entry point for `restore`.
 proc cmdRestore*(c: Ctx, args: seq[string]): int = run(c, args, mRestore)

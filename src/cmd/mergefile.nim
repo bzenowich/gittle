@@ -17,41 +17,29 @@
 import std/os
 import ../cli, ../mergefile, ../objects, ../util
 
-const usageText = """usage: gittle merge-file [-p] [-q] [-L <name1> [-L <orig> [-L <name2>]]]
-                         <current-file> <base-file> <other-file>"""
+
+const
+  synopsis = "[-p] [-q] [-L <name1> [-L <orig> [-L <name2>]]] <current-file> <base-file> <other-file>"
+  options = [
+    opt("-p|--stdout", help = "print the result instead of writing <current-file>"),
+    opt("-q|--quiet", help = "do not warn about conflicts"),
+    opt("-L", okValue, arg = "<label>", help = "a name for the next file, in the markers; up to three"),
+    opt("--object-id|--diff3|--zdiff3|--ours|--theirs|--union|--marker-size|--diff-algorithm",
+        okRefused, help = "docs/10"),
+  ]
 
 proc cmdMergeFile*(c: Ctx, argv: seq[string]): int =
-  var labels: seq[string]
-  var files: seq[string]
-  var toStdout = false
-  var quiet = false
-  var i = 0
-  var noMoreOpts = false
-  let args = expandShortOptions(argv, {'L'})
-
-  optionValue(args, i)
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-': files.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-p" or a == "--stdout": toStdout = true
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "-L":
-      failIf(labels.len >= 3, "too many labels on the command line")
-      labels.add valueFor(a)
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif a in ["--object-id", "--diff3", "--zdiff3", "--ours", "--theirs",
-               "--union", "--marker-size", "--diff-algorithm"]:
-      fail(a & " is out of scope for gittle v1 (docs/10)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
+  ## Entry point: parse, read the three files, merge, and write or print
+  ## the result; the exit status is the conflict count.
+  let o = parse(options, argv, "merge-file", synopsis)
+  var labels = o.vals "L"
+  failIf(labels.len > 3, "too many labels on the command line")
+  let toStdout = o.has "stdout"
+  let quiet = o.has "quiet"
+  let files = o.args
   if files.len != 3:
-    stderr.write usageText & "\n"
+    stderr.write o.use & "\n"
     return 129
-
   var text: array[3, string]
   for k in 0 .. 2:
     failIf(not fileExists(files[k]), "failed to read file '" & files[k] & "'")

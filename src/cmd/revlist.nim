@@ -26,72 +26,47 @@ import std/[sets, strutils]
 import ../cli, ../objects, ../oid, ../pretty, ../repository, ../revision,
        ../revwalk, ../util
 
-const usageText = """usage: gittle rev-list [<options>] <commit>… [[--] <path>…]
 
-   -n <n>, --max-count=<n>   stop after <n> commits
-   --skip=<n>                skip the first <n>
-   --since=<date>, --until=<date>
-   --merges, --no-merges     only, or never, commits with two or more parents
-   --first-parent            follow only the first parent of a merge
-   --not                     invert `^` for every following argument
-   --all, --branches[=<pat>], --tags[=<pat>], --remotes[=<pat>]
-   --stdin                   read further arguments from standard input
-   --topo-order, --date-order, --reverse, --no-walk[=(sorted|unsorted)]
-   --parents                 print each commit's parents after it
-   --left-right              mark which side of an A...B a commit came from
-   --count                   print how many commits, not which
-   --objects                 also print every reachable tree and blob
-   --pretty[=<fmt>], --format=<fmt>, --abbrev-commit, --date=<fmt>"""
+const
+  synopsis = "[<options>] <commit>… [[--] <path>…]"
+  options = [
+    opt("--oneline", help = "one line per commit: abbreviated ID and subject"),
+    opt("--abbrev-commit", help = "abbreviate the commit ID"),
+    opt("--no-abbrev-commit"),
+    opt("--abbrev", okValue, arg = "<n>", help = "abbreviate object IDs to <n> digits"),
+    opt("--date", okValue, arg = "<format>", help = "the date format"),
+    opt("--pretty|--format", okOptValue, key = "format", arg = "[=<format>]",
+        help = "print commits through a format, not as bare IDs"),
+  ]
 
 proc cmdRevList*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse, replay the walk options and revisions in order,
+  ## then walk and print IDs, counts, or formatted commits.
   if args.len == 0:
-    # git's usage exit for a command given nothing at all.  With any option at
-    # all but no revision it is not an error -- there is simply nothing to
-    # list, which is what makes `rev-list --objects --stdin` work.
-    stderr.write usageText & "\n"
+    stderr.write usage("rev-list", synopsis, @options & @walkOptions) & "\n"
     return 129
   let repo = c.repo
+  let p = parse(@options & @walkOptions, args, "rev-list", synopsis, numeric = true)
   let w = newRevWalk(repo)
   var ri = initRevInput()
   var opts = PrettyOpts(now: dateNow())
   var pretty = false
   var showParents = false
   var abbrevLen = 0
-  var i = 0
-
-  optionValue(args, i)
-
-  while i < args.len:
-    let a = args[i]
-    if ri.seenDashDash:
-      ri.specs.add a
-    elif a == "--":
-      ri.seenDashDash = true
-    elif a.len > 1 and a[0] == '-':
-      if w.parseWalkOpt(ri, a, valueFor): discard
-      elif a == "--parents": showParents = true
-      elif a == "-h" or a == "--help":
-        echo usageText
-        return 0
-      elif a == "--oneline":
-        pretty = true
-        opts.kind = pkOneline
-        opts.abbrevCommit = true
-      elif a == "--abbrev-commit": opts.abbrevCommit = true
-      elif a == "--no-abbrev-commit": opts.abbrevCommit = false
-      elif a.startsWith("--abbrev"): abbrevLen = parseInt(valueFor(a))
-      elif a.startsWith("--date"): opts.dateMode = parseDateMode(valueFor(a))
-      elif a.startsWith("--pretty") or a.startsWith("--format"):
-        pretty = true
-        parsePretty((if a.contains('='): a[a.find('=') + 1 .. ^1] else: ""), opts)
-      elif a.len > 1 and a[1] in {'0' .. '9'}:
-        ri.maxCount = parseInt(a[1 .. ^1])      # the bare `-5` form
-      else:
-        fail("unknown option '" & a & "'\n" & usageText)
+  for (k, v) in p.occurrences:
+    if k == "": w.addRevisionArg(ri, v)
+    elif k == "--": ri.seenDashDash = true
+    elif w.applyWalkOpt(ri, k, v): discard
     else:
-      w.addRevisionArg(ri, a)
-    inc i
-
+      case k
+      of "parents": showParents = true
+      of "oneline": (pretty = true; opts.kind = pkOneline; opts.abbrevCommit = true)
+      of "abbrev-commit": opts.abbrevCommit = true
+      of "no-abbrev-commit": opts.abbrevCommit = false
+      of "abbrev": abbrevLen = parseInt(v)
+      of "date": opts.dateMode = parseDateMode(v)
+      of "format": (pretty = true; parsePretty(v, opts))
+      else: discard
   opts.abbrev = if abbrevLen > 0: abbrevLen else: repo.autoAbbrev
   w.finishRevInput(ri, defaultHead = false)
 

@@ -114,6 +114,7 @@ proc lineEnd(msg: string, at: int): tuple[trimmed, next: int] =
   (n, if eol < 0: msg.len else: eol + 1)
 
 proc skipBlankLines(msg: string, at: int): int =
+  ## The offset of the first non-blank line at or after `at`, or the end.
   result = at
   while result < msg.len:
     let (trimmed, next) = msg.lineEnd(result)
@@ -188,6 +189,7 @@ proc body*(message: string): string =
 # ---------------------------------------------------------------------------
 
 func stripTrailingSpace(s: string): string =
+  ## Without trailing whitespace, newline included.
   var n = s.len
   while n > 0 and s[n - 1] in Whitespace: dec n
   s[0 ..< n]

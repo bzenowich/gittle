@@ -33,37 +33,30 @@ import std/[algorithm, os, posix, strutils]
 import ../cli, ../dir, ../ignore, ../index, ../oid, ../pathspec, ../repository,
        ../util
 
-const usageText = """usage: gittle add [-n] [-v] [-f] [-u] [-A] [--] <pathspec>…"""
+
+const
+  synopsis = "[-n] [-v] [-f] [-u] [-A] [--] <pathspec>…"
+  options = [
+    opt("-n|--dry-run", help = "report what would be staged, stage nothing"),
+    opt("-v|--verbose", help = "report every path staged or removed"),
+    opt("-f|--force", help = "stage ignored paths too"),
+    opt("-u|--update", help = "tracked paths only: no walk for new files"),
+    opt("-A|--all|--no-ignore-removal", key = "all",
+        help = "stage every change under the pathspec, removals included"),
+    opt("-p|--patch|-i|--interactive|-e|--edit", okRefused,
+        help = "interactive and hunk-level staging are cut (plan.md R6)"),
+  ]
 
 proc cmdAdd*(c: Ctx, argv: seq[string]): int =
-  let args = expandShortOptions(argv, {})
-  var dryRun = false
-  var verbose = false
-  var force = false
-  var updateOnly = false
-  var addAll = false
-  var specs: seq[string]
-  var i = 0
-  var noMoreOpts = false
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-':
-      specs.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-n" or a == "--dry-run": dryRun = true
-    elif a == "-v" or a == "--verbose": verbose = true
-    elif a == "-f" or a == "--force": force = true
-    elif a == "-u" or a == "--update": updateOnly = true
-    elif a == "-A" or a == "--all" or a == "--no-ignore-removal": addAll = true
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif a in ["-p", "--patch", "-i", "--interactive", "-e", "--edit"]:
-      fail(a & " is not implemented in this version\n" &
-           "  interactive and hunk-level staging are cut from v1 (plan.md R6)")
-    else:
-      fail("unknown option '" & a & "'\n" & usageText)
-    inc i
+  ## Entry point: parse, refuse ignored paths named outright, then stage
+  ## the index pass (tracked paths) and the walk pass (new files).
+  let o = parse(options, argv, "add", synopsis)
+  let dryRun = o.has "dry-run"
+  let verbose = o.has "verbose"
+  let force = o.has "force"
+  let updateOnly = o.has "update"
+  let addAll = o.has "all"
+  let specs = o.args
 
   failIf(updateOnly and addAll, "-u and -A are incompatible")
 

@@ -1,278 +1,118 @@
 ## `clean` -- delete what is in the working tree and in no tree at all.
 ##
-## In scope (docs/06): `<pathspec>…`, `-d`, `-f`/`--force`, `-n`/`--dry-run`,
-## `-q`/`--quiet`, `-e <pattern>`/`--exclude=<pattern>`, `-x`, `-X`.  `-i` is
-## cut with every other interactive engine (plan.md R6).
+## `-d`, `-f`/`--force`, `-n`/`--dry-run`, `-q`/`--quiet`, `-x`, `--` and
+## pathspecs.  `-e`, `-X`, `-i` and `-ff` are cut (docs/minimize.md §3.5).
 ##
-## ## The whole command is one decision: collapse, or descend
+## ## The untracked walk, then unlink
 ##
-## Finding untracked files is [dir.nim](../dir.nim)'s job and was built in
-## phase 4.  What `clean` adds is that it reports and removes *directories*,
-## and therefore has to decide, per directory, whether to name it once or to
-## name the files inside it.  git calls that `DIR_SHOW_OTHER_DIRECTORIES` and
-## `correct_untracked_entries`; the rule is:
+## `stash -u` already has the list this command needs: `dir.walkWorkTree`
+## returns every untracked, non-ignored *file* under a pathspec, sorted, and
+## marks a nested repository as `dir/`.  `clean` over that list is four
+## decisions, each about one line:
 ##
-## > A directory collapses to one entry when everything below it is going to
-## > be deleted anyway.  Anything below it that must survive -- a tracked
-## > file, or an ignored one that `-x` was not given for -- forces the walk
-## > to descend and name the deletable files one by one.
+## 1. walk with the ignore files, or with an *empty* ignore list under `-x`.
+##    That is what `-x` means -- "there are no ignore files", which is why
+##    `builtin/clean.c` skips `setup_standard_excludes` -- and not "delete
+##    ignored files too", a reading that only differs once an exclude pattern
+##    has to survive it;
+## 2. without `-d`, drop every file whose parent directory has nothing tracked
+##    under it.  That *is* an untracked directory, which git lists as one
+##    entry and then skips (`clean.c`, `S_ISDIR(st.st_mode) &&
+##    !remove_directories`); a file whose parent holds something tracked is
+##    one git descended to.  A pathspec implies `-d` (`if (argc)
+##    remove_directories = 1`);
+## 3. skip the nested repositories, as git does without `-ff`
+##    (`msg_skip_git_dir`): someone else's history is not this command's;
+## 4. unlink each file, then, under `-d`, sweep out every directory that is
+##    now empty and has nothing tracked below it.
 ##
-## Get it wrong in one direction and `clean -fd` removes a directory holding
-## `node_modules`; wrong in the other and it leaves empty directories behind.
+## Step 4 is where git's directory rule comes out for free.  git decides per
+## directory whether to name it once (`Removing build/`) or descend and name
+## the files -- `DIR_KEEP_UNTRACKED_CONTENTS`, `correct_untracked_entries` --
+## and a directory holding an ignored file is never collapsed, so `clean -fd`
+## leaves a directory that has `.o` files in it.  Here that directory is
+## simply not empty after the unlinks, so its `rmdir` fails, and the failure
+## is ignored.  What is lost is the collapsed *report*: gittle prints one line
+## per file where git prints the directory.  Stdout is compared for content
+## now, not bytes (docs/minimize.md §6); the state on disk is the same.
 ##
-## `-x` and `-X` do not select a third and fourth kind of path.  There is one
-## exclude list -- the `-e` patterns, plus the standard ignore files unless
-## `-x` said to leave them out -- and the two flags say which side of it to
-## delete:
-##
-## | | the exclude list is | deletable | a directory collapses when |
-## |---|---|---|---|
-## | (default) | `-e` + the ignore files | untracked, not excluded | nothing tracked or excluded below |
-## | `-x` | `-e` only | untracked, not excluded | nothing tracked or excluded below |
-## | `-X` | `-e` + the ignore files | untracked *and* excluded | everything below is excluded |
-##
-## Reading `-x` as "delete ignored files too" rather than "there are no
-## ignore files" gets `clean -x -e '*.log'` wrong: the `-e` pattern still has
-## to protect the files it names.
-##
-## ## Two rules that are not about ignore files
-##
-## * **A pathspec implies `-d`.**  `clean -f sub/` recurses into untracked
-##   directories under `sub/`, because naming a path is the same statement
-##   `-d` makes (`builtin/clean.c`, `if (argc) remove_directories = 1`).
-## * **A nested repository is skipped**, and reported, unless `-ff`.  Someone
-##   else's history is not this command's to throw away.
+## The sweep is a walk of its own rather than an `rmdir` of each removed
+## file's parents because an *empty* untracked directory is not in the file
+## walk at all, and `clean -fd` removes those too.  It stops where the file
+## walk stopped -- at an ignored directory, at a nested repository (whose own
+## `.git` has empty directories in it, `refs/tags` for one), and at anything
+## named `.git`, which `dir.c:treat_path` refuses at any depth.  And it
+## enters a tracked directory without removing it: `-d` also removes
+## `src/scratch/` when `src/` is tracked and `scratch/` is not.
 
-import std/[algorithm, os, strutils]
-import ../cli, ../ignore, ../index, ../pathspec, ../repository, ../util
+import std/[algorithm, os, posix, strutils]
+import ../cli, ../dir, ../ignore, ../index, ../pathspec, ../repository, ../util
 
-const usageText = """usage: gittle clean [-d] [-f] [-n] [-q] [-e <pattern>] [-x | -X] [--] [<pathspec>…]
+proc anyTrackedUnder(idx: Index, dir: string): bool =
+  ## Is anything below `dir/` in the index?  The entries are sorted by path,
+  ## so the first one at or after `dir/` settles the question.
+  let i = idx.entries.lowerBound(dir, proc(e: IndexEntry, d: string): int = cmp(e.path, d))
+  i < idx.entries.len and idx.entries[i].path.startsWith(dir)
 
-   -d              recurse into untracked directories
-   -f, --force     actually delete; required unless clean.requireForce is false
-   -n, --dry-run   report what would be deleted
-   -q, --quiet     report only errors
-   -e <pattern>    add an exclude pattern
-   -x              delete ignored files too
-   -X              delete only ignored files"""
+proc sweep(repo: Repository, idx: Index, ig: Ignore, ps: Pathspec, name: string,
+           dryRun, quiet: bool): bool =
+  ## Remove every empty untracked directory under `name` ("" for the root),
+  ## deepest first, and `name` itself when that empties it.  True when `name`
+  ## is gone -- or, dry-running, would be.
+  let full = repo.workTree / name
+  if name.len > 0 and (ig.isIgnored(name, true) or fileExists(full / ".git") or
+                       dirExists(full / ".git")): return false
+  result = name.len > 0 and not idx.anyTrackedUnder(name & "/") and ps.matches(name)
+  for kind, sub in walkDir(full, relative = true, checkDir = false):
+    if kind != pcDir or sub == ".git" or
+       not sweep(repo, idx, ig, ps, name / sub, dryRun, quiet): result = false
+  result = result and (dryRun or rmdir(cstring(full)) == 0)
+  if result and not quiet:
+    echo (if dryRun: "Would remove " else: "Removing ") & relativeTo(name, ps.prefix) & "/"
 
-type
-  Entry = object
-    path: string     ## root-relative; a directory carries a trailing `/`
-    isDir: bool
-
-  Cleaner = object
-    repo: Repository
-    idx: Index
-    ig: Ignore
-    ps: Pathspec
-    ignoredOnly: bool ## `-X`: delete what the exclude list names, and only that
-    dirs: bool       ## `-d`, or a pathspec, which means the same thing
-    keepNested: bool ## a nested repository is someone else's; `-ff` overrides
-
-proc anyTrackedUnder(cl: Cleaner, dir: string): bool =
-  ## Is anything below this directory in the index?  The entries are sorted by
-  ## path, so the first one that could be under `dir/` settles it.
-  var lo = 0
-  var hi = cl.idx.entries.len
-  while lo < hi:
-    let mid = (lo + hi) div 2
-    if cl.idx.entries[mid].path < dir: lo = mid + 1 else: hi = mid
-  lo < cl.idx.entries.len and cl.idx.entries[lo].path.startsWith(dir)
-
-proc isNestedRepo(full: string): bool =
-  fileExists(full / ".git") or dirExists(full / ".git")
-
-proc children(full: string): seq[string] =
-  ## The names in a directory, sorted.  Both walks here are in path order --
-  ## the scan because git reports in it, and the removal because a failure
-  ## report has to name the files it did remove in the same order.
-  for _, path in walkDir(full, relative = true, checkDir = false):
-    result.add path
-  sort(result)
-
-proc scan(cl: Cleaner, dir: string, found: var seq[Entry]):
-    tuple[keep, excluded: bool] =
-  ## Everything deletable under `dir` ("" or ending in `/`), and what was
-  ## found below it that is not.  The two flags are the collapse decision:
-  ## the caller uses them to choose between the entries this returned and one
-  ## entry naming `dir` itself.  `keep` means something below must survive
-  ## whatever the mode; `excluded` means something below matched the exclude
-  ## list, which is a reason to survive in one mode and to go in the other.
-  for name in children(cl.repo.workTree / dir):
-    if dir.len == 0 and name == ".git": continue
-    let rel = dir & name
-    let full = cl.repo.workTree / rel
-    let isDir = dirExists(full) and not symlinkExists(full)
-
-    if not isDir:
-      if cl.idx.isTracked(rel): (result.keep = true; continue)
-      let ex = cl.ig.isIgnored(rel, false)
-      if ex: result.excluded = true
-      if ex != cl.ignoredOnly:
-        # Not deletable in this mode.  Under `-X` that is a reason the
-        # directory cannot go as one unit; in the other modes it is recorded
-        # as `excluded` instead, because whether it blocks the collapse
-        # depends on `-d` -- see the collapse rule below.
-        if cl.ignoredOnly: result.keep = true
-        continue
-      if cl.ps.matches(rel): found.add Entry(path: rel)
-      else: result.keep = true            # a pathspec spared it, so it stays
-      continue
-
-    if cl.keepNested and isNestedRepo(full):
-      # Not listed at all: `dir.c`'s DIR_SKIP_NESTED_GIT.  It does *not* stop
-      # an ancestor from collapsing -- the removal walk meets it again and
-      # reports it there ("Skipping repository"), which is the only place the
-      # user is told about it.
-      continue
-
-    if cl.ig.isIgnored(rel, true):
-      # An excluded directory is never entered, whichever way round the modes
-      # are -- which is the rule the ignore engine is built around: a `!`
-      # inside it could not be reached, so it cannot re-include anything
-      # (plan.md §4).
-      result.excluded = true
-      if not cl.ignoredOnly: continue
-      if cl.ps.matches(rel): found.add Entry(path: rel & "/", isDir: true)
-      else: result.keep = true
-      continue
-    if not cl.ps.mightMatchDir(rel): (result.keep = true; continue)
-
-    var sub: seq[Entry]
-    let below = cl.scan(rel & "/", sub)
-    if below.keep: result.keep = true
-    if below.excluded: result.excluded = true
-    # Collapse only when the whole directory goes, and only when the
-    # directory itself is what the pathspec named.  Under `-X` "the whole
-    # directory" means everything below it was excluded; otherwise it means
-    # nothing below it was.  Without `-d` the exclude half does not apply:
-    # git does not even collect ignored paths then, and the collapsed entry
-    # is about to be skipped anyway.
-    let collapses = not below.keep and not cl.anyTrackedUnder(rel & "/") and
-                    (cl.ignoredOnly or not cl.dirs or not below.excluded) and
-                    cl.ps.matches(rel)
-    if collapses: found.add Entry(path: rel & "/", isDir: true)
-    else:
-      result.keep = true
-      found.add sub
-
-proc removeTree(cl: Cleaner, rel: string, dryRun, quiet: bool,
-                errors: var int): bool =
-  ## Delete a directory and everything in it, reporting what it could not.
-  ##
-  ## `builtin/clean.c:remove_dirs`, and the reporting is the interesting half:
-  ## when the directory goes entirely, only the directory is named, and when
-  ## something inside it survives, every file that *was* removed is named
-  ## instead.  Returns whether the directory is gone.
-  let full = cl.repo.workTree / rel
-  if cl.keepNested and isNestedRepo(full):
-    if not quiet:
-      echo (if dryRun: "Would skip repository " else: "Skipping repository ") &
-           relativeTo(rel, cl.ps.prefix)
-    return false
-
-  result = true
-  var removed: seq[string]
-  for name in children(full):
-    let child = rel & "/" & name
-    let childFull = full / name
-    if dirExists(childFull) and not symlinkExists(childFull):
-      if cl.removeTree(child, dryRun, quiet, errors):
-        # No trailing slash here, unlike the entry the caller printed: git
-        # builds these names from the walk and that one from the directory
-        # lister, and only the lister adds one.
-        removed.add relativeTo(child, cl.ps.prefix)
-      else: result = false
-    elif dryRun or tryRemoveFile(childFull):
-      removed.add relativeTo(child, cl.ps.prefix)
-    else:
-      stderr.write "warning: failed to remove " &
-                   relativeTo(child, cl.ps.prefix) & "\n"
-      inc errors
-      result = false
-
-  if result:
-    # Refusing to remove the directory the command was run in is git's rule,
-    # and it is a kindness: the shell would be left in a directory that is no
-    # longer there.
-    if (try: sameFile(full, getCurrentDir()) except OSError: false):
-      echo (if dryRun: "Would refuse to remove current working directory"
-            else: "Refusing to remove current working directory")
-      result = false
-    elif dryRun: discard
-    else:
-      try: removeDir(full)
-      except OSError:
-        stderr.write "warning: failed to remove " &
-                     relativeTo(rel, cl.ps.prefix) & "/\n"
-        inc errors
-        result = false
-  if not result and not quiet:
-    for p in removed:
-      echo (if dryRun: "Would remove " else: "Removing ") & p
+const
+  synopsis = "[-d] [-f] [-n] [-q] [-x] [--] [<pathspec>…]"
+  options = [
+    opt("-f|--force", okCount, help = "actually delete; required unless clean.requireForce is false"),
+    opt("-d", help = "recurse into untracked directories"),
+    opt("-n|--dry-run", help = "report what would be deleted"),
+    opt("-q|--quiet", help = "report only errors"),
+    opt("-x", help = "as if there were no ignore files at all"),
+    opt("-e|--exclude|-X|-i|--interactive", okRefused, help = "docs/minimize.md §3.5"),
+  ]
 
 proc cmdClean*(c: Ctx, argv: seq[string]): int =
-  var args = expandShortOptions(argv, {'e'})
-  var force = 0
-  var dryRun, quiet, dirs, alsoIgnored, ignoredOnly = false
-  var excludes, specs: seq[string]
-  var i = 0
-  var noMoreOpts = false
-  optionValue(args, i)
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-': specs.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-n" or a == "--dry-run": dryRun = true
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "-f" or a == "--force": inc force
-    elif a == "-d": dirs = true
-    elif a == "-x": alsoIgnored = true
-    elif a == "-X": ignoredOnly = true
-    elif a == "-e" or a.startsWith("--exclude"): excludes.add valueFor(a)
-    elif a == "-h" or a == "--help": (echo usageText; return 0)
-    elif a == "-i" or a == "--interactive":
-      fail("interactive cleaning is cut from v1 (plan.md R6)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
-  failIf(alsoIgnored and ignoredOnly,
-         "options '-x' and '-X' cannot be used together")
-
+  ## Entry point: parse, walk the untracked files, unlink what qualifies,
+  ## then sweep the directories that emptied.
+  let o = parse(options, argv, "clean", synopsis)
+  failIf(o.count("force") > 1, "-ff is cut (docs/minimize.md §3.5)")
+  let force = o.has "force"
+  var dirs = o.has "d"
+  let dryRun = o.has "dry-run"
+  let quiet = o.has "quiet"
+  let noIgnore = o.has "x"
+  let specs = o.args
   let repo = c.repo
   failIf(repo.workTree.len == 0, "this operation must be run in a work tree")
-  failIf(repo.cfg.getBool("clean.requireForce", true) and force == 0 and
-         not dryRun,
+  failIf(repo.cfg.getBool("clean.requireForce", true) and not force and not dryRun,
          "clean.requireForce is true and -f not given: refusing to clean")
+  dirs = dirs or specs.len > 0                    # naming a path says what -d says
+  let idx = readIndex(repo.indexPath)
+  let ig = if noIgnore: newEmptyIgnore(repo) else: newIgnore(repo)
+  let ps = parsePathspec(specs, repo.prefix, implicitPrefix = true)
+  let verb = if dryRun: "Would remove " else: "Removing "
 
-  # `-x` is "there are no ignore files", not "delete ignored files too": the
-  # `-e` patterns are a separate, higher-precedence list and survive it.
-  var cl = Cleaner(
-    repo: repo, idx: readIndex(repo.indexPath),
-    ig: (if alsoIgnored: newEmptyIgnore(repo) else: newIgnore(repo)),
-    ps: parsePathspec(specs, repo.prefix, implicitPrefix = true),
-    ignoredOnly: ignoredOnly,
-    # Naming a path says the same thing `-d` says.
-    dirs: dirs or specs.len > 0,
-    keepNested: force < 2)
-  cl.ig.addCommandLinePatterns(excludes)
-
-  var found: seq[Entry]
-  discard cl.scan("", found)
-
-  var errors = 0
-  for e in found:
-    if e.isDir and not cl.dirs: continue
-    let shown = relativeTo(e.path, cl.ps.prefix)
-    if e.isDir:
-      let gone = cl.removeTree(e.path[0 ..< e.path.len - 1], dryRun, quiet,
-                               errors)
-      if gone and not quiet:
-        echo (if dryRun: "Would remove " else: "Removing ") & shown
-    elif dryRun or tryRemoveFile(repo.workTree / e.path):
-      if not quiet: echo (if dryRun: "Would remove " else: "Removing ") & shown
+  for path in walkWorkTree(repo, idx, ig, ps):
+    let parent = path[0 .. path.rfind('/')]        # "" at the root
+    if path.endsWith("/"):                          # a nested repository
+      if dirs and not quiet:
+        echo (if dryRun: "Would skip repository " else: "Skipping repository ") &
+             relativeTo(path, ps.prefix)
+    elif not dirs and parent.len > 0 and not idx.anyTrackedUnder(parent):
+      discard                                       # inside an untracked directory
+    elif dryRun or tryRemoveFile(repo.workTree / path):
+      if not quiet: echo verb & relativeTo(path, ps.prefix)
     else:
-      stderr.write "warning: failed to remove " & shown & "\n"
-      inc errors
-  if errors != 0: 1 else: 0
+      stderr.write "warning: failed to remove " & relativeTo(path, ps.prefix) & "\n"
+      result = 1
+  if dirs: discard sweep(repo, idx, ig, ps, "", dryRun, quiet)

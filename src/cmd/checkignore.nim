@@ -23,25 +23,21 @@
 import std/os
 import ../cli, ../ignore, ../index, ../pathspec, ../repository, ../util
 
-const usageText = """usage: gittle check-ignore [-q] [-v] <pathname>…
-
-   -q, --quiet     say nothing; the exit status is the answer
-   -v, --verbose   print the pattern that decided, and where it came from"""
+const
+  synopsis = "[-q] [-v] <pathname>…"
+  options = [
+    opt("-q|--quiet", help = "say nothing; the exit status is the answer"),
+    opt("-v|--verbose", help = "print the pattern that decided, and where it came from"),
+    opt("--stdin|-z|-n|--non-matching|--no-index", okRefused, help = "docs/13"),
+  ]
 
 proc cmdCheckIgnore*(c: Ctx, args: seq[string]): int =
-  var quiet, verbose = false
-  var names: seq[string]
-  var noMoreOpts = false
-  for a in args:
-    if noMoreOpts or a.len == 0 or a[0] != '-': names.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "-v" or a == "--verbose": verbose = true
-    elif a == "-h" or a == "--help": (echo usageText; return 0)
-    elif a in ["--stdin", "-z", "-n", "--non-matching", "--no-index"]:
-      fail("gittle check-ignore does not support '" & a & "' (docs/13)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-
+  ## Entry point: parse, then ask the ignore engine about each path and
+  ## report the deciding pattern under `-v`.
+  let o = parse(options, args, "check-ignore", synopsis)
+  let quiet = o.has "quiet"
+  let verbose = o.has "verbose"
+  let names = o.args
   failIf(names.len == 0, "no path specified")
   failIf(quiet and names.len > 1, "--quiet is only valid with a single pathname")
   failIf(quiet and verbose, "cannot have both --quiet and --verbose")

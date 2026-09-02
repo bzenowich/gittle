@@ -20,19 +20,6 @@ import std/strutils
 import ../cli, ../diffcore, ../index, ../pathspec, ../repository,
        ../revision, ../revwalk, ../util
 
-const usageText = """usage: gittle diff [<options>] [<commit>] [<commit>] [--] [<path>…]
-
-   --cached, --staged        diff the index against a commit
-   --no-index <a> <b>        diff two files, ignoring the repository
-   -p, --patch               a unified patch (the default)
-   -s, --no-patch            no output
-   --raw                     the machine-readable record
-   --stat, --shortstat, --numstat, --name-only, --name-status
-   -U<n>, --unified=<n>      lines of context
-   --full-index, --abbrev=<n>, --no-prefix, -a/--text, -R, -z
-   --diff-filter=[ADMT], -S<string>
-   -w, -b, --ignore-space-at-eol, --ignore-cr-at-eol
-   --color[=<when>], --no-color, --exit-code, --quiet"""
 
 proc noIndexPair(a, b: string): DiffPair =
   ## Two plain files.  Both sides read from the filesystem, and the two names
@@ -45,32 +32,25 @@ proc noIndexPair(a, b: string): DiffPair =
            oldMode: modeForFile(aSt), newMode: modeForFile(bSt),
            oldFromWork: true, newFromWork: true)
 
+const
+  synopsis = "[<options>] [<commit>] [<commit>] [--] [<path>…]\n--no-index [<options>] <path> <path>"
+  options = [
+    opt("--cached|--staged", help = "the index against a commit (HEAD by default)"),
+    opt("--no-index", help = "two files, outside any repository"),
+  ]
+
 proc cmdDiff*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse, work out which two of the three things (a tree,
+  ## the index, the working tree) are being compared, and render.
+  let p = parse(@options & @diffOptions, args, "diff", synopsis)
   var o = defaultDiffOpts()
-  var cached = false
-  var noIndex = false
-  var revs: seq[string]
-  var specs: seq[string]
-  var i = 0
-  var seenDashDash = false
-
-  optionValue(args, i)
-
-  while i < args.len:
-    let a = args[i]
-    if seenDashDash: specs.add a
-    elif a == "--": seenDashDash = true
-    elif a.len > 1 and a[0] == '-':
-      if a == "--cached" or a == "--staged": cached = true
-      elif a == "--no-index": noIndex = true
-      elif a == "-h" or a == "--help":
-        echo usageText
-        return 0
-      elif not parseDiffOpt(a, o, valueFor):
-        fail("unknown option '" & a & "'\n" & usageText)
-    else: revs.add a
-    inc i
-
+  applyDiffOpts(p, o)
+  let cached = p.has "cached"
+  let noIndex = p.has "no-index"
+  let seenDashDash = p.dashDash
+  # Before `--` a word is a revision; after it, a path.
+  var revs = if p.dashDashAt >= 0: p.args[0 ..< p.dashDashAt] else: p.args
+  var specs = if p.dashDashAt >= 0: p.args[p.dashDashAt .. ^1] else: @[]
   if o.formats.card == 0: o.formats = {dfPatch}
   checkDiffOpts(o)
 
@@ -122,6 +102,7 @@ proc cmdDiff*(c: Ctx, args: seq[string]): int =
   let idx = readIndex(repo.indexPath)
 
   proc headTree(): Oid =
+    ## HEAD's tree, or a clear refusal on an unborn branch.
     let h = repo.refs.resolveRef(headRef)
     failIf(not h.found, "no commits yet on '" & repo.headRefName & "'")
     repo.peelTo(h.oid, otTree).oid

@@ -18,26 +18,21 @@
 
 import ../cli, ../oid, ../repository, ../revision, ../revwalk, ../util
 
-const usageText = """usage: gittle merge-base [-a] <commit> <commit>…
-   or: gittle merge-base --is-ancestor <commit> <commit>
-
-   -a, --all         print every best common ancestor, not just one
-   --is-ancestor     exit 0 if the first commit is an ancestor of the second"""
+const
+  synopsis = "[-a] <commit> <commit>…\n--is-ancestor <commit> <commit>"
+  options = [
+    opt("-a|--all", help = "print every best common ancestor, not just one"),
+    opt("--is-ancestor", help = "exit 0 if the first commit is an ancestor of the second"),
+    opt("--octopus|--independent|--fork-point", okRefused, help = "docs/09"),
+  ]
 
 proc cmdMergeBase*(c: Ctx, args: seq[string]): int =
-  var all, isAncestor = false
-  var revs: seq[string]
-  for a in args:
-    case a
-    of "-a", "--all": all = true
-    of "--is-ancestor": isAncestor = true
-    of "-h", "--help": (echo usageText; return 0)
-    of "--octopus", "--independent", "--fork-point":
-      fail(a & " is out of scope for gittle v1 (docs/09)")
-    else:
-      failIf(a.len > 1 and a[0] == '-', "unknown option '" & a & "'\n" & usageText)
-      revs.add a
-
+  ## Entry point: parse, resolve the commits, then `--is-ancestor` or the
+  ## merge-base walk.
+  let o = parse(options, args, "merge-base", synopsis)
+  let all = o.has "all"
+  let isAncestor = o.has "is-ancestor"
+  let revs = o.args
   let repo = c.repo
   var oids: seq[Oid]
   for r in revs: oids.add repo.resolveCommittish(r)
@@ -48,7 +43,7 @@ proc cmdMergeBase*(c: Ctx, args: seq[string]): int =
     # would make `if gittle merge-base --is-ancestor …` noisy.
     return if repo.isAncestor(oids[0], oids[1]): 0 else: 1
 
-  failIf(oids.len < 2, usageText)
+  failIf(oids.len < 2, o.use)
   let bases = repo.mergeBases(oids[0], oids[1 .. ^1])
   if bases.len == 0: return 1
   for b in (if all: bases else: bases[0 .. 0]): echo b

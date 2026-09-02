@@ -7,13 +7,12 @@ import std/[strutils]
 import ../cli, ../objects, ../oid, ../repository, ../revision, ../util
 
 const
-  usageText = "usage: gittle cat-file (-t | -s | -e | -p | <type>) <object>\n" &
-              "   or: gittle cat-file (--batch | --batch-check)[=<format>]"
   defaultFormat = "%(objectname) %(objecttype) %(objectsize)"
 
 # -- pretty printing --------------------------------------------------------
 
 proc prettyPrint(obj: GitObject) =
+  ## `-p`: a tree as `ls-tree` shows it, a commit or tag as its raw text.
   case obj.kind
   of otTree:
     # `<mode> <type> <oid>\t<name>`, with the mode padded to six octal digits.
@@ -37,6 +36,8 @@ proc emitFormat(fmt: string, o: Oid, kind: ObjectType, size: int) =
   stdout.write "\n"
 
 proc runBatch(c: Ctx, fmt: string, withContents: bool): int =
+  ## `--batch`/`--batch-check`: one object name per input line, answered
+  ## through the format; a missing object is reported inline, not fatal.
   let r = c.repo
   for rawLine in stdin.lines:
     let name = rawLine.strip()
@@ -64,70 +65,62 @@ proc runBatch(c: Ctx, fmt: string, withContents: bool): int =
 
 # -- entry point ------------------------------------------------------------
 
-proc cmdCatFile*(c: Ctx, args: seq[string]): int =
-  var mode = '\0'          # one of t s e p, or \0 for the <type> form
-  var batch = false
-  var batchCheck = false
-  var format = defaultFormat
-  var rest: seq[string]
-  var i = 0
-  while i < args.len:
-    let a = args[i]
-    case a
-    of "-t", "-s", "-e", "-p":
-      failIf(mode != '\0', "only one of -t, -s, -e, -p may be given")
-      mode = a[1]
-    of "--batch": batch = true
-    of "--batch-check": batchCheck = true
-    of "-h", "--help":
-      echo usageText
-      return 0
-    of "--":
-      inc i
-      while i < args.len: rest.add args[i]; inc i
-    else:
-      if a.startsWith("--batch="):
-        batch = true
-        format = a["--batch=".len .. ^1]
-      elif a.startsWith("--batch-check="):
-        batchCheck = true
-        format = a["--batch-check=".len .. ^1]
-      elif a.len > 1 and a[0] == '-':
-        fail("unknown option '" & a & "'\n" & usageText)
-      else:
-        rest.add a
-    inc i
+const
+  synopsis = "(-t | -s | -e | -p) <object>\n<type> <object>\n(--batch | --batch-check)[=<format>] < <objects>"
+  options = [
+    opt("-t", help = "print the object's type"),
+    opt("-s", help = "print the object's size"),
+    opt("-e", help = "exit 0 if the object exists, 1 if not; print nothing"),
+    opt("-p", help = "pretty-print the object"),
+    opt("--batch", okOptValue, arg = "[=<format>]", help = "one object per input line, with its content"),
+    opt("--batch-check", okOptValue, arg = "[=<format>]", help = "the same, without the content"),
+  ]
 
+proc cmdCatFile*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse, then one of the three shapes -- batch, a single
+  ## mode letter, or `<type> <object>`.
+  let o = parse(options, args, "cat-file", synopsis)
+  var mode = '\0'          # one of t s e p, or \0 for the <type> form
+  for m in "tsep":
+    if o.has $m:
+      failIf(mode != '\0', "only one of -t, -s, -e, -p may be given")
+      mode = m
+  let batch = o.has "batch"
+  let batchCheck = o.has "batch-check"
+  let format = if o.val("batch").len > 0: o.val "batch"
+               elif o.val("batch-check").len > 0: o.val "batch-check"
+               else: defaultFormat
+  let rest = o.args
   if batch or batchCheck:
     failIf(batch and batchCheck, "cannot use --batch with --batch-check")
-    failIf(rest.len > 0, usageText)
+    failIf(rest.len > 0, o.use)
     return runBatch(c, format, batch)
 
   let r = c.repo
   if mode != '\0':
-    failIf(rest.len != 1, usageText)
+    failIf(rest.len != 1, o.use)
     if mode == 'e':
       # No output either way; the exit status is the whole answer.
-      var o: Oid
+      var oid: Oid
       try:
-        o = r.resolveRevish(rest[0])
+        oid = r.resolveRevish(rest[0])
       except GittleError:
         return 1
-      return (if r.hasObject(o): 0 else: 1)
-    let o = r.resolveRevish(rest[0])
+      return (if r.hasObject(oid): 0 else: 1)
+    let oid = r.resolveRevish(rest[0])
     case mode
-    of 't': echo $r.objectInfo(o).kind
-    of 's': echo $r.objectInfo(o).size
-    of 'p': prettyPrint(r.readObject(o))
+    of 't': echo $r.objectInfo(oid).kind
+    of 's': echo $r.objectInfo(oid).size
+    of 'p': prettyPrint(r.readObject(oid))
     else: discard
     stdout.flushFile()
     return 0
 
   # The `<type> <object>` form.
-  failIf(rest.len != 2, usageText)
+  failIf(rest.len != 2, o.use)
   let want = parseObjectType(rest[0])
   failIf(want == otBad, "invalid object type '" & rest[0] & "'")
-  let o = r.resolveRevish(rest[1])
-  stdout.write r.peelTo(o, want).obj.data
+  let oid = r.resolveRevish(rest[1])
+  stdout.write r.peelTo(oid, want).obj.data
   stdout.flushFile()
   0

@@ -54,6 +54,7 @@ type
     sbData = 1, sbProgress = 2, sbError = 3
 
 func hexDigit(c: char): int =
+  ## The value of a hex digit, or -1.
   case c
   of '0'..'9': int(c) - int('0')
   of 'a'..'f': int(c) - int('a') + 10
@@ -72,6 +73,8 @@ proc readExactly(s: Stream, n: int): string =
     got += k
 
 proc readPkt*(s: Stream): Pkt =
+  ## One packet: the four-digit length, then the payload; `flush`, `delim`
+  ## and `response-end` are the lengths 0, 1 and 2.
   let head = readExactly(s, 4)
   var n = 0
   for c in head:
@@ -96,6 +99,7 @@ proc readPktLine*(s: Stream): Pkt =
     result.data.setLen(result.data.len - 1)
 
 func pktHeader(n: int): string =
+  ## The four hex digits of a packet length.
   const hex = "0123456789abcdef"
   result = newString(4)
   for i in 0 .. 3:

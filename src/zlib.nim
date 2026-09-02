@@ -40,14 +40,20 @@ const
 
   zlibVersion = "1.2.11"  ## only the major digit is checked by zlib
 
+# zlib's `inflateInit2_`, with the version and struct size it checks.
 proc inflateInit2u(strm: var ZStream, windowBits: cint, version: cstring,
                    streamSize: cint): cint
   {.importc: "inflateInit2_", zlibh.}
+# zlib's `inflate`.
 proc inflateRaw(strm: var ZStream, flush: cint): cint {.importc: "inflate", zlibh.}
+# zlib's `inflateEnd`.
 proc inflateEnd(strm: var ZStream): cint {.importc: "inflateEnd", zlibh.}
+# zlib's bound on the compressed size of `sourceLen` bytes.
 proc compressBound(sourceLen: culong): culong {.importc, zlibh.}
+# zlib's `crc32`, which packs' `.idx` files use per object.
 proc crc32c(crc: culong, buf: ptr byte, len: cuint): culong
   {.importc: "crc32", zlibh.}
+# zlib's one-shot `compress2`, for writing loose objects.
 proc compress2(dest: ptr byte, destLen: var culong, source: ptr byte,
                sourceLen: culong, level: cint): cint {.importc, zlibh.}
 
@@ -63,11 +69,14 @@ static const long gittle_zstream_size = (long)sizeof(z_stream);
 let cZStreamSize {.importc: "gittle_zstream_size", nodecl.}: clong
 
 proc assertLayout() =
+  ## Refuse to run if this build's zlib disagrees with the `ZStream`
+  ## layout declared here.
   failIf(int(cZStreamSize) != sizeof(ZStream),
     "z_stream layout mismatch: zlib.h says " & $int(cZStreamSize) &
     " bytes, gittle assumes " & $sizeof(ZStream))
 
 proc failZ(z: ZStream, code: cint, what: string) {.noreturn.} =
+  ## A fatal error carrying zlib's return code and message.
   fail(what & " failed (" & $code & ")" & (if z.msg != nil: ": " & $z.msg else: ""))
 
 type
@@ -78,11 +87,13 @@ type
     finished*: bool  ## the stream reached its end marker
 
 proc close*(z: var Inflater) =
+  ## Free the stream, once.
   if z.live:
     discard inflateEnd(z.strm)
     z.live = false
 
 proc openInflater*(): Inflater =
+  ## A stream ready to inflate zlib-wrapped data.
   assertLayout()
   result.strm = ZStream()
   let rc = inflateInit2u(result.strm, 15, zlibVersion, cint(sizeof(ZStream)))
@@ -106,6 +117,7 @@ proc pump*(z: var Inflater, src: pointer, srcLen: int,
   result.produced = dstLen - int(z.strm.availOut)
 
 func offset(p: pointer, n: int): pointer {.inline.} =
+  ## A pointer `n` bytes further on.
   cast[pointer](cast[uint](p) + uint(n))
 
 # -- one-shot helpers -------------------------------------------------------

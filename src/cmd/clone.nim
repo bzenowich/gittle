@@ -29,15 +29,6 @@ import ../cli, ../index, ../objects, ../oid, ../refname, ../refs, ../refspec,
        ../remotes, ../repository, ../util, ../worktree
 import init as cmdinit
 
-const usageText = """usage: gittle clone [<options>] <repository> [<directory>]
-
-   -o, --origin <name>   name of the remote to create (default: origin)
-   -b, --branch <name>   check out this branch (or tag) instead of the remote's HEAD
-   -n, --no-checkout     do not check out a working tree
-   --bare                create a bare repository
-   -u, --upload-pack <exec>  the command to run on the far end
-   -q, --quiet           report nothing but errors
-   -v, --verbose         report more"""
 
 proc directoryFor(url: string): string =
   ## `guess_dir_name` in `builtin/clone.c`: the last component of the URL,
@@ -55,6 +46,8 @@ proc directoryFor(url: string): string =
 
 proc cloneInto(c: Ctx, gitDir, dir, url, origin, branchArg, uploadPack: string,
                bare, noCheckout, quiet, verbose: bool) =
+  ## Everything after `init`: write the remote's configuration, fetch,
+  ## point HEAD where the remote's points, and check out unless told not to.
   # The remote, before the fetch, so that the fetch reads its refspec from the
   # configuration like any other -- there is no clone-only code path.
   let fetchSpec = if bare: "+refs/heads/*:refs/heads/*"
@@ -153,49 +146,36 @@ proc cloneInto(c: Ctx, gitDir, dir, url, origin, branchArg, uploadPack: string,
     repo.resetIndexTo(idx, tree)
     idx.writeIndex()
 
+const
+  synopsis = "[<options>] <repository> [<directory>]"
+  options = [
+    opt("-o|--origin", okValue, arg = "<name>", help = "name of the remote to create (default: origin)"),
+    opt("-b|--branch", okValue, arg = "<name>", help = "check out this branch (or tag) instead of the remote's HEAD"),
+    opt("-n|--no-checkout", help = "do not check out a working tree"),
+    opt("--bare", help = "create a bare repository"),
+    opt("-u|--upload-pack|--exec", okValue, arg = "<exec>", help = "the command to run on the far end"),
+    opt("-q|--quiet", help = "report nothing but errors"),
+    opt("-v|--verbose", help = "report more"),
+    opt("--mirror|--sparse|--separate-git-dir|--template|--reference|--dissociate|" &
+        "--recurse-submodules|--single-branch|--no-single-branch|-l|--local|--no-hardlinks|" &
+        "-s|--shared|--revision|--ref-format|--bundle-uri", okRefused, help = "docs/06"),
+    opt("--depth|--deepen|--shallow-since|--shallow-exclude|--filter", okRefused,
+        help = "gittle has no shallow or partial clone (plan.md §1)"),
+  ]
+
 proc cmdClone*(c: Ctx, args: seq[string]): int =
-  var origin = "origin"
-  var branchArg, uploadPack = ""
-  var bare = c.bare
-  var noCheckout, quiet, verbose = false
-  var positional: seq[string]
-  var i = 0
-  while i < args.len:
-    let a = args[i]
-    template value(): string =
-      inc i
-      failIf(i >= args.len, "option '" & a & "' requires a value")
-      args[i]
-    case a
-    of "-o", "--origin": origin = value()
-    of "-b", "--branch": branchArg = value()
-    of "-u", "--upload-pack", "--exec": uploadPack = value()
-    of "-n", "--no-checkout": noCheckout = true
-    of "--bare": bare = true
-    of "-q", "--quiet": quiet = true
-    of "-v", "--verbose": verbose = true
-    of "-h", "--help": (echo usageText; return 0)
-    of "--mirror", "--sparse", "--separate-git-dir", "--template",
-       "--reference", "--dissociate", "--recurse-submodules", "--single-branch",
-       "--no-single-branch", "-l", "--local", "--no-hardlinks", "-s", "--shared",
-       "--revision", "--ref-format", "--bundle-uri":
-      fail(a & " is out of scope for gittle v1 (docs/06)")
-    else:
-      if a.startsWith("--origin="): origin = a["--origin=".len .. ^1]
-      elif a.startsWith("--branch="): branchArg = a["--branch=".len .. ^1]
-      elif a.startsWith("--upload-pack="): uploadPack = a["--upload-pack=".len .. ^1]
-      elif a.startsWith("-o"): origin = a[2 .. ^1]
-      elif a.startsWith("-b"): branchArg = a[2 .. ^1]
-      elif a.startsWith("-u"): uploadPack = a[2 .. ^1]
-      elif a.startsWith("--depth") or a.startsWith("--shallow") or
-           a.startsWith("--filter"):
-        fail(a.split('=')[0] & " is out of scope for gittle v1: gittle has no " &
-             "shallow or partial clone (plan.md §1)")
-      elif a.startsWith("-") and a.len > 1:
-        fail("unknown option '" & a & "'\n" & usageText)
-      else: positional.add a
-    inc i
-  failIf(positional.len == 0 or positional.len > 2, usageText)
+  ## Entry point: parse, pick the directory, create the repository, then
+  ## `cloneInto` -- and remove the directory again if anything fails.
+  let o = parse(options, args, "clone", synopsis)
+  let origin = o.val("origin", "origin")
+  let branchArg = o.val "branch"
+  let uploadPack = o.val "upload-pack"
+  let bare = c.bare or o.has "bare"
+  let noCheckout = o.has "no-checkout"
+  let quiet = o.has "quiet"
+  let verbose = o.has "verbose"
+  let positional = o.args
+  failIf(positional.len == 0 or positional.len > 2, o.use)
   failIf(not isValidRefname(refsPrefix & "remotes/" & origin & "/x"),
          "'" & origin & "' is not a valid remote name")
 

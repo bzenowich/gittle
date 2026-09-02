@@ -25,10 +25,6 @@
 import std/[os, strutils]
 import ../cli, ../config, ../repository, ../util
 
-const usageText = """usage: gittle config list [--local | --global | --file <file>]
-   or: gittle config get [--all] [<scope>] <key>
-   or: gittle config set [<scope>] <key> <value>
-   or: gittle config unset [--all] [<scope>] <key>"""
 
 type
   Scope = enum
@@ -38,55 +34,49 @@ type
     scFile
 
 proc writeTarget(c: Ctx, scope: Scope, file: string): string =
+  ## The file a `set` or `unset` edits under this scope.
   case scope
   of scFile: file
   of scGlobal: globalConfigPath()
   of scLocal, scDefault: c.repo.commonDir / "config"
 
 proc readConfigFor(c: Ctx, scope: Scope, file: string): Config =
+  ## The configuration a `get` or `list` reads under this scope.
   case scope
   of scFile: loadConfig(file)
   of scGlobal: loadConfig(globalConfigPath())
   of scLocal: loadConfig(c.repo.commonDir / "config")
   of scDefault: c.repo.cfg   # already merged, including any -c overrides
 
+const
+  synopsis = "list [--local | --global | --file <file>]\nget [--all] [<scope>] <key>\nset [<scope>] <key> <value>\nunset [--all] [<scope>] <key>"
+  options = [
+    opt("--local", help = "the repository's own file"),
+    opt("--global", help = "the user's file"),
+    opt("-f|--file", okValue, arg = "<file>", help = "a named file"),
+    opt("--all", help = "every value of a multi-valued key"),
+  ]
+
 proc cmdConfig*(c: Ctx, args: seq[string]): int =
+  ## Entry point: parse the scope options, then the sub-verb.
+  let o = parse(options, args, "config", synopsis)
   var scope = scDefault
   var file = ""
-  var all = false
-  var rest: seq[string]
-  var i = 0
-  while i < args.len:
-    let a = args[i]
-    case a
-    of "--local": scope = scLocal
-    of "--global": scope = scGlobal
-    of "--all": all = true
-    of "-f", "--file":
-      inc i
-      failIf(i >= args.len, "option '--file' requires a value")
-      scope = scFile
-      file = args[i]
-    of "-h", "--help":
-      echo usageText
-      return 0
-    else:
-      if a.startsWith("--file="):
-        scope = scFile
-        file = a["--file=".len .. ^1]
-      elif a.len > 1 and a[0] == '-':
-        fail("unknown option '" & a & "'\n" & usageText)
-      else:
-        rest.add a
-    inc i
-
-  failIf(rest.len == 0, usageText)
+  for (k, v) in o.occurrences:      # the last scope given wins
+    case k
+    of "local": scope = scLocal
+    of "global": scope = scGlobal
+    of "file": (scope = scFile; file = v)
+    else: discard
+  let all = o.has "all"
+  let rest = o.args
+  failIf(rest.len == 0, o.use)
   let sub = rest[0]
   let rem = rest[1 .. ^1]
 
   case sub
   of "list":
-    failIf(rem.len != 0, usageText)
+    failIf(rem.len != 0, o.use)
     for e in readConfigFor(c, scope, file).entries:
       # A variable written with no `=` is an implicit true.  git lists it as a
       # bare key rather than `key=true`, which is how a reader tells "present"
@@ -96,7 +86,7 @@ proc cmdConfig*(c: Ctx, args: seq[string]): int =
     return 0
 
   of "get":
-    failIf(rem.len != 1, usageText)
+    failIf(rem.len != 1, o.use)
     let cfg = readConfigFor(c, scope, file)
     let key = rem[0].toLowerAscii
     var values: seq[string]
@@ -110,12 +100,12 @@ proc cmdConfig*(c: Ctx, args: seq[string]): int =
     return 0
 
   of "set":
-    failIf(rem.len != 2, usageText)
+    failIf(rem.len != 2, o.use)
     setConfigValue(writeTarget(c, scope, file), rem[0], rem[1])
     return 0
 
   of "unset":
-    failIf(rem.len != 1, usageText)
+    failIf(rem.len != 1, o.use)
     let path = writeTarget(c, scope, file)
     var removed = 0
     try:
@@ -128,4 +118,4 @@ proc cmdConfig*(c: Ctx, args: seq[string]): int =
     return if removed > 0: 0 else: 5
 
   else:
-    fail("unknown subcommand '" & sub & "'\n" & usageText)
+    fail("unknown subcommand '" & sub & "'\n" & o.use)

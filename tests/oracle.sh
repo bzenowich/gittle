@@ -34,7 +34,7 @@ fi
 # Automatic maintenance would run at unpredictable moments and write to the
 # stderr this suite compares.  gittle has no `--auto` at all (docs/07 cuts it),
 # so this only pins git's side.
-git() { "$GIT" -c gc.auto=0 -c maintenance.auto=false "$@"; }
+git() { "$GIT" -c gc.auto=0 -c maintenance.auto=false -c advice.statusHints=false "$@"; }
 
 # Tests that write refs need an identity for the reflog, and must not depend on
 # whichever one the developer happens to have configured.  The dates are pinned
@@ -464,26 +464,6 @@ check "loose ref shadows packed" \
   "$(git -C "$WORK/packed" rev-parse refs/heads/side)" \
   "$("$GITTLE" -C "$WORK/packed" for-each-ref --format='%(objectname)' refs/heads/side)"
 
-# ---------------------------------------------------------------- symbolic-ref
-check "symbolic-ref HEAD" \
-  "$(git -C "$REFS" symbolic-ref HEAD)" "$("$GITTLE" -C "$REFS" symbolic-ref HEAD)"
-check "symbolic-ref --short" \
-  "$(git -C "$REFS" symbolic-ref --short HEAD)" \
-  "$("$GITTLE" -C "$REFS" symbolic-ref --short HEAD)"
-"$GITTLE" -C "$REFS" symbolic-ref refs/heads/alias refs/heads/side
-check "gittle's symref, read by git" \
-  "refs/heads/side" "$(git -C "$REFS" symbolic-ref refs/heads/alias)"
-check "symref resolves to its target" \
-  "$(git -C "$REFS" rev-parse refs/heads/side)" \
-  "$(git -C "$REFS" rev-parse refs/heads/alias)"
-"$GITTLE" -C "$REFS" symbolic-ref -d refs/heads/alias
-git -C "$REFS" symbolic-ref refs/heads/alias >/dev/null 2>&1 \
-  && bad "symbolic-ref -d left the ref behind" || ok
-# -q on a ref that is not symbolic exits 1 without complaining
-"$GITTLE" -C "$REFS" symbolic-ref -q refs/heads/side >/dev/null 2>&1
-[ $? = 1 ] && ok || bad "symbolic-ref -q on a direct ref should exit 1"
-report "symbolic-ref" "read, write, --short, -d, -q"
-
 # ------------------------------------------------------------------ update-ref
 "$GITTLE" -C "$REFS" update-ref refs/heads/written "$H" -m "by gittle"
 check "gittle writes, git reads" "$H" "$(git -C "$REFS" rev-parse refs/heads/written)"
@@ -540,77 +520,6 @@ check "both reflogs recorded it" "1 1" \
 git -C "$REFS" update-ref HEAD "$H"
 report "update-ref" "write, CAS, delete, deref, validation"
 
-# --stdin: run the identical command stream through git and through gittle and
-# require the same exit status, the same stdout, and the same refs afterwards.
-# Comparing against git rather than against a hand-written expectation is what
-# caught `symref-update` dereferencing, `option no-deref` being mandatory for
-# two verbs, and `start` without `commit` meaning abort.
-STDIN_A="$WORK/stdin-git"; STDIN_B="$WORK/stdin-gittle"
-mk_stdin_repo() {  # a fixed date, so both copies get the same commit ID
-  rm -rf "$1"; git init -q "$1"
-  ( cd "$1" && echo a > f && git add f \
-    && GIT_COMMITTER_DATE='1700000000 +0000' GIT_AUTHOR_DATE='1700000000 +0000' \
-       git commit -qm one \
-    && git branch b1 && git branch b2 \
-    && git symbolic-ref refs/heads/s refs/heads/b1 ) >/dev/null 2>&1
-}
-mk_stdin_repo "$WORK/stdin-seed"
-SH=$(git -C "$WORK/stdin-seed" rev-parse HEAD)
-
-stdin_ok=1; nstdin=0
-try_stdin() {  # try_stdin <stream> <flags> <name>
-  mk_stdin_repo "$STDIN_A"; mk_stdin_repo "$STDIN_B"; nstdin=$((nstdin+1))
-  printf "$1" > "$WORK/stream"
-  git -C "$STDIN_A" update-ref $2 --stdin < "$WORK/stream" \
-    > "$WORK/out.git" 2>/dev/null; ea=$?
-  "$GITTLE" -C "$STDIN_B" update-ref $2 --stdin < "$WORK/stream" \
-    > "$WORK/out.gittle" 2>/dev/null; eb=$?
-  ra=$(git -C "$STDIN_A" for-each-ref --format='%(refname) %(objectname) %(symref)')
-  rb=$(git -C "$STDIN_B" for-each-ref --format='%(refname) %(objectname) %(symref)')
-  if [ "$ea" != "$eb" ] || [ "$ra" != "$rb" ] || \
-     ! cmp -s "$WORK/out.git" "$WORK/out.gittle"; then
-    stdin_ok=0
-    printf '  %-40s git=%s gittle=%s\n' "$3" "$ea" "$eb"
-    diff <(echo "$ra") <(echo "$rb") | head -4
-    diff "$WORK/out.git" "$WORK/out.gittle" | head -3
-  fi
-}
-try_stdin "update refs/heads/b1 $SH\n" "" "update"
-try_stdin "update refs/heads/b2 $SH $SH\n" "" "update with old"
-try_stdin "update refs/heads/b1 $SH 0000000000000000000000000000000000000000\n" "" "old=null"
-try_stdin "delete refs/heads/b1\n" "" "delete"
-try_stdin "delete refs/heads/nope\n" "" "delete missing"
-try_stdin 'update refs/heads/b1 ""\n' "" "empty new value is a delete"
-try_stdin "update refs/heads/b1 $SH \"\"\n" "" "empty old value"
-try_stdin "create refs/heads/new $SH\n" "" "create"
-try_stdin "create refs/heads/b1 $SH\n" "" "create existing"
-try_stdin "verify refs/heads/b1 $SH\n" "" "verify"
-try_stdin "verify refs/heads/b1\n" "" "verify with no value"
-try_stdin "bogus x\n" "" "unknown command"
-try_stdin "start\nupdate refs/heads/b1 $SH\ncommit\n" "" "start/commit"
-try_stdin "start\nupdate refs/heads/new $SH\n" "" "start without commit aborts"
-try_stdin "start\nupdate refs/heads/new $SH\nabort\n" "" "start/abort"
-try_stdin "start\nstart\n" "" "double start"
-try_stdin "prepare\nupdate refs/heads/b1 $SH\n" "" "update after prepare"
-try_stdin "update refs/heads/new $SH\nprepare\ncommit\n" "" "prepare then commit"
-try_stdin "commit\nupdate refs/heads/b1 $SH\n" "" "command after commit"
-try_stdin "commit\nstart\nupdate refs/heads/new $SH\ncommit\n" "" "new transaction after commit"
-try_stdin "option no-deref\nsymref-delete refs/heads/s\n" "" "no-deref + symref-delete"
-try_stdin "symref-delete refs/heads/s\n" "" "symref-delete needs no-deref"
-try_stdin "option bogus\n" "" "unknown option"
-try_stdin "option no-deref\nupdate refs/heads/s $SH\n" "" "no-deref update on a symref"
-try_stdin "symref-update refs/heads/s refs/heads/b2\n" "" "symref-update dereferences"
-try_stdin "option no-deref\nsymref-update refs/heads/s refs/heads/b2\n" "" "no-deref symref-update"
-try_stdin "symref-create refs/heads/ns refs/heads/b2\n" "" "symref-create"
-try_stdin "update refs/heads/b1\0$SH\0\0" -z "z: empty old value"
-try_stdin "update refs/heads/b1\0$SH\0" -z "z: missing old record"
-try_stdin "update refs/heads/b1\0\0\0" -z "z: empty new value"
-try_stdin "delete refs/heads/b1\0\0" -z "z: delete"
-try_stdin "symref-create refs/heads/n\0refs/heads/b1\0" -z "z: symref-create"
-try_stdin "symref-update refs/heads/s\0refs/heads/b2\0" -z "z: symref-update"
-try_stdin "option no-deref\0symref-verify refs/heads/s\0refs/heads/b1\0" -z "z: symref-verify"
-[ $stdin_ok = 1 ] && { ok; report "update-ref --stdin" "$nstdin streams match git exactly"; } \
-                  || bad "update-ref --stdin"
 
 # A held lock must stop a second writer rather than corrupt the ref.
 touch "$REFS/.git/refs/heads/t1.lock"
@@ -728,7 +637,7 @@ git init -q "$IDX"
   && printf '#!/bin/sh\n' > run.sh && chmod +x run.sh && ln -s f.txt link )
 
 # gittle stages; git must see exactly that, and agree on the tree.
-( cd "$IDX" && "$GITTLE" update-index --add f.txt a/b/deep.txt run.sh link )
+( cd "$IDX" && "$GITTLE" add f.txt a/b/deep.txt run.sh link )
 check "git sees what gittle staged" \
   "A  a/b/deep.txt
 A  f.txt
@@ -743,12 +652,10 @@ git -C "$IDX" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after gittle wrot
 report "gittle writes, git reads" "modes 100644, 100755 and 120000"
 
 # Every ls-files selector, against a working tree that is modified, deleted
-# and chmod'd at once -- git emits up to three lines per entry, so the
-# combinations are where the structure shows.
+# and chmod'd at once -- the index pass must not notice any of it.
 ( cd "$IDX" && echo changed > f.txt && rm a/b/deep.txt && chmod -x run.sh )
 sel_ok=1; nsel=0
-for o in "" "-c" "-s" "-m" "-d" "-u" "-c -m" "-d -m" "-c -d -m" "-m -s" "-z" \
-         "-c -s" "-u -s" "-c -u" "-c -d" "-d -s"; do
+for o in "" "-c" "-s" "-u" "-z" "-c -s" "-u -s" "-c -u"; do
   nsel=$((nsel+1))
   git -C "$IDX" ls-files $o > "$WORK/s.git" 2>&1
   "$GITTLE" -C "$IDX" ls-files $o > "$WORK/s.gittle" 2>&1
@@ -758,16 +665,6 @@ done
 [ $sel_ok = 1 ] && { ok; report "ls-files selectors" "$nsel combinations"; } \
                 || bad "ls-files selectors"
 
-# --refresh must leave an index git calls clean.
-( cd "$IDX" && git checkout -q -- . && touch f.txt run.sh \
-  && "$GITTLE" update-index --refresh >/dev/null )
-check "git status after gittle --refresh" "" "$(git -C "$IDX" status --porcelain)"
-
-# --cacheinfo stages without a working-tree file at all.
-BLOB=$(echo staged-directly | git -C "$IDX" hash-object -w --stdin)
-"$GITTLE" -C "$IDX" update-index --add --cacheinfo "100644,$BLOB,virtual.txt"
-check "--cacheinfo, read by git" "100644 $BLOB 0	virtual.txt" \
-  "$(git -C "$IDX" ls-files -s virtual.txt)"
 git -C "$IDX" reset -q --hard
 
 # ---------------------------------------------------------- index formats
@@ -788,7 +685,7 @@ done
 
 git -C "$FMT" update-index --index-version 2 >/dev/null
 git -C "$FMT" update-index --skip-worktree top.txt
-( cd "$FMT" && "$GITTLE" update-index --add d/f1.txt )
+( cd "$FMT" && echo more >> d/f1.txt && "$GITTLE" add d/f1.txt )
 check "extended flags survive a gittle rewrite" "S top.txt" \
   "$(git -C "$FMT" ls-files -v top.txt)"
 git -C "$FMT" update-index --no-skip-worktree top.txt
@@ -827,27 +724,22 @@ done
 [ $quote_ok = 1 ] && { ok; report "path quoting" "quote, space and UTF-8, and -z"; } \
                   || bad "path quoting"
 
-# --error-unmatch is a status code, and only the cached pass satisfies it.
+# --error-unmatch is a status code, not a fatal error.
 git -C "$QP" ls-files --error-unmatch nope >/dev/null 2>&1; ea=$?
 "$GITTLE" -C "$QP" ls-files --error-unmatch nope >/dev/null 2>&1; eb=$?
 check "--error-unmatch on a missing path" "$ea" "$eb"
-git -C "$QP" ls-files --error-unmatch -m "sp ace.txt" >/dev/null 2>&1; ea=$?
-"$GITTLE" -C "$QP" ls-files --error-unmatch -m "sp ace.txt" >/dev/null 2>&1; eb=$?
-check "--error-unmatch counts only the cached pass" "$ea" "$eb"
 
-# ------------------------------------------------------------------ read-tree
+# ------------------------------------------------------------------ reset
+# The tree-into-index path, driven through `reset` now that `read-tree` is gone.
 RT="$WORK/rt"
 git clone -q "$IDX" "$RT" 2>/dev/null
-( cd "$RT" && "$GITTLE" read-tree HEAD )
-check "read-tree then git write-tree" "$(git -C "$RT" rev-parse "HEAD^{tree}")" \
+( cd "$RT" && git read-tree --empty && "$GITTLE" reset -q )
+check "reset then git write-tree" "$(git -C "$RT" rev-parse "HEAD^{tree}")" \
   "$(git -C "$RT" write-tree)"
-( cd "$RT" && "$GITTLE" read-tree --empty )
-check "read-tree --empty" "" "$(git -C "$RT" ls-files)"
-( cd "$RT" && "$GITTLE" read-tree HEAD )
 diff <(git -C "$RT" ls-files -s) <("$GITTLE" -C "$RT" ls-files -s) >/dev/null \
-  && ok || bad "read-tree produced a different index"
-git -C "$RT" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after read-tree"
-report "read-tree" "a tree, and --empty"
+  && ok || bad "reset produced a different index"
+git -C "$RT" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after reset"
+report "reset, index only" "a tree read back into an emptied index"
 
 # An unmerged index has three stages for one path; neither tool may write a
 # tree from it.
@@ -896,44 +788,6 @@ case "$out" in Reinitialized*) ok;; *) bad "re-init message: $out";; esac
 check "re-init keeps HEAD" "$before" "$(git -C "$IN/c" rev-parse HEAD)"
 git -C "$IN/c" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after gittle init+commit"
 report "init" "layout, config bytes, --bare, -b, re-init"
-
-# --------------------------------------------------- commit-tree, byte-exact
-# The command with no index, no hooks and no message cleanup in front of it:
-# whatever the two tools disagree about here is the commit format itself.
-CT="$WORK/ct"
-git init -q "$CT"
-( cd "$CT" && echo one > a && mkdir -p d && echo two > d/b && git add . )
-T1=$(git -C "$CT" write-tree)
-( cd "$CT" && echo three >> a && git add . )
-T2=$(git -C "$CT" write-tree)
-ct_ok=1; nct=0
-P1=$(git -C "$CT" commit-tree "$T1" -m base)
-for spec in "$T1||one" "$T2||one" "$T1|$P1|child" "$T2|$P1|child" \
-            "$T1|$P1 $P1|dup" "$T1||multi
-line
-message" "$T1||trailing   spaces   " "$T1||#looks like a comment" \
-            "$T1||" "$T2|$P1|a
-"; do
-  tree=${spec%%|*}; rest=${spec#*|}; par=${rest%%|*}; msg=${rest#*|}
-  args=""
-  for p in $par; do args="$args -p $p"; done
-  nct=$((nct+1))
-  a=$(printf '%s' "$msg" | git -C "$CT" commit-tree $args "$tree" 2>/dev/null)
-  b=$(printf '%s' "$msg" | "$GITTLE" -C "$CT" commit-tree $args "$tree" 2>/dev/null)
-  [ "$a" = "$b" ] || { ct_ok=0; echo "  commit-tree differs: tree=$tree parents='$par'"; }
-done
-# -m is repeatable and paragraphs join with a blank line; -F reads a file.
-printf 'from a file\n' > "$WORK/msg.txt"
-for args in "-m one" "-m one -m two" "-m one -m two -m three" \
-            "-F $WORK/msg.txt" "-m one -F $WORK/msg.txt"; do
-  nct=$((nct+1))
-  a=$(git -C "$CT" commit-tree $args "$T1")
-  b=$("$GITTLE" -C "$CT" commit-tree $args "$T1")
-  [ "$a" = "$b" ] || { ct_ok=0; echo "  commit-tree $args: git=$a gittle=$b"; }
-done
-[ $ct_ok = 1 ] && { ok; report "commit-tree" "$nct object IDs match git's"; } \
-               || bad "commit-tree"
-git -C "$CT" fsck --strict >/dev/null 2>&1 && ok || bad "fsck after commit-tree"
 
 # ------------------------------------------------ commit message cleanup (R1)
 # The pipeline that decides the bytes hashed into the commit.  Compared by
@@ -1004,7 +858,7 @@ PATTERNS
   printf '!*.log\n*.txt\n' > doc/.gitignore
   printf 'q.txt\n' > sub/.gitignore )
 ig_ok=1; nig=0
-for opts in "-o --exclude-standard" "-o -i --exclude-standard" "-o" \
+for opts in "-o --exclude-standard" "-o" \
             "-o --exclude-standard -- a" "-o --exclude-standard -- '*.c'" \
             "-o --exclude-standard -- ':(glob)*.c'" \
             "-o --exclude-standard -- doc sub"; do
@@ -1203,13 +1057,13 @@ log_ok=1; nlog=0
 for f in "" "--oneline" "--pretty=oneline" "--pretty=raw" "--pretty=full" \
          "--pretty=fuller" "--date=iso8601" "--date=iso8601-strict" \
          "--date=rfc2822" "--date=short" "--date=raw" "--date=unix" \
-         "--date=human" "--date=relative" "--date=local" "--date=iso-local" \
-         "--relative-date" "--parents" "--abbrev-commit" "--abbrev=12" \
+         "--date=local" "--date=iso-local" \
+         "--parents" "--abbrev-commit" "--abbrev=12" \
          "--abbrev=12 --abbrev-commit" "--reverse" "--skip=7" \
          "--first-parent" "--no-walk" "--format=%B" "--format=%b" \
-         "--format=%s" "--format=%f" "--format=%H" \
-         "--pretty=format:%h|%p|%T|%t|%ci|%cr|%f|%an|%ae|%ad" \
-         "--pretty=format:%ai|%aI|%as|%at|%ar|%cd|%cD|%ct" \
+         "--format=%s" "--format=%H" \
+         "--pretty=format:%h|%p|%T|%t|%ci|%an|%ae|%ad" \
+         "--pretty=format:%ai|%aI|%as|%at|%cd|%cD|%ct" \
          "--pretty=tformat:%h%x09%s"; do
   nlog=$((nlog+1))
   a=$(git -C "$REFREPO" log -$LOGN $NOMAILMAP $f 2>&1 | md5sum)
@@ -1218,8 +1072,8 @@ for f in "" "--oneline" "--pretty=oneline" "--pretty=raw" "--pretty=full" \
 done
 # Formats containing a space have to be passed as one argument, so they are
 # checked outside the loop rather than fought with through word splitting.
-for f in "--date=format:%Y/%m/%d %H:%M:%S %a %b" "--format=%h %t %p" \
-         "--format=%ai %aI %as %at %ar" "--format=%an <%ae> %ad%n%s"; do
+for f in "--format=%h %t %p" \
+         "--format=%ai %aI %as %at" "--format=%an <%ae> %ad%n%s"; do
   nlog=$((nlog+1))
   a=$(git -C "$REFREPO" log -$LOGN $NOMAILMAP "$f" | md5sum)
   b=$("$GITTLE" -C "$REFREPO" log -$LOGN "$f" | md5sum)
@@ -1318,33 +1172,42 @@ NOCC="--diff-merges=off"
 NOATTR="-c diff.cpp.xfuncname=^[A-Za-z_$].*$ -c diff.perl.xfuncname=^[A-Za-z_$].*$ -c diff.python.xfuncname=^[A-Za-z_$].*$"
 
 # ------------------------------------------------- the diff engine, alone
-# Every file pair of real commits through both engines, with git's four header
-# lines stripped.  Comparing *pairs* rather than commits is what makes a
-# failure point at the file (phase-5.md, "The oracle procedure").
-if [ -x "$SELF" ]; then
-  PAIRN=120
-  [ $FULL = 1 ] && PAIRN=900
-  eng_ok=1; npair=0
-  for c in $(git -C "$REFREPO" rev-list --no-merges -n $PAIRN HEAD); do
-    for f in $(git -C "$REFREPO" diff-tree -r --no-renames --name-only "$c^" "$c"); do
-      git -C "$REFREPO" cat-file blob "$c^:$f" > "$WORK/p5.a" 2>/dev/null || continue
-      git -C "$REFREPO" cat-file blob "$c:$f"  > "$WORK/p5.b" 2>/dev/null || continue
-      npair=$((npair+1))
-      case $((npair % 7)) in
-        0) fl="";;  1) fl="-U0";; 2) fl="-U10";; 3) fl="-w";;
-        4) fl="-b";; 5) fl="--ignore-space-at-eol";; 6) fl="-U1";;
-      esac
-      git diff --no-index --minimal --no-color $fl -- "$WORK/p5.a" "$WORK/p5.b" \
-        | tail -n +5 > "$WORK/p5.pg"
-      "$SELF" diff $fl "$WORK/p5.a" "$WORK/p5.b" > "$WORK/p5.pt"
-      cmp -s "$WORK/p5.pg" "$WORK/p5.pt" || { eng_ok=0; echo "  $c $f [$fl] differs"; }
-    done
+# Every file pair of real commits through both tools.  The engine is diff(1)
+# now (docs/minimize.md §5), so the hunks are not expected to sit where
+# git's do; what is checked is what a patch is *for*: applied with patch(1)
+# to the old side it reproduces the new one, and the line counts -- which a
+# minimal script fixes -- agree with git's `--numstat`.  Under a whitespace
+# mode the patch cannot reproduce the file (the differences it ignores are
+# the point), so only the counts are compared there.  Comparing *pairs*
+# rather than commits is what makes a failure point at the file.
+PAIRN=120
+[ $FULL = 1 ] && PAIRN=900
+eng_ok=1; npair=0; nsame=0
+ENG="$WORK/eng"; mkdir -p "$ENG"
+for c in $(git -C "$REFREPO" rev-list --no-merges -n $PAIRN HEAD); do
+  for f in $(git -C "$REFREPO" diff-tree -r --no-renames --name-only "$c^" "$c"); do
+    git -C "$REFREPO" cat-file blob "$c^:$f" > "$ENG/a" 2>/dev/null || continue
+    git -C "$REFREPO" cat-file blob "$c:$f"  > "$ENG/b" 2>/dev/null || continue
+    npair=$((npair+1))
+    case $((npair % 7)) in
+      0) fl="";;  1) fl="-U0";; 2) fl="-U10";; 3) fl="-w";;
+      4) fl="-b";; 5) fl="--ignore-space-at-eol";; 6) fl="-U1";;
+    esac
+    # `-U<n>` implies `-p` in both tools, so the counts are taken without it.
+    case $fl in -U*) nfl="";; *) nfl=$fl;; esac
+    ( cd "$ENG" && git diff --no-index --minimal --numstat $nfl -- a b | cut -f1,2 ) > "$ENG/ng"
+    ( cd "$ENG" && "$GITTLE" diff --no-index --numstat $nfl a b | cut -f1,2 ) > "$ENG/nt"
+    cmp -s "$ENG/ng" "$ENG/nt" || { eng_ok=0; echo "  $c $f [$fl] counts differ"; }
+    case $fl in -w|-b|--ignore-space-at-eol) continue;; esac
+    ( cd "$ENG" && git diff --no-index --minimal --no-color $fl -- a b | tail -n +5 ) > "$ENG/pg"
+    ( cd "$ENG" && "$GITTLE" diff --no-index $fl a b | tail -n +5 ) > "$ENG/pt"
+    cmp -s "$ENG/pg" "$ENG/pt" && nsame=$((nsame+1))
+    ( cd "$ENG" && rm -f out && patch -s -o out a < pt >/dev/null 2>&1 && cmp -s out b ) \
+      || { eng_ok=0; echo "  $c $f [$fl] patch does not reproduce the file"; }
   done
-  [ $eng_ok = 1 ] && { ok; report "diff engine" "$npair file pairs, hunk for hunk"; } \
-                  || bad "diff engine"
-else
-  report "diff engine" "skipped (no nim)"
-fi
+done
+[ $eng_ok = 1 ] && { ok; report "diff engine" "$npair file pairs round-trip through patch(1), counts agree; $nsame hunk-identical"; } \
+                || bad "diff engine"
 
 # ------------------------------------------------------------------- diff
 # A repository in a state that has one of everything: a modification, a
@@ -1422,8 +1285,12 @@ for f in "-p" "--stat" "--numstat" "--shortstat" "--raw" "--name-only" \
          "-p --full-index" "--stat --format=full" "--numstat -z" \
          "-p --abbrev=12"; do
   nld=$((nld+1))
-  a=$(git -C "$REFREPO" $NOATTR log $NOMAILMAP $NOREN -n$LOGD $f 2>&1 | md5sum)
-  b=$("$GITTLE" -C "$REFREPO" log -n$LOGD $f 2>&1 | md5sum)
+  # A patch's hunks may sit elsewhere than git's (docs/minimize.md §5, the
+  # engine is diff(1)); the engine test checks them by applying them, so a
+  # `-p` form here compares everything but the hunk lines.
+  case " $f " in *" -p"*|*" -U"*) hunkless="grep -v '^[@+ -]'";; *) hunkless=cat;; esac
+  a=$(git -C "$REFREPO" $NOATTR log $NOMAILMAP $NOREN -n$LOGD $f 2>&1 | eval "$hunkless" | md5sum)
+  b=$("$GITTLE" -C "$REFREPO" log -n$LOGD $f 2>&1 | eval "$hunkless" | md5sum)
   [ "$a" = "$b" ] || { ld_ok=0; echo "  log $f differs"; }
 done
 # show: a commit, a merge, a root commit, a tag and a tag of a tag.
@@ -1435,8 +1302,10 @@ for f in "" "-s" "--stat" "--numstat" "-p --stat" "--oneline" "--name-status" \
          "--format=full" "--format=fuller" "--format=%s"; do
   for obj in $SHOWOBJ; do
     nld=$((nld+1))
-    a=$(git -C "$REFREPO" $NOATTR show $NOMAILMAP $NOREN $NOCC $f $obj 2>&1 | md5sum)
-    b=$("$GITTLE" -C "$REFREPO" show $f $obj 2>&1 | md5sum)
+    case " $f " in *" -p"*|*" -U"*|"  "|*"-format"*|*"--oneline"*|*"--name"*)
+      hunkless="grep -v '^[@+ -]'";; *) hunkless=cat;; esac
+    a=$(git -C "$REFREPO" $NOATTR show $NOMAILMAP $NOREN $NOCC $f $obj 2>&1 | eval "$hunkless" | md5sum)
+    b=$("$GITTLE" -C "$REFREPO" show $f $obj 2>&1 | eval "$hunkless" | md5sum)
     [ "$a" = "$b" ] || { ld_ok=0; echo "  show $f $obj differs"; }
   done
 done
@@ -1560,7 +1429,7 @@ for f in "--stat" "--name-only" "--raw" "" "--stat -- deep"; do
   cmp -s "$WORK/p5.dg" "$WORK/p5.dt" \
     || { sub_ok=0; echo "  diff $f from a subdirectory differs"; }
 done
-for f in "-n -E b" "-n -E b HEAD" "-l -E b" "-c -E b"; do
+for f in "-n -E b" "-n -E b HEAD" "-l -E b"; do
   nsub=$((nsub+1))
   ( cd "$SUB/sub" && git grep $f ) > "$WORK/p5.gg" 2>&1
   ( cd "$SUB/sub" && "$GITTLE" grep $f ) > "$WORK/p5.gt" 2>&1
@@ -1617,8 +1486,7 @@ grep_ok=1; ngrep=0
 GREPPAT="static xdl_ TODO the Signed-off-by"
 [ $FULL = 1 ] && GREPPAT="$GREPPAT ^int [a-z]+_oid struct"
 for pat in $GREPPAT; do
-  for f in "-n" "-l" "-c" "" "-i -n" "-w -n" "-C1 -n" "-L" "-A1 -n" "-B2 -n" \
-           "-v -l" "-v -c" "-h -n" "--cached -n"; do
+  for f in "-n" "-l" "" "-i -n" "-L" "-v -l" "-v -n" "--cached -n"; do
     ngrep=$((ngrep+1))
     git -C "$REFREPO" grep -E $f -e "$pat" > "$WORK/p5.gg" 2>&1; ga=$?
     "$GITTLE" -C "$REFREPO" grep -E $f -e "$pat" > "$WORK/p5.gt" 2>&1; gb=$?
@@ -1629,7 +1497,7 @@ done
 # A tree search prefixes every path with the name it was asked by, and -z, -q
 # and --color have shapes of their own.
 for f in "-n alpha HEAD" "-n -z static" "-l -z static" "--color -n static" \
-         "-c -z static" "-n static HEAD" "-2 static"; do
+         "-n static HEAD"; do
   ngrep=$((ngrep+1))
   git -C "$REFREPO" grep -E $f > "$WORK/p5.gg" 2>&1; ga=$?
   "$GITTLE" -C "$REFREPO" grep -E $f > "$WORK/p5.gt" 2>&1; gb=$?
@@ -1686,7 +1554,7 @@ P6="$WORK/p6"; mkdir -p "$P6"
 
 # gittle names itself where git names itself; that is a deliberate difference
 # and not one to test.
-p6norm(){ sed -e 's/^fatal: //' -e 's/^gittle: //' -e "s/'git /'gittle /" \
+p6norm(){ sed -e '/^hint:/d' -e 's/^fatal: //' -e 's/^gittle: //' -e "s/'git /'gittle /" \
               -e 's/^  git /  gittle /' -e 's/"git /"gittle /g' \
               -e 's/\tgit /\tgittle /' -e 's/ git add/ gittle add/' \
               -e 's/known to git$/known to gittle/' \
@@ -1701,7 +1569,10 @@ p6ro(){
   bo=$( cd "$p6dir" && "$GITTLE" "$@" 2>"$WORK/p6.eb" ); bs=$?
   be=$(p6norm < "$WORK/p6.eb")
   p6n=$((p6n+1))
-  if [ "$ao" != "$bo" ] || [ "$as" != "$bs" ] || [ "$ae" != "$be" ]; then
+  # P6ERR=0 compares the exit status but not the text of a refusal: git's
+  # near-miss diagnostics for `:<path>` are cut (docs/minimize.md §3).
+  if [ "$ao" != "$bo" ] || [ "$as" != "$bs" ] || \
+     { [ "${P6ERR:-1}" = 1 ] && [ "$ae" != "$be" ]; }; then
     p6ok=0
     printf '  %s %s  [git %d / gittle %d]\n' "${p6what:-}" "$*" "$as" "$bs"
     diff <(printf '%s\n' "$ao") <(printf '%s\n' "$bo") | head -4
@@ -1755,7 +1626,7 @@ p6state(){
 # Each tool's own view of the same repository, which p6state -- a neutral
 # observer -- cannot check.  A `status` that describes a state both tools
 # agree on differently is exactly the bug this catches.
-p6own(){ ( cd "$2" && "$1" status; "$1" status --porcelain=v2 --branch
+p6own(){ ( cd "$2" && "$1" -c advice.statusHints=false status; "$1" status --porcelain=v2 --branch
            "$1" ls-files -u; "$1" branch -a ) 2>&1 | p6norm; }
 
 # p6mut <args...> -- a mutating command, run in two copies of $P6/fix.
@@ -1772,7 +1643,10 @@ p6mut(){
   bo=$( cd "$P6/b" && "$GITTLE" "$@" 2>&1 ); bs=$?
   p6n=$((p6n+1)); this=1
   # The two copies live at different paths, and a message that names the
-  # working tree would differ for that reason alone.
+  # working tree would differ for that reason alone.  P6OUT=0 skips the
+  # comparison of output altogether: a block sets it where the two tools say
+  # different things about the same result (docs/minimize.md §6).
+  [ "${P6OUT:-1}" = 0 ] || \
   [ "$(printf '%s\n' "$ao" | p6norm | sed "s|$P6/[ab]|REPO|g")" \
   = "$(printf '%s\n' "$bo" | p6norm | sed "s|$P6/[ab]|REPO|g")" ] || this=0
   [ "$as" = "$bs" ] || this=0
@@ -1853,18 +1727,17 @@ p6ro rev-parse --abbrev-ref=strict main
 p6ro rev-parse --symbolic-full-name main..side
 p6ro rev-parse -- a.txt;                p6ro rev-parse HEAD a.txt
 p6ro rev-parse --foo;                   p6ro rev-parse --short main..side
-for f in --git-dir --show-toplevel --show-cdup --show-prefix \
+for f in --git-dir --show-toplevel \
          --is-inside-git-dir --is-inside-work-tree --is-bare-repository; do
   p6ro rev-parse $f
 done
 # From a subdirectory: `:path` is root-relative and `:./path` is not, and the
 # layout queries all answer differently.
 p6dir="$P6/fix/sub"
-for f in --git-dir --show-toplevel --show-cdup --show-prefix \
-         --is-inside-work-tree; do
+for f in --git-dir --show-toplevel --is-inside-work-tree; do
   p6ro rev-parse $f
 done
-p6ro rev-parse ':s.txt'; p6ro rev-parse ':./s.txt'; p6ro rev-parse 'HEAD:./s.txt'
+P6ERR=0 p6ro rev-parse ':s.txt'; P6ERR=0 p6ro rev-parse ':./s.txt'; P6ERR=0 p6ro rev-parse 'HEAD:./s.txt'
 p6dir="$P6/fix"
 [ $p6ok = 1 ] && { ok; report "revision grammar" "$p6n expressions and rev-parse forms"; } \
               || bad "revision grammar"
@@ -1975,12 +1848,9 @@ p6ro for-each-ref --points-at HEAD
 # --------------------------------------------------------------- branch
 p6ok=1; p6n=0; p6dir="$P6/fix"; p6what="branch"
 for a in "" "-v" "-vv" "-a" "-r" "-av" "-arv" "--show-current" "--list" \
-         "--contains side" "--merged" "--no-merged" "--sort=-refname" \
-         "-v --sort=objectname" "-l ma*" "-l s*"; do
+         "--contains side" "--merged" "-l ma*" "-l s*"; do
   p6ro branch $a
 done
-p6ro branch --format='%(refname)'
-p6ro branch --format='%(refname:short) %(objectname:short)'
 # A detached HEAD is a row in the listing that is not a ref, and it counts
 # toward the column width.
 ( cd "$P6/fix" && git checkout -q --detach HEAD~1 ) >/dev/null 2>&1
@@ -1988,6 +1858,20 @@ p6ro branch; p6ro branch -v; p6ro branch -a
 ( cd "$P6/fix" && git checkout -q main ) >/dev/null 2>&1
 [ $p6ok = 1 ] && { ok; report "branch listing" "$p6n forms, detached HEAD included"; } \
               || bad "branch listing"
+
+# The listing options trimmed in the minimisation pass (docs/minimize.md §3)
+# must refuse by name, not be ignored: a `branch --no-merged` that listed
+# every branch would look like an answer.
+p6ok=1; p6n=0
+for o in --sort=-refname --format='%(refname)' --points-at --no-contains \
+         --no-merged --edit-description; do
+  p6n=$((p6n+1))
+  ( cd "$P6/fix" && "$GITTLE" branch "$o" ) >/dev/null 2>"$WORK/p6.eb" \
+    && { p6ok=0; echo "  branch $o was accepted"; }
+  grep -q -- "${o%%=*}" "$WORK/p6.eb" || { p6ok=0; echo "  branch $o: refusal does not name it"; }
+done
+[ $p6ok = 1 ] && { ok; report "branch trims" "$p6n trimmed options refuse by name"; } \
+              || bad "branch trims"
 
 p6ok=1; p6n=0; p6what="branch"
 p6mut branch newb;            p6mut branch newb HEAD~1
@@ -2010,17 +1894,29 @@ p6mut branch -d main;         p6mut branch -d light
 
 # ------------------------------------------------------------------ tag
 p6ok=1; p6n=0; p6dir="$P6/fix"; p6what="tag"
-for a in "" "-l" "-n" "-n1" "-n2" "-n5" "--sort=-refname" "--contains HEAD~2" \
-         "--merged HEAD" "--points-at HEAD~1" "-l v*" "-l l*"; do
+for a in "" "-l" "-l v*" "-l l*" "v*"; do
   p6ro tag $a
 done
-p6ro tag --format='%(refname)'
 [ $p6ok = 1 ] && { ok; report "tag listing" "$p6n forms"; } || bad "tag listing"
+
+# Trimmed (docs/minimize.md §3), so each refuses by name.  `-n2` is the case
+# that kept `tag` from bundling short options; with it gone `-am msg` works.
+p6ok=1; p6n=0
+for o in -n -n2 --sort=-refname --format='%(refname)' --contains --no-contains \
+         --merged --no-merged --points-at; do
+  p6n=$((p6n+1))
+  ( cd "$P6/fix" && "$GITTLE" tag "$o" ) >/dev/null 2>"$WORK/p6.eb" \
+    && { p6ok=0; echo "  tag $o was accepted"; }
+  grep -q -- "${o%%=*}" "$WORK/p6.eb" || { p6ok=0; echo "  tag $o: refusal does not name it"; }
+done
+[ $p6ok = 1 ] && { ok; report "tag trims" "$p6n trimmed options refuse by name"; } \
+              || bad "tag trims"
 
 p6ok=1; p6n=0; p6what="tag"
 p6mut tag newtag;                p6mut tag newtag HEAD~1
 p6mut tag -a -m hello annot;     p6mut tag -mmsg mtag
 p6mut tag -a -m one -m two two;  p6mut tag -f v1
+p6mut tag -am bundled bund;      PREP='echo from file > m.txt' p6mut tag -F m.txt ftag
 p6mut tag -f -m new v1;          p6mut tag -d v1
 p6mut tag -d light;              p6mut tag -d nosuch
 p6mut tag v1;                    p6mut tag newtag v1
@@ -2337,15 +2233,14 @@ p6ok=1; p6n=0
 P6FIX="$P7/f8"
 DIRTY='printf "1\nX\n3\n" > f; echo s > staged; $GITX add staged; echo u > untracked'
 for a in "stash" "stash push" "stash push -m message" "stash push -u" \
-         "stash push -k" "stash push -q" "stash push -- f" "stash list" \
-         "stash show" "stash pop" "stash apply" "stash drop" "stash clear"; do
+         "stash push -q" "stash push -- f" "stash list" \
+         "stash pop" "stash apply" "stash drop" "stash clear"; do
   PREP="$DIRTY" p6mut $a
 done
 PREP='true' p6mut stash; PREP='true' p6mut stash pop; PREP='true' p6mut stash list
 TWO='printf "1\nX\n3\n" > f; $GITX stash push -q; echo n > n; $GITX add n; $GITX stash push -q'
 for a in "stash list" "stash pop" "stash apply" "stash drop" \
-         "stash show stash@{1}" "stash pop stash@{1}" "stash drop stash@{1}" \
-         "stash clear"; do
+         "stash pop stash@{1}" "stash drop stash@{1}" "stash clear"; do
   PREP="$TWO" p6mut $a
 done
 PREP='printf "1\nX\n3\n" > f; $GITX stash push -q; printf "1\nZ\n3\n" > f; $GITX commit -qam other' \
@@ -2354,37 +2249,6 @@ PREP='printf "1\nX\n3\n" > f; echo u > untracked; $GITX stash push -q -u' \
   p6mut stash pop
 unset PREP; unset P6FIX
 [ $p6ok = 1 ] && { ok; report "stash" "$p6n pushes, pops and drops"; } || bad "stash"
-
-# ------------------------------------------- read-tree -m: the plumbing merge
-# f11: main and topic each changed the same file, differently, and topic added
-# one -- so the two-way form has something to refuse and the three-way form
-# has something to leave unmerged.
-p7mk f11
-( cd "$P7/f11"
-  printf '1\n2\n3\n' > f; echo k > keep; git add .; git commit -qm base
-  git checkout -qb topic; printf '1\nT\n3\n' > f; echo n > n
-  git add .; git commit -qm t
-  git checkout -q main; printf '1\n2\nM\n' > f; git commit -qam m )
-p6ok=1; p6n=0; P6FIX="$P7/f11"
-MB=$( cd "$P7/f11" && git merge-base HEAD topic )
-# `cp -a` gives every file a new inode, and git calls a path "not uptodate" on
-# an inode change alone where gittle's stat comparison deliberately does not
-# (index.nim).  Refreshing first makes these tests measure `read-tree`.
-REFRESH='git update-index --refresh >/dev/null 2>&1'
-for a in "read-tree topic" "read-tree -m topic" "read-tree --reset topic" \
-         "read-tree -m HEAD topic" "read-tree -m -u HEAD topic" \
-         "read-tree --reset -u HEAD topic" "read-tree -u topic" \
-         "read-tree --empty" "read-tree -m" \
-         "read-tree -m $MB HEAD topic" "read-tree -m -u $MB HEAD topic"; do
-  PREP="$REFRESH" p6mut $a
-done
-PREP="$REFRESH; echo dirty >> f"              p6mut read-tree -m -u HEAD topic
-PREP="$REFRESH; echo dirty >> f"              p6mut read-tree --reset -u HEAD topic
-PREP="$REFRESH; echo dirty >> f; git add f"   p6mut read-tree -m -u HEAD topic
-PREP="$REFRESH; echo x > n"                   p6mut read-tree -m -u HEAD topic
-unset PREP; unset P6FIX
-[ $p6ok = 1 ] && { ok; report "read-tree -m" "$p6n one-, two- and three-tree reads"; } \
-              || bad "read-tree -m"
 
 # ------------------------------------------------------- objects git will read
 # Everything above compares gittle against git.  This asks the other question:
@@ -2490,6 +2354,7 @@ p8clone(){
   ao=$( cd "$P8" && git clone "$@" a 2>&1 ); as=$?
   bo=$( cd "$P8" && "$GITTLE" clone "$@" b 2>&1 ); bs=$?
   p8n=$((p8n+1))
+  [ "${P6OUT:-1}" = 0 ] || \
   [ "$(printf '%s\n' "$ao" | p8norm)" = "$(printf '%s\n' "$bo" | p8norm)" ] || this=0
   [ "$as" = "$bs" ] || this=0
   sa=$(p6state "$P8/a" | p8norm); sb=$(p6state "$P8/b" | p8norm)
@@ -2518,6 +2383,7 @@ p8mut(){
   ao=$( cd "$P8/a" && git "$@" 2>&1 ); as=$?
   bo=$( cd "$P8/b" && "$GITTLE" "$@" 2>&1 ); bs=$?
   p8n=$((p8n+1))
+  [ "${P6OUT:-1}" = 0 ] || \
   [ "$(printf '%s\n' "$ao" | p8norm)" = "$(printf '%s\n' "$bo" | p8norm)" ] || this=0
   [ "$as" = "$bs" ] || this=0
   sa="$(p6state "$P8/a"|p8norm)
@@ -2539,23 +2405,6 @@ $ob"; }
     diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -8
   fi
 }
-
-# ------------------------------------------------------------- ls-remote
-p6ok=1; p6n=0; p6dir="$P8/fix"; p6what="ls-remote"
-p6ro ls-remote "$SRC"
-p6ro ls-remote --refs "$SRC"
-p6ro ls-remote -b "$SRC"
-p6ro ls-remote -t "$SRC"
-p6ro ls-remote --branches --tags "$SRC"
-p6ro ls-remote "$SRC" main
-p6ro ls-remote "$SRC" 'refs/heads/main'
-p6ro ls-remote "$SRC" nosuch
-p6ro ls-remote origin
-p6ro ls-remote
-p6ro ls-remote --upload-pack "$P8/v0" "$SRC"
-p6ro ls-remote "file://$P8/empty"
-[ $p6ok = 1 ] && { ok; report "ls-remote" "$p6n forms, protocol v2 and v0"; } \
-              || bad "ls-remote"
 
 # ------------------------------------------------------------------ clone
 p8ok=1; p8n=0
@@ -2671,73 +2520,12 @@ p8mut remote set-url origin "file://$P8/elsewhere"
 [ $p8ok = 1 ] && { ok; report "remote" "$p8n subcommand forms"; } \
               || bad "remote"
 
-# -------------------------------------------------------------- index-pack
-# The index is a pure function of the pack, so it must come out byte for byte
-# identical to git's -- object order, CRCs, fanout and both trailing hashes.
-IP="$WORK/ip"; mkdir -p "$IP"
-ip_ok=1; ip_n=0
-ip_packs=$(ls "$P8/src"/objects/pack/*.pack 2>/dev/null)
-[ $FULL = 1 ] && ip_packs="$ip_packs $(ls "$REFREPO"/.git/objects/pack/*.pack)"
-for pk in $ip_packs; do
-  # A packfile is created read-only, and `cp` will not write over one.
-  rm -f "$IP/one.pack" "$IP/two.pack" "$IP/one.idx" "$IP/two.idx"
-  cp "$pk" "$IP/one.pack"; cp "$pk" "$IP/two.pack"; ip_n=$((ip_n+1))
-  git index-pack -o "$IP/one.idx" "$IP/one.pack" >/dev/null 2>&1 || ip_ok=0
-  "$GITTLE" index-pack -o "$IP/two.idx" "$IP/two.pack" >/dev/null || ip_ok=0
-  cmp -s "$IP/one.idx" "$IP/two.idx" || { ip_ok=0; echo "  idx differs for $pk"; }
-done
-# A truncated pack, a corrupted byte, and a thin pack with no repository to
-# complete it from: all three must be refused rather than indexed.
-head -c 200 "$IP/one.pack" > "$IP/short.pack"
-"$GITTLE" index-pack -o "$IP/short.idx" "$IP/short.pack" >/dev/null 2>&1 \
-  && { ip_ok=0; echo "  a truncated pack was accepted"; }
-cp "$IP/one.pack" "$IP/bad.pack"; chmod +w "$IP/bad.pack"
-# Eight bytes, so that at least one of them is certainly not what was there.
-printf 'XXXXXXXX' | dd of="$IP/bad.pack" bs=1 seek=40 conv=notrunc >/dev/null 2>&1
-cmp -s "$IP/one.pack" "$IP/bad.pack" && { ip_ok=0; echo "  corruption did nothing"; }
-"$GITTLE" index-pack -o "$IP/bad.idx" "$IP/bad.pack" >/dev/null 2>&1 \
-  && { ip_ok=0; echo "  a corrupted pack was accepted"; }
-[ $ip_ok = 1 ] && { ok; report "index-pack" "$ip_n packs byte-identical, 2 refusals"; } \
-               || bad "index-pack"
-
-# ------------------------------------------------------------- pack-objects
-# gittle's pack is not expected to be git's byte for byte -- it holds the
-# deltas it was given rather than the ones a search would find (R2).  What
-# must hold is that it contains exactly the right objects and that git can
-# read it.
-PO="$WORK/po"; rm -rf "$PO"; mkdir -p "$PO"
-po_ok=1
-( cd "$P8/fix" && git rev-parse main ) > "$PO/revs"
-( cd "$P8/fix" && "$GITTLE" pack-objects --revs --stdout < "$PO/revs" ) > "$PO/p.pack" \
-  || po_ok=0
-git -C "$P8/fix" index-pack -o "$PO/p.idx" "$PO/p.pack" >/dev/null 2>&1 || po_ok=0
-git show-index < "$PO/p.idx" | awk '{print $2}' | sort > "$PO/got"
-( cd "$P8/fix" && git rev-list --objects main ) | awk '{print $1}' | sort -u > "$PO/want"
-diff -q "$PO/got" "$PO/want" >/dev/null || { po_ok=0; echo "  object set differs"; }
-git -C "$P8/fix" verify-pack "$PO/p.idx" >/dev/null 2>&1 || \
-  { po_ok=0; echo "  git will not verify the pack"; }
-# ...and the delta reuse actually happens, which is the whole of R2: a slice
-# of the reference repository's history repacked here must still contain
-# deltas, because every one of them was copied out of the pack next door.
-( cd "$REFREPO" && git rev-parse HEAD; echo "^$(git rev-parse HEAD~2000)" ) > "$PO/revs2"
-( cd "$REFREPO" && "$GITTLE" pack-objects --revs --stdout < "$PO/revs2" ) > "$PO/q.pack"
-git -C "$REFREPO" index-pack -o "$PO/q.idx" "$PO/q.pack" >/dev/null 2>&1 || po_ok=0
-nd=$(git -C "$REFREPO" verify-pack -v "$PO/q.idx" 2>/dev/null |
-     awk 'NF>=7 && $2!="chain"{n++} END{print n+0}')
-[ "${nd:-0}" -gt 0 ] || { po_ok=0; echo "  no delta was reused (R2)"; }
-# A named pack writes both files and prints the name it gave them.
-( cd "$P8/fix" && "$GITTLE" pack-objects "$PO/named" < /dev/null >"$PO/name" )
-[ -f "$PO/named-$(cat "$PO/name").pack" ] && [ -f "$PO/named-$(cat "$PO/name").idx" ] \
-  || { po_ok=0; echo "  a named pack was not written where it said"; }
-[ $po_ok = 1 ] && { ok; report "pack-objects" "object set, git-readable, $nd deltas reused"; } \
-               || bad "pack-objects"
-
 # ------------------------------------------------ the URL forms, parsed only
-# `ls-remote` against a host that does not exist is the cheapest way to see
-# which command gittle would have run; the failure is ssh's, not gittle's.
+# `fetch` against a host that does not exist is the cheapest way to see which
+# command gittle would have run; the failure is ssh's, not gittle's.
 url_ok=1
 for u in "https://example.com/x.git" "git://example.com/x" "http://x/y"; do
-  out=$( "$GITTLE" ls-remote "$u" 2>&1 )
+  out=$( cd "$P8/fix" && "$GITTLE" fetch "$u" 2>&1 )
   case "$out" in *"ssh and local paths only"*) ;; *) url_ok=0; echo "  $u: $out";; esac
 done
 [ $url_ok = 1 ] && { ok; report "unsupported transports" "3 schemes refused by name"; } \
@@ -2854,20 +2642,18 @@ PREP='rm a.txt' p6mut rm a.txt
 PREP='echo x >> a.txt; echo y >> b.txt' p6mut rm a.txt b.txt
 [ $p6ok = 1 ] && { ok; report "rm" "$p6n removals, refusals and dry runs"; } || bad "rm"
 
-p6ok=1; p6n=0
+# `mv` refuses what git refuses, in fewer words (docs/minimize.md §3.5): a
+# refusal is compared by its exit status and by the state it left alone, and
+# a rename by the index and the tree it produced.
+p6ok=1; p6n=0; P6OUT=0
 p6mut mv a.txt c.txt
-p6mut mv -v a.txt c.txt
-p6mut mv -n a.txt c.txt
 p6mut mv a.txt b.txt
 p6mut mv -f a.txt b.txt
-p6mut mv -f -v a.txt b.txt
 p6mut mv a.txt sub
 p6mut mv a.txt sub/
 p6mut mv a.txt b.txt sub
 p6mut mv a.txt b.txt c.txt
 p6mut mv sub newsub
-p6mut mv -v sub newsub
-p6mut mv -n sub newsub
 p6mut mv sub newsub/
 p6mut mv sub other
 p6mut mv sub sub2/x
@@ -2888,19 +2674,32 @@ p6mut mv sub sub/deep/x
 p6mut mv sub/deep newdeep
 p6mut mv sub/s.txt sub/deep/d.txt
 p6mut mv a.txt other/o.txt
+PREP='echo edit >> a.txt' p6mut mv a.txt c.txt
+PREP='echo edit >> a.txt; $GITX add a.txt; echo more >> a.txt' p6mut mv a.txt c.txt
+PREP='mkdir ig; echo ig > .gitignore' p6mut mv a.txt ig
+PREP=; P6OUT=
 [ $p6ok = 1 ] && { ok; report "mv" "$p6n renames and refusals"; } || bad "mv"
 
 # ------------------------------------------------------------------- clean
 #
-# The fixture exists to exercise the collapse rule (src/cmd/clean.nim): a
-# directory with tracked content, one with none, one holding an ignored file,
-# one that is entirely ignored, one that is a repository of its own, and an
-# ignored directory.
+# git names a directory once (`Removing build/`) where gittle names each file
+# in it (docs/minimize.md §3.5), so stdout is not compared byte for byte.
+# What is compared is the working tree afterwards -- every file, and every
+# directory too, empty ones included, which `p6state`'s `find -type f` does
+# not list -- and, for `-n`, the *set* of paths that would go, with git's
+# directory lines expanded to the files and empty directories under them.
+#
+# The fixture has one of everything the directory rule turns on: a directory
+# with tracked content, one with none, one holding an ignored file, one that
+# is entirely ignored, an ignored directory, an empty one, a chain of empty
+# ones, an empty one under a tracked directory, and a repository of its own
+# both at the root and inside an untracked directory.
 rm -rf "$P10/cl"; mkdir -p "$P10/cl"
 ( cd "$P10/cl"
   git init -q -b main .
   printf '*.log\nignoredir/\n' > .gitignore
-  mkdir -p tracked untracked/deep mixed ignoredir nested wholeign
+  mkdir -p tracked/scratch untracked/deep untracked/emptysub untracked/inner \
+           mixed ignoredir nested wholeign emptydir deepempty/a/b
   echo t > tracked/t.txt; echo m > mixed/m.txt
   git add .gitignore tracked/t.txt mixed/m.txt >/dev/null; git commit -qm one
   echo u > u.txt; echo l > u.log
@@ -2908,31 +2707,71 @@ rm -rf "$P10/cl"; mkdir -p "$P10/cl"
   echo n > mixed/new.txt; echo il > mixed/i.log
   echo ig > ignoredir/a.txt
   echo w > wholeign/a.log; echo w2 > wholeign/b.log
-  ( cd nested && git init -q . && echo n > n.txt ) )
+  ( cd nested && git init -q . && echo n > n.txt )
+  ( cd untracked/inner && git init -q . ) )
 
-P6FIX="$P10/cl"; p6ok=1; p6n=0
-for f in "" -n -f -fd -fdx -fdX -fx -fX -nd -ndx -ndX -ffd -ffdx -qfd -nx; do
-  p6mut clean $f
+clstate(){ p6state "$1"; ( cd "$1" && find . -path ./.git -prune -o -type d -print | sort ); }
+# The paths a `-n` run said would go, as a set of files and empty
+# directories, resolved in the copy the run looked at.
+clwould(){ ( cd "$1" && sed -n 's/^Would remove //p' | while read -r p; do
+              p=${p%/}; if [ -d "$p" ]; then find "$p" -type f -o -type d -empty
+              else echo "$p"; fi; done | sort -u ); }
+clmut(){
+  local ao as bo bs sa sb this=1 dry=0 a
+  rm -rf "$P6/a" "$P6/b"; cp -a "$P10/cl" "$P6/a"; cp -a "$P10/cl" "$P6/b"
+  ao=$( cd "$P6/a" && git "$@" 2>&1 ); as=$?
+  bo=$( cd "$P6/b" && "$GITTLE" "$@" 2>&1 ); bs=$?
+  p6n=$((p6n+1))
+  [ "$as" = "$bs" ] || this=0
+  sa=$(clstate "$P6/a"); sb=$(clstate "$P6/b")
+  [ "$sa" = "$sb" ] || this=0
+  for a; do case $a in --dry-run) dry=1;; --*) ;; -*n*) dry=1;; esac; done
+  if [ $dry = 1 ]; then
+    sa=$(printf '%s\n' "$ao" | clwould "$P6/a"); sb=$(printf '%s\n' "$bo" | clwould "$P6/b")
+    [ "$sa" = "$sb" ] || this=0
+  fi
+  if [ $this = 0 ]; then
+    p6ok=0
+    printf '  %s  [git %d / gittle %d]\n' "$*" "$as" "$bs"
+    diff <(printf '%s\n' "$sa") <(printf '%s\n' "$sb") | head -6
+  fi
+}
+p6ok=1; p6n=0
+for f in "" -n -f -fd -fdx -fx -nd -ndx -nx -qfd -qfdx -nfd; do
+  clmut clean $f
 done
-p6mut clean -fd untracked
-p6mut clean -fd mixed
-p6mut clean -f mixed
-p6mut clean -fd wholeign
-p6mut clean -fdx wholeign
-p6mut clean -fd nested
-p6mut clean -ffd nested
-p6mut clean -fdX ignoredir
-p6mut clean -f u.txt
-p6mut clean -fd untracked/deep
-p6mut clean -nfd nosuch
-p6mut clean -fd -e '*.txt'
-p6mut clean -fdx -e '*.log'
-p6mut clean -fdx -e untracked
-p6mut clean -fdX -e '*.txt'
-p6mut clean -f -e '*.txt'
-p6mut clean -fdxX
-p6mut -c clean.requireForce=false clean -d
-[ $p6ok = 1 ] && { ok; report "clean" "$p6n forms over the collapse rule"; } || bad "clean"
+clmut clean -fd untracked
+clmut clean -nd untracked
+clmut clean -fdx untracked
+clmut clean -fd mixed
+clmut clean -f mixed
+clmut clean -fd wholeign
+clmut clean -fdx wholeign
+clmut clean -fd nested
+clmut clean -nd nested
+clmut clean -fd ignoredir
+clmut clean -fdx ignoredir
+clmut clean -f u.txt
+clmut clean -fd untracked/deep
+clmut clean -f untracked/deep/y.txt
+clmut clean -fd emptydir
+clmut clean -fd deepempty
+clmut clean -nd deepempty
+clmut clean -fd tracked
+clmut clean -nfd nosuch
+clmut clean -fx -- u.txt
+clmut clean -fd -- -x
+clmut -c clean.requireForce=false clean -d
+clmut -C mixed clean -fd
+clmut -C untracked clean -fd
+# The cuts refuse, name the flag, and touch nothing (docs/minimize.md §6).
+for f in "-ffd|-ff" "-fd -e x.txt|-e" "-fdX|-X" "-fdi|-i" "-fd --exclude=x|--exclude"; do
+  rm -rf "$P6/b"; cp -a "$P10/cl" "$P6/b"; p6n=$((p6n+1))
+  bo=$( cd "$P6/b" && "$GITTLE" clean ${f%|*} 2>&1 ); bs=$?
+  [ $bs != 0 ] && [ "${bo#*${f#*|}}" != "$bo" ] && [ "$(clstate "$P6/b")" = "$(clstate "$P10/cl")" ] \
+    || { p6ok=0; printf '  clean %s  [gittle %d] %s\n' "${f%|*}" "$bs" "$bo"; }
+done
+[ $p6ok = 1 ] && { ok; report "clean" "$p6n forms over the directory rule, state on disk"; } || bad "clean"
 
 # ---------------------------------------------------------------- worktree
 #
@@ -3048,73 +2887,129 @@ PREP=
 
 # ---------------------------------------------------------------------- gc
 #
-# `gc` is additive (plan.md R2a), so the packs it leaves are *not* git's and
-# cannot be compared.  What can be compared is everything a later command
-# reads: the refs, the reflogs, the index, the working tree, and whether
-# every object still reachable is still there.  `git fsck --strict` after it
-# is the other half of the claim.
+# `gc` has no packer of its own: it asks the *remote* for one pack of
+# everything outside the largest pack it already has -- a fetch with wants
+# and haves of its own choosing (docs/minimize.md §3.4) -- and then deletes
+# only what that pack, or the largest one, provably covers.  So it runs in
+# the phase-8 fixture, where each client has a server, and the comparison
+# is the one every command that talks to a remote gets: both clients and
+# both servers afterwards.  The packs themselves cannot be compared -- git's
+# `gc` rewrites every pack and gittle's keeps the largest -- but nothing
+# that a later command reads may differ, and `git fsck --strict` after is
+# the other half of the claim.
 #
-# git is told `gc.reflogExpire=never`: gittle does not expire reflogs, which
-# is a deliberate cut (src/cmd/gc.nim), and without this the comparison would
-# be of that and nothing else -- the fixture's commits are dated 2023 and the
+# git is told `gc.reflogExpire=never` in the fixture: gittle does not expire
+# reflogs (a cut, src/cmd/gc.nim), and without it the comparison would be of
+# that and nothing else -- the fixture's commits are dated 2023 and the
 # suite pins "now" to 2027.
-rm -rf "$P10/gc"; mkdir -p "$P10/gc"
-( cd "$P10/gc"
-  git init -q -b main .
-  for i in 1 2 3; do echo $i > f$i.txt; git add f$i.txt >/dev/null; git commit -qm "c$i"; done
-  git branch side; git tag -m ann v1; git tag light
-  echo dead > u.txt; git add u.txt >/dev/null; git commit -qm dead
-  git reset -q --hard HEAD~1
-  git config gc.reflogExpire never
-  git config gc.reflogExpireUnreachable never )
+GCFIX="$P10/gcfix"; rm -rf "$GCFIX"; cp -a "$P8/fix" "$GCFIX"
+git -C "$GCFIX" config gc.reflogExpire never
+git -C "$GCFIX" config gc.reflogExpireUnreachable never
+P8FIX="$GCFIX"; p8ok=1; p8n=0
+p8mut gc
+p8mut gc -q
+PREP='echo more >> a.txt; $GITX commit -qam more; $GITX push -q origin main' p8mut gc -q
+PREP='echo more >> a.txt; $GITX commit -qam more' p8mut gc -q
+PREP='echo staged > s.txt; $GITX add s.txt' p8mut gc -q
+PREP='echo x | $GITX hash-object -w --stdin' p8mut gc -q
+PREP='$GITX worktree add --detach wt1 HEAD; rm -rf wt1' p8mut gc -q
+PREP='$GITX gc -q' p8mut gc -q
+P8FIX=
+[ $p8ok = 1 ] && { ok; report "gc" "$p8n runs, both clients and both servers compared"; } || bad "gc"
 
-P6FIX="$P10/gc"; p6ok=1; p6n=0
-p6mut gc --quiet
-p6mut gc -q --prune=now
-p6mut gc -q --no-prune
-p6mut gc -q --prune=never
-p6mut gc -q --prune=all
-PREP='$GITX worktree add wt1 side' p6mut gc --quiet
-PREP='$GITX worktree add wt1 side' p6mut gc -q --prune=now
-PREP='$GITX worktree add wt1 side; rm -rf wt1' p6mut gc --quiet
-PREP='echo staged > s.txt; $GITX add s.txt' p6mut gc -q --prune=now
-PREP='echo x | $GITX hash-object -w --stdin' p6mut gc -q --prune=now
-PREP='echo x | $GITX hash-object -w --stdin' p6mut gc -q
-[ $p6ok = 1 ] && { ok; report "gc" "$p6n runs, refs, reflogs and objects compared"; } || bad "gc"
-
-# The claim `gc` actually makes: loose objects end up in a pack, unreachable
-# ones older than the expiry are gone, and git is still happy afterwards.
+# The claims `gc` actually makes, on a clone gittle made itself: the pack
+# the clone received is still there afterwards (R2a), what was pushed is
+# packed and its loose copies gone, what was *not* pushed survives loose,
+# `--full` leaves exactly one pack, and git is happy at every step.
 gc_ok=1
-rm -rf "$P10/g1"; cp -a "$P10/gc" "$P10/g1"
-dangling=$( cd "$P10/g1" && echo dangling | git hash-object -w --stdin )
-before=$( find "$P10/g1/.git/objects" -type f -name '*' -not -path '*/pack/*' -not -path '*/info/*' | wc -l )
-( cd "$P10/g1" && "$GITTLE" gc -q --prune=now )
-after=$( find "$P10/g1/.git/objects" -type f -not -path '*/pack/*' -not -path '*/info/*' | wc -l )
-[ "$before" -gt 0 ] && [ "$after" = 0 ] || { gc_ok=0; echo "  loose objects: $before before, $after after"; }
-( cd "$P10/g1" && git cat-file -e "$dangling" 2>/dev/null ) && { gc_ok=0; echo "  unreachable object survived --prune=now"; }
-# ... and the reflog is a root, so what `reset --hard` moved off is kept.
-kept=$( cd "$P10/g1" && git rev-parse HEAD@{1} )
-( cd "$P10/g1" && git cat-file -e "$kept" 2>/dev/null ) || { gc_ok=0; echo "  a commit named by the reflog was pruned"; }
-# ... and a ref's own object survives, not merely what it peels to: an
-# annotated tag is a root *and* an object, and keeping only the commit it
-# names leaves the ref dangling.
-tagobj=$( cd "$P10/g1" && git rev-parse refs/tags/v1 )
-( cd "$P10/g1" && git cat-file -e "$tagobj" 2>/dev/null ) || { gc_ok=0; echo "  an annotated tag object was pruned"; }
-git -C "$P10/g1" fsck --strict --no-progress >/dev/null 2>&1 || { gc_ok=0; echo "  fsck not clean after gc"; }
-# The refs are packed, and nothing is left loose beside them.
-[ -f "$P10/g1/.git/packed-refs" ] || { gc_ok=0; echo "  no packed-refs after gc"; }
-[ -z "$(find "$P10/g1/.git/refs" -type f)" ] || { gc_ok=0; echo "  loose refs left after gc"; }
-diff <( cd "$P10/gc" && git for-each-ref ) <( cd "$P10/g1" && git for-each-ref ) >/dev/null \
-  || { gc_ok=0; echo "  refs changed across gc"; }
-# R2a: a pack that was already here is not rewritten.
-rm -rf "$P10/g2"; cp -a "$P10/gc" "$P10/g2"
-( cd "$P10/g2" && git gc -q )
-inherited=$( ls "$P10"/g2/.git/objects/pack/*.pack )
-( cd "$P10/g2" && echo more > m.txt && "$GITTLE" add m.txt && "$GITTLE" commit -qm more && "$GITTLE" gc -q ) >/dev/null 2>&1
-[ -f "$inherited" ] || { gc_ok=0; echo "  gc rewrote an inherited pack (R2a)"; }
-[ $gc_ok = 1 ] && { ok; report "gc, what it claims" "additive, reflogs are roots, fsck clean"; } \
+rm -rf "$P10/gsrv" "$P10/gw" "$P10/g1"
+( cd "$P10" && git init -q -b main gw && cd gw
+  for i in 1 2 3; do echo $i > f$i.txt; git add f$i.txt; git commit -qm "c$i"; done
+  git tag -m ann v1; git tag light ) >/dev/null 2>&1
+git clone -q --bare "$P10/gw" "$P10/gsrv" >/dev/null 2>&1
+git -C "$P10/gsrv" repack -a -d -q >/dev/null 2>&1
+( cd "$P10" && "$GITTLE" clone -q "file://$P10/gsrv" g1 ) >/dev/null 2>&1
+G1="$P10/g1"
+gcloose(){ find "$G1/.git/objects" -type f -not -path '*/pack/*' -not -path '*/info/*' | wc -l; }
+gcpacks(){ ls "$G1"/.git/objects/pack/*.pack 2>/dev/null | wc -l; }
+gcfsck(){ git -C "$G1" fsck --strict --no-progress >/dev/null 2>&1 || { gc_ok=0; echo "  fsck not clean after $1"; }; }
+inherited=$( ls "$G1"/.git/objects/pack/*.pack )
+( cd "$G1"
+  for i in 4 5; do echo $i > f$i.txt; "$GITTLE" add f$i.txt; "$GITTLE" commit -qm "c$i"; done
+  "$GITTLE" push -q origin main ) >/dev/null 2>&1
+pushed=$( git -C "$G1" rev-parse HEAD HEAD~1 HEAD:f4.txt HEAD:f5.txt )
+[ "$(gcloose)" -gt 0 ] || { gc_ok=0; echo "  fixture has no loose objects to pack"; }
+refs_before=$( git -C "$G1" for-each-ref )
+( cd "$G1" && "$GITTLE" gc -q ) || { gc_ok=0; echo "  gc failed"; }
+[ "$(gcloose)" = 0 ] || { gc_ok=0; echo "  $(gcloose) loose objects left after pushing everything"; }
+[ "$(gcpacks)" = 2 ] || { gc_ok=0; echo "  $(gcpacks) packs after gc, expected the clone's and one new"; }
+[ -f "$inherited" ] || { gc_ok=0; echo "  gc removed the pack the clone received (R2a)"; }
+for o in $pushed; do
+  git -C "$G1" cat-file -e "$o" 2>/dev/null || { gc_ok=0; echo "  $o missing after gc"; }
+done
+[ "$(git -C "$G1" log --oneline | wc -l)" = 5 ] || { gc_ok=0; echo "  log lost commits after gc"; }
+[ "$refs_before" = "$(git -C "$G1" for-each-ref)" ] || { gc_ok=0; echo "  refs changed across gc"; }
+gcfsck "gc"
+# Again with nothing new: the server sends the same pack under the same
+# name, and it must not be mistaken for an old one and deleted.
+( cd "$G1" && "$GITTLE" gc -q ) || { gc_ok=0; echo "  second gc failed"; }
+[ "$(gcpacks)" = 2 ] || { gc_ok=0; echo "  $(gcpacks) packs after a second gc"; }
+gcfsck "a second gc"
+# An unpushed commit: the server has never seen it, so its three objects
+# stay loose.
+( cd "$G1" && echo 6 > f6.txt && "$GITTLE" add f6.txt && "$GITTLE" commit -qm c6 ) >/dev/null 2>&1
+unpushed=$( git -C "$G1" rev-parse HEAD )
+( cd "$G1" && "$GITTLE" gc -q ) || { gc_ok=0; echo "  gc with unpushed work failed"; }
+[ "$(gcloose)" = 3 ] || { gc_ok=0; echo "  $(gcloose) loose objects with one unpushed commit, expected 3"; }
+git -C "$G1" cat-file -e "$unpushed" 2>/dev/null || { gc_ok=0; echo "  the unpushed commit is gone"; }
+gcfsck "gc with unpushed work"
+# `--full`: one pack, and the unpushed objects still loose beside it.
+( cd "$G1" && "$GITTLE" gc --full -q ) || { gc_ok=0; echo "  gc --full failed"; }
+[ "$(gcpacks)" = 1 ] || { gc_ok=0; echo "  $(gcpacks) packs after gc --full, expected 1"; }
+[ "$(gcloose)" = 3 ] || { gc_ok=0; echo "  $(gcloose) loose objects after gc --full, expected the unpushed 3"; }
+[ "$(git -C "$G1" log --oneline | wc -l)" = 6 ] || { gc_ok=0; echo "  log lost commits after gc --full"; }
+gcfsck "gc --full"
+# ... and once that commit is pushed, nothing is left loose at all.
+( cd "$G1" && "$GITTLE" push -q origin main && "$GITTLE" gc --full -q ) >/dev/null 2>&1
+[ "$(gcpacks)" = 1 ] && [ "$(gcloose)" = 0 ] \
+  || { gc_ok=0; echo "  $(gcpacks) packs and $(gcloose) loose after push and gc --full"; }
+# Automatic: with `gc.auto` set low, a push packs on its own -- and not a
+# dry run, and not when gc.auto is 0.  The estimate is git's, the files in
+# objects/17 times 256, so the commit has to put a blob in that bucket: the
+# first small integer whose blob hash starts with 17 is found first.
+git -C "$G1" config gc.auto 1
+seventeen=1
+while :; do
+  case "$(echo $seventeen | git hash-object --stdin)" in 17*) break;; esac
+  seventeen=$((seventeen+1))
+done
+( cd "$G1" && echo $seventeen > f7.txt && "$GITTLE" add f7.txt && "$GITTLE" commit -qm c7 ) >/dev/null 2>&1
+[ "$(gcloose)" = 3 ] || { gc_ok=0; echo "  $(gcloose) loose before the auto push, expected 3"; }
+( cd "$G1" && "$GITTLE" push -n -q origin main ) >/dev/null 2>&1
+[ "$(gcloose)" = 3 ] || { gc_ok=0; echo "  a dry-run push packed"; }
+( cd "$G1" && "$GITTLE" push -q origin main ) >/dev/null 2>&1
+[ "$(gcloose)" = 0 ] || { gc_ok=0; echo "  $(gcloose) loose after a push with gc.auto=1, expected 0"; }
+gcfsck "an automatic gc"
+git -C "$G1" config gc.auto 0
+( cd "$G1" && echo 8 > f8.txt && "$GITTLE" add f8.txt && "$GITTLE" commit -qm c8 && "$GITTLE" push -q origin main ) >/dev/null 2>&1
+[ "$(gcloose)" = 3 ] || { gc_ok=0; echo "  gc.auto=0 did not stop the automatic gc"; }
+( cd "$G1" && "$GITTLE" gc -q ) >/dev/null 2>&1      # back to nothing loose
+git -C "$G1" config --unset gc.auto
+gcfsck "push and gc --full"
+# `extensions.preciousObjects`: the delete pass is skipped, so a loose
+# object stays even when the server packed it.
+( cd "$G1" && echo 7 > f7.txt && "$GITTLE" add f7.txt && "$GITTLE" commit -qm c7 &&
+  "$GITTLE" push -q origin main && git config extensions.preciousObjects true &&
+  "$GITTLE" gc -q ) >/dev/null 2>&1
+[ "$(gcloose)" = 3 ] || { gc_ok=0; echo "  preciousObjects: $(gcloose) loose objects, expected 3 kept"; }
+git -C "$G1" config --unset extensions.preciousObjects
+# The options this command does not have are refused, naming the flag.
+for f in --prune=now --no-prune --auto --aggressive; do
+  out=$( cd "$G1" && "$GITTLE" gc $f 2>&1 ) && { gc_ok=0; echo "  gc $f was accepted"; }
+  case "$out" in *"$f"*) ;; *) gc_ok=0; echo "  refusal of $f does not name it: $out";; esac
+done
+[ $gc_ok = 1 ] && { ok; report "gc, what it claims" "server-packed, R2a, unpushed work kept, --full, fsck clean"; } \
                || bad "gc, what it claims"
-
 
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"

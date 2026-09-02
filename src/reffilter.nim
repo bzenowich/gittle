@@ -81,6 +81,7 @@ type
 # ---------------------------------------------------------------------------
 
 proc load(repo: Repository, i: var ObjInfo) =
+  ## Read the object's type, size and headers, once, on first need.
   if i.loaded: return
   i.loaded = true
   if i.oid.isNull: return
@@ -98,19 +99,7 @@ proc loadPeel(repo: Repository, r: var RefRow) =
   if r.rf.hasPeeled:
     r.peeled.oid = r.rf.peeled
   elif r.self.kind == otTag:
-    var current = r.rf.oid
-    for _ in 0 .. 15:
-      let obj = repo.readObject(current)
-      if obj.kind != otTag: break
-      var target = ""
-      for line in obj.data.splitLines:
-        if line.len == 0: break
-        if line.startsWith("object "):
-          target = line[7 .. ^1].strip()
-          break
-      if target.len == 0: break
-      current = parseOid(target)
-    r.peeled.oid = current
+    r.peeled.oid = repo.peelTags(r.rf.oid)
   repo.load(r.peeled)
 
 proc refField(repo: Repository, name, modifier, atom: string): string =
@@ -220,6 +209,7 @@ proc fieldValue*(repo: Repository, r: var RefRow, atom: string): string =
     fail("unknown field name: %(" & atom & ")")
 
 proc expand*(repo: Repository, r: var RefRow, format: string): string =
+  ## The format with every `%(atom)` replaced for this ref.
   var row = r
   result = interpolate(format, proc (atom: string): string =
     repo.fieldValue(row, atom))
@@ -312,6 +302,8 @@ type Contains = ref object
   memo: Table[Oid, bool]
 
 proc newContains(repo: Repository, wanted: seq[Oid]): Contains =
+  ## The state for `--contains`: the wanted tips and the oldest of their
+  ## commit dates, below which no walk need go.
   result = Contains(repo: repo, cutoff: high(int64))
   for o in wanted:
     result.wanted.incl o
@@ -345,17 +337,6 @@ proc reachesWanted(c: Contains, tip: Oid): bool =
         if not c.memo.hasKey(p): stack.add (p, false)
   c.memo.getOrDefault(tip)
 
-proc reachableFrom(repo: Repository, tips: seq[Oid]): HashSet[Oid] =
-  ## Everything reachable from any of `tips`, in one walk.  `--merged` asks
-  ## the question this way round -- "is the ref in here?" -- so one traversal
-  ## answers it for every ref in the listing.
-  var stack = tips
-  while stack.len > 0:
-    let o = stack.pop()
-    if o in result: continue
-    result.incl o
-    for p in repo.readCommit(o).parents: stack.add p
-
 proc collectRefs*(repo: Repository, prefixes: openArray[string],
                   f: RefFilter): seq[RefRow] =
   ## Every ref under one of `prefixes` that survives the filters, sorted.
@@ -366,9 +347,9 @@ proc collectRefs*(repo: Repository, prefixes: openArray[string],
                    f.merged.len + f.noMerged.len > 0
   let hasCon = if f.contains.len > 0: newContains(repo, f.contains) else: nil
   let noCon = if f.noContains.len > 0: newContains(repo, f.noContains) else: nil
-  let merged = if f.merged.len > 0: repo.reachableFrom(f.merged)
+  let merged = if f.merged.len > 0: repo.ancestry(f.merged)
                else: initHashSet[Oid]()
-  let noMerged = if f.noMerged.len > 0: repo.reachableFrom(f.noMerged)
+  let noMerged = if f.noMerged.len > 0: repo.ancestry(f.noMerged)
                  else: initHashSet[Oid]()
 
   for prefix in prefixes:
@@ -387,8 +368,7 @@ proc collectRefs*(repo: Repository, prefixes: openArray[string],
       if f.pointsAt.len > 0 and oid notin f.pointsAt:
         var peeled = oid
         try:
-          while repo.objectInfo(peeled).kind == otTag:
-            peeled = parseOid(headerField(repo.readObject(peeled).data, "object"))
+          peeled = repo.peelTags(peeled)
         except GittleError: discard
         if peeled == oid or peeled notin f.pointsAt: continue
       if wantsReach:

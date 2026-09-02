@@ -33,15 +33,11 @@
 ## `nothing to commit` is likewise reported without the `status` output git
 ## prints alongside it.
 
-import std/[os, strutils]
+import std/os
 import ../cli, ../commitobj, ../diffcore, ../dir, ../hooks, ../ident, ../index,
        ../oid, ../pathspec, ../pretty, ../repository, ../sequencer, ../status,
        ../trees, ../util
 
-const usageText = """usage: gittle commit [-a] [-m <msg>] [-F <file>] [--amend]
-                     [--author=<author>] [--date=<date>] [-s] [-q]
-                     [--allow-empty] [--no-verify] [-e|--no-edit]
-                     [--] [<pathspec>…]"""
 
 const editTemplate = """
 # Please enter the commit message for your changes.  Lines starting with '#'
@@ -72,6 +68,8 @@ proc identFor(cfg: Config, role: IdentRole, override, dateOverride: string,
     result.tzOffset = stamp.tzOffset
 
 proc stageOrRemove(repo: Repository, into: Index, path: string) =
+  ## Stage the working-tree version of a path into `into`, or drop the
+  ## entry when the file is gone.
   if not stageWorkingPath(repo, into, path): discard into.removePath(path)
 
 proc partialTree(repo: Repository, idx: Index, paths: seq[string],
@@ -88,65 +86,52 @@ proc partialTree(repo: Repository, idx: Index, paths: seq[string],
   for path in paths: repo.stageOrRemove(result.index, path)
   result.oid = repo.writeTree(result.index)
 
+const
+  synopsis = "[-a] [-m <msg>] [-F <file>] [--amend] [--author=<author>] [--date=<date>]\n[-s] [-q] [--allow-empty] [--no-verify] [-e|--no-edit] [--] [<pathspec>…]"
+  options = [
+    opt("-a|--all", help = "stage every tracked change first"),
+    opt("-m|--message", okValue, arg = "<msg>", help = "the message; repeatable, paragraphs joined"),
+    opt("-F|--file", okValue, arg = "<file>", help = "read the message from a file, `-` for stdin"),
+    opt("--amend", help = "replace the tip commit"),
+    opt("--allow-empty", help = "record a commit with no change"),
+    opt("-s|--signoff", help = "add a Signed-off-by trailer"),
+    opt("--no-signoff"),
+    opt("-q|--quiet", help = "print no summary"),
+    opt("-n|--no-verify", help = "skip the pre-commit and commit-msg hooks"),
+    opt("--verify"),
+    opt("-e|--edit", help = "open the editor even when a message was given"),
+    opt("--no-edit", help = "never open the editor"),
+    opt("--author", okValue, arg = "<author>", help = "override the author, `A U Thor <a@b>`"),
+    opt("--date", okValue, arg = "<date>", help = "override the author date"),
+    opt("-p|--patch|-i|--include|-o|--only|-v|--verbose|--dry-run|--short|--porcelain|" &
+        "-C|--reuse-message|--fixup|--squash|--cleanup|--reset-author", okRefused, help = "docs/06"),
+  ]
+
 proc cmdCommit*(c: Ctx, argv: seq[string]): int =
-  let args = expandShortOptions(argv, {'m', 'F'})
+  ## Entry point: parse, build the tree to commit (the index, `-a`'s
+  ## refresh of it, or a partial tree for named paths), take the message
+  ## through the hooks and the editor, and write the commit.
+  let o = parse(options, argv, "commit", synopsis)
   var messages: seq[string]
-  var all = false
-  var amend = false
-  var allowEmpty = false
-  var signoff = false
-  var quiet = false
-  var noVerify = false
-  var forceEdit = false
-  var noEdit = false
-  var authorOpt, dateOpt: string
-  var specs: seq[string]
-  var i = 0
-  var noMoreOpts = false
-
-  proc valueFor(a: string, dflt = ""): string =
-    ## As `optionValue`, plus the stuck short spelling: `commit -mfoo` is one
-    ## argument, and `-m` is the only option here that takes a value at all.
-    if a.len > 2 and a[0] == '-' and a[1] != '-': return a[2 .. ^1]
-    let eq = a.find('=')
-    if eq > 0 and a.startsWith("--"): return a[eq + 1 .. ^1]
-    inc i
-    failIf(i >= args.len, "option '" & a & "' requires a value")
-    args[i]
-
-  while i < args.len:
-    let a = args[i]
-    if noMoreOpts or a.len == 0 or a[0] != '-':
-      specs.add a
-    elif a == "--": noMoreOpts = true
-    elif a == "-a" or a == "--all": all = true
-    elif a == "--amend": amend = true
-    elif a == "--allow-empty": allowEmpty = true
-    elif a == "-s" or a == "--signoff": signoff = true
-    elif a == "--no-signoff": signoff = false
-    elif a == "-q" or a == "--quiet": quiet = true
-    elif a == "-n" or a == "--no-verify": noVerify = true
-    elif a == "--verify": noVerify = false
-    elif a == "-e" or a == "--edit": forceEdit = true
-    elif a == "--no-edit": noEdit = true
-    elif a == "-m" or a.startsWith("--message"): messages.add valueFor(a)
-    elif a == "-F" or a.startsWith("--file"):
-      let f = valueFor(a)
-      messages.add(if f == "-": readAll(stdin) else: readWholeFile(f))
-    elif a.startsWith("--author"): authorOpt = valueFor(a)
-    elif a.startsWith("--date"): dateOpt = valueFor(a)
-    elif a == "-h" or a == "--help":
-      echo usageText
-      return 0
-    elif a in ["-p", "--patch", "-i", "--include", "-o", "--only", "-v",
-               "--verbose", "--dry-run", "--short", "--porcelain", "-C",
-               "--reuse-message", "--fixup", "--squash", "--cleanup",
-               "--reset-author"]:
-      fail(a & " is out of scope for gittle v1 (docs/06)")
-    else:
-      fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
+  var signoff, noVerify = false
+  for (k, v) in o.occurrences:        # -m and -F accumulate, in order
+    case k
+    of "message": messages.add v
+    of "file": messages.add(if v == "-": readAll(stdin) else: readWholeFile(v))
+    of "signoff": signoff = true
+    of "no-signoff": signoff = false
+    of "no-verify": noVerify = true
+    of "verify": noVerify = false
+    else: discard
+  let all = o.has "all"
+  let amend = o.has "amend"
+  let allowEmpty = o.has "allow-empty"
+  let quiet = o.has "quiet"
+  let forceEdit = o.has "edit"
+  let noEdit = o.has "no-edit"
+  let authorOpt = o.val "author"
+  let dateOpt = o.val "date"
+  let specs = o.args
   let repo = c.repo
   failIf(repo.workTree.len == 0,
          "cannot commit in a bare repository: there is no working tree")
@@ -245,9 +230,7 @@ proc cmdCommit*(c: Ctx, argv: seq[string]): int =
     if (parents.len == 1 and parentTree == treeOid) or
        (parents.len == 0 and repo.readObject(treeOid).data.len == 0):
       let st = computeStatus(repo, idx, parsePathspec(@[], repo.prefix), umNormal)
-      stdout.write longStatus(st, umNormal,
-                              repo.cfg.getBool("advice.statusHints", true),
-                              (if repo.cfg.getBool("status.relativePaths", true):
+      stdout.write longStatus(st, umNormal, (if repo.cfg.getBool("status.relativePaths", true):
                                  repo.prefix else: ""))
       stdout.flushFile()
       return 1

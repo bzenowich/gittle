@@ -1,219 +1,201 @@
-## `gc` -- housekeeping, done additively.
+## `gc` -- housekeeping, with the packing done by the server.
 ##
-## In scope (docs/07): `--prune=<date>`, `--no-prune`, `--quiet`.
-## `--aggressive`, `--auto`, `--detach`, `--cruft`, `--keep-largest-pack`
-## and `--force` are cut.
+## `gittle gc [--full] [-q]`.  Everything else git's `gc` takes
+## (`--prune=<date>`, `--auto`, `--aggressive`, `--cruft`, ...) is refused
+## with one line: it either names a job this command does not do, or a
+## knob for one.
 ##
-## ## R2a: never repack what was already packed
+## ## Why a fetch, and not a packer
 ##
-## This is the one rule that shapes the command (plan.md §3, R2a).  git's `gc`
-## runs `repack -a -d`, which rewrites every pack in the repository -- and
-## rewriting a pack means re-deltifying it, which gittle **cannot do**,
-## because R2 says gittle never searches for a delta.  A repository whose
-## 304 MiB pack came from a clone would come out of a naive `gittle gc` at
-## 3.1 GiB (plan.md §3.1, measured).
+## R2 says gittle never searches for a delta, and so it cannot repack: a
+## pack it wrote itself would be a copy of every object at full size, ten
+## times what git's is (plan.md §3.1, measured).  The first version of this
+## command therefore only *added* a pack of the loose objects and left
+## every older pack alone (R2a) -- which meant the repository grew one
+## pack per fetch and nothing ever consolidated them.
 ##
-## So `gittle gc` is additive: **loose objects are folded into a new pack and
-## the packs that were already there are left alone.**  The result is a
-## repository with more packs than git would leave, all of them optimally
-## deltified, and a real `git gc` run later in the same repository restores
-## git's own layout exactly.  The only thing gittle must never do is undo it.
+## But the remote always runs full git.  A fetch says "I want these tips
+## and I have these commits", and the server's `pack-objects` sends the
+## difference as one properly deltified pack
+## (`builtin/fetch.c` → `fetch-pack.c`, `upload-pack.c:create_pack_file`).
+## **The haves do not have to be honest.**  Offer only the commits whose
+## objects already sit in the pack worth keeping, and the server sends
+## everything newer -- including what gittle already holds loose or in
+## small packs -- packed the way git would pack it.  So `gc` is a caller of
+## the fetch engine (`remotes.receivePack`) with wants and haves of its
+## own choosing, and no ref moves at all.  docs/minimize.md §3.4 is the
+## decision.
 ##
-## ## What it actually does, in order
+## The wants are every branch and tag the remote advertises whose object
+## is already here (a want must be an advertised tip, and one that is not
+## here yet is `fetch`'s business).  The haves come from a walk back from
+## each want to the first commit found in the **largest existing pack**:
+## every commit on the near side of that frontier is what the new pack
+## will hold.  Three levels are possible, by where the walk stops:
 ##
-## 1. **Prune worktrees** whose directories are gone ([worktrees.nim]).
-## 2. **Pack refs**: every loose shared ref folded into `packed-refs`
-##    ([refs.nim]).
-## 3. **Pack loose objects** that are reachable, and delete the loose copies.
-## 4. **Prune** loose objects that are unreachable *and* older than the
-##    expiry -- two weeks by default, as in git.
+## | level | haves | the server sends | deleted afterwards |
+## |---|---|---|---|
+## | pack pushed history | first commit in *any* pack | the commits since the last pack | loose objects the new pack covers |
+## | consolidate (**default**) | first commit in the *largest* pack | everything outside that pack | every smaller pack, and loose object, the new pack covers |
+## | `--full` | none | the whole history, as a clone would | every old pack and loose object |
 ##
-## ## What it deliberately does not do
+## The first is what git's own `gc` amounts to between full repacks, and
+## it is not offered: it is the default minus the consolidation, and the
+## bytes it saves on the wire are bounded by the size of the smaller packs
+## -- which is exactly what the default exists to get rid of.
 ##
-## * **Expire reflogs.**  git drops entries older than `gc.reflogExpire`
-##   (90 days) and unreachable ones older than `gc.reflogExpireUnreachable`
-##   (30 days).  That needs approxidate parsing, which is cut (plan.md §6.3),
-##   and reflog growth is bounded and tiny; the cost of the difference is a
-##   slightly longer `logs/HEAD`.  The oracle's fixture sets
-##   `gc.reflogExpire=never`, so both tools read the same configuration file
-##   and the divergence is *tested* rather than merely absent.
-## * **Write a commit-graph, a multi-pack-index, or a `.rev` file.**  R3:
-##   caches git writes and gittle declines to read.
-## * **Touch the object store at all**, when `extensions.preciousObjects` is
-##   set.  That extension says some other tool has references into this object
-##   store that gittle cannot see -- possibly by path, to a loose file -- so
-##   steps 3 and 4 are skipped entirely.  Steps 1 and 2 still run: neither
-##   removes an object.
+## The pack is asked for **non-thin**.  A fetch takes a thin pack and
+## appends the bases it is missing; here the file must stand on its own,
+## or a base would be copied out of the pack being kept and the old pack
+## could never be shown redundant.  It goes through the same `installPack`
+## as a fetch -- the pack checksum and every object's own hash -- which is
+## what lets the delete pass trust it.  The connectivity walk a fetch runs
+## afterwards is skipped: it exists to keep a ref from moving to a history
+## that cannot be read, and this command moves none.
+##
+## ## The one safety rule
+##
+## A loose object, or a pack other than the new one and the largest kept
+## one, is deleted only when **every object in it exists in a kept pack**.
+## Nothing else is ever removed.  That is what makes this safe beside a
+## real git writing the same repository, and it is what draws the limits:
+##
+## * **unpushed work** -- a local branch not yet pushed, a stash, a staged
+##   blob, a commit only the reflog names -- the server has never seen it
+##   and cannot send it, so it stays loose until the first `gc` after a
+##   push;
+## * **unreachable objects** are never pruned.  A branch fetched and then
+##   deleted pins its pack, because the server sends only what its own
+##   tips reach.  Pruning needs a grace period against writes in flight,
+##   which is why git waits two weeks (`gc.pruneExpire`); it stays git's
+##   job;
+## * **reflog expiry and packed refs** are local files git manages fine;
+##   packing refs only speeds up a repository with thousands of them;
+## * **being offline**: the gc needs the remote, opened the way `fetch`
+##   opens it -- the current branch's remote, else `origin`.  A device
+##   that pushes already has that requirement.
+##
+## ## When it runs on its own
+##
+## git runs `maintenance run --auto` at the end of `commit`, `merge`,
+## `rebase`, `fetch` and `am`, and it does nothing until about 6,700 loose
+## objects (`gc.auto`) have piled up.  gittle has one trigger, at the end
+## of a successful `push` (cmd/push.nim): that is the moment the server is
+## known to hold everything worth packing, and the connection to it was
+## just open.  The threshold is git's, estimated git's way (`objects/17`
+## times 256), and `gc.auto = 0` turns it off.  It runs in the foreground;
+## gittle has no background mode.
+##
+## `extensions.preciousObjects` says another tool holds references into
+## this object store that gittle cannot see, possibly by path to a loose
+## file: the delete pass is skipped entirely (plan.md §6 promised this
+## when it decided to accept the extension).  An alternate object
+## directory belongs to somebody else and is neither counted nor touched.
+## A `.keep` file beside a pack means what it means to git
+## (`builtin/repack.c`): that pack is never deleted.
 
-import std/[algorithm, os, sets, strutils, times]
-import ../cli, ../index, ../indexpack, ../oid, ../packwrite, ../refs,
-       ../repository, ../revision, ../revwalk, ../util, ../worktrees
+import std/[algorithm, os, posix, sequtils, sets, strutils]
+import ../cli, ../oid, ../packfile, ../remotes, ../repository, ../revwalk,
+       ../transport, ../util, ../worktrees
 
-const usageText = """usage: gittle gc [--prune=<date> | --no-prune] [--quiet]
 
-   --prune=<date>   prune unreachable loose objects older than <date>
-   --no-prune       prune nothing
-   --quiet          say nothing"""
+proc ownPacks(repo: Repository): seq[Pack] =
+  ## Every pack in this repository's own object directory, largest first --
+  ## which is the one that is kept.
+  for kind, path in walkDir(repo.objDirs[0] / "pack", checkDir = false):
+    if kind in {pcFile, pcLinkToFile} and path.endsWith(".idx"):
+      result.add openPack(path)
+  result.sort(proc (a, b: Pack): int =
+    cmp(getFileSize(b.packPath), getFileSize(a.packPath)))
 
-proc parseExpiry(spec: string): int64 =
-  ## `--prune=<date>`.  The three words git's own users type are honored;
-  ## everything else goes through the ISO-8601 parser, because approxidate
-  ## ("2.weeks.ago") is out of scope (plan.md §6.3) and quietly meaning
-  ## something else would be worse than refusing.
-  case spec.toLowerAscii
-  of "now", "all": high(int64)
-  of "never": low(int64)
-  else: parseTimestamp(spec)
+const
+  synopsis = "[--full] [-q]"
+  options = [
+    opt("--full", help = "repack the whole history into one pack, as a clone would"),
+    opt("-q|--quiet", help = "say nothing"),
+    opt("--prune|--no-prune|--auto|--aggressive|--cruft|--keep-largest-pack|--force",
+        okRefused, help = "the server packs; gittle neither prunes nor repacks (docs/minimize.md §3.4)"),
+  ]
 
-proc looseObjects(repo: Repository): seq[tuple[oid: Oid, path: string,
-                                               age: int64]] =
-  ## Every loose object in *this* repository's own object directory.  An
-  ## alternate belongs to somebody else and is never touched.
-  const hex = "0123456789abcdef"
-  let objDir = repo.objDirs[0]
-  for a in hex:
-    for b in hex:
-      let sub = $a & $b
-      for kind, path in walkDir(objDir / sub, checkDir = false):
-        if kind notin {pcFile, pcLinkToFile}: continue
-        var o: Oid
-        if not tryParseOid(sub & path.lastPathPart, o): continue
-        result.add (o, path, getLastModificationTime(path).toUnix)
-  sort(result, proc (x, y: (Oid, string, int64)): int = cmp($x[0], $y[0]))
+proc looseObjectEstimate*(repo: Repository): int =
+  ## git's own guess at how many loose objects there are, without counting
+  ## them all: the files in `objects/17`, one bucket of 256
+  ## (`builtin/gc.c:too_many_loose_objects`).  `gc.auto` is compared with
+  ## this; its default, 6700, is git's.
+  for _, _ in walkDir(repo.objDirs[0] / "17", checkDir = false): inc result
+  result * 256
 
-proc reachableSet(repo: Repository): HashSet[Oid] =
-  ## Everything worth keeping.
-  ##
-  ## The roots are wider than "the refs", and each extra one is a way work has
-  ## actually been lost: a **reflog** entry is how `reset --hard` is undone, a
-  ## worktree's **index** holds a blob that has been added but not committed,
-  ## and every **linked worktree** has a HEAD and an index of its own that
-  ## this one cannot see.  git collects the same four
-  ## (`reachable.c:mark_reachable_objects`).
-  var roots: seq[Oid]
-  var direct: seq[Oid]
+proc gcRepository*(c: Ctx, remote: string, full, quiet: bool) =
+  ## The whole of `gc`: prune stale worktrees, fetch the pack the module
+  ## comment describes from `remote`, then the delete pass under the safety
+  ## rule.  `push` calls this too, on the remote it just pushed to, when the
+  ## loose-object estimate crosses `gc.auto` -- the one moment the server is
+  ## known to hold the history worth packing.
+  let repo = c.repo
+  pruneWorktrees(repo, dryRun = false, verbose = false)
+  let packs = repo.ownPacks()
+  let largest = if full or packs.len == 0: nil else: packs[0]
+  let rem = repo.lookupRemote(remote)
+  let program = repo.cfg.get("remote." & rem.name & ".uploadpack")
+  let conn = connect(rem.url, if program.len > 0: program
+                              else: "git-upload-pack", wantV2 = true)
+  defer: conn.finish()
+  conn.handshake()
 
-  proc addRoot(o: Oid) =
-    if not o.isNull and repo.hasObject(o): roots.add o
+  # Wants and haves, as the module comment describes.  A tip the walk from
+  # an earlier tip already passed is walked no further, and is still wanted:
+  # a want the server finds nothing new for costs nothing.
+  var wants, haves, stack: seq[Oid]
+  var seen: HashSet[Oid]
+  for r in conn.lsRefs(["refs/heads/", "refs/tags/"]):
+    if r.unborn or not repo.hasObject(r.oid) or r.oid in wants: continue
+    wants.add r.oid
+    if largest == nil: continue
+    try: stack.add repo.peelTo(r.oid, otCommit).oid
+    except GittleError: continue      # a tag of a tree or a blob: no history
+    while stack.len > 0:
+      let o = stack.pop()
+      if seen.containsOrIncl(o): continue
+      if largest.contains(o): haves.add o
+      else: stack.add repo.readCommit(o).parents
+  var kept: seq[Pack]
+  if largest != nil: kept.add largest
+  if wants.len > 0:
+    let newPack = receivePack(repo, conn, wants, haves, includeTag = false,
+                              quiet = quiet or isatty(2) == 0, thin = false)
+    if not newPack.isNull:
+      kept.add openPack(repo.objDirs[0] / "pack" / ("pack-" & $newPack & ".idx"))
 
-  for r in repo.refs.allRefs(refsPrefix): addRoot r.oid
-  for w in repo.allWorktrees:
-    addRoot w.headOid
-    # Its index: a staged blob is in no tree yet, so nothing else names it.
-    let idxPath = w.gitDir / "index"
-    if fileExists(idxPath):
-      for e in readIndex(idxPath).entries: direct.add e.oid
-    # Its reflogs, which is what makes `HEAD@{5}` still resolvable.
-    for path in walkDirRec(w.gitDir / "logs", checkDir = false):
-      for line in readWholeFile(path).splitLines:
-        let parts = line.split(' ')
-        if parts.len < 2: continue
-        var o: Oid
-        if tryParseOid(parts[0], o): addRoot o
-        if tryParseOid(parts[1], o): addRoot o
-
-  # A root is walked as history when it peels to a commit, and taken as a bare
-  # object otherwise.  The peel is *tried* rather than inferred from the type,
-  # because a tag can name a tree or a blob and starting the history walk
-  # there would fail rather than keep it -- and the root itself is kept either
-  # way, which is what stops an annotated tag from being pruned out from under
-  # the ref that names it.
-  var commitish: seq[Oid]
-  for o in roots:
-    result.incl o
-    try:
-      discard repo.peelTo(o, otCommit)
-      commitish.add o           # not the peeled ID: the walk peels it again
-                                # and keeps the tag object as it goes
-    except GittleError: direct.add o
-  for o in repo.objectsBetween(commitish, @[]): result.incl o
-  for o in direct:
-    if not repo.hasObject(o): continue
-    result.incl o
-    if repo.objectInfo(o).kind == otTree:
-      repo.walkObjects(o, "", result, proc (x: Oid, p: string) = discard)
-
-proc packInto(repo: Repository, oids: seq[Oid]): Oid =
-  ## Write one pack holding exactly these objects, and index it.  The name is
-  ## the pack's own checksum, which is not known until the last byte, so it is
-  ## written to a temporary and renamed.
-  let base = repo.objDirs[0] / "pack" / "pack"
-  createDir(base.parentDir)
-  let tmp = base & "-tmp-" & $getCurrentProcessId() & ".pack"
-  var f: File
-  failIf(not open(f, tmp, fmWrite), "cannot create '" & tmp & "'")
-  try:
-    result = writePack(repo, oids, proc (d: string) =
-      failIf(d.len > 0 and f.writeBuffer(unsafeAddr d[0], d.len) != d.len,
-             "short write to " & tmp))
-  finally:
-    f.close()
-  let final = base & "-" & $result & ".pack"
-  moveFile(tmp, final)
-  discard indexPack(final, base & "-" & $result & ".idx", fixThin = false)
+  if repo.cfg.getBool("extensions.preciousObjects", false): return
+  # Is the object in one of the packs being kept?
+  proc covered(o: Oid): bool = kept.anyIt(it.contains(o))
+  # A kept pack is known by its *path*, not its handle: a pack's name is its
+  # checksum, so a second `gc` with nothing new to send receives the very
+  # same file it made last time -- installed over the old one, which must
+  # then not be found "covered" by itself and deleted.
+  for p in packs:
+    if kept.anyIt(it.packPath == p.packPath) or
+       fileExists(p.packPath[0 ..^ 6] & ".keep"): continue
+    if (0 ..< p.nObjects).anyIt(not covered(p.oidAt(it))): continue
+    p.close()
+    for ext in [".pack", ".idx", ".rev", ".bitmap", ".mtimes", ".promisor"]:
+      discard tryRemoveFile(p.packPath[0 ..^ 6] & ext)
+  # The loose objects, in this repository's own object directory only, and
+  # then the fan-out directories that emptied: git's `prune` removes those
+  # too, and 256 empty directories are what a reader would otherwise mistake
+  # for a repository with loose objects in it.
+  for kind, sub in walkDir(repo.objDirs[0], checkDir = false):
+    if kind != pcDir or sub.lastPathPart.len != 2: continue
+    for _, path in walkDir(sub):
+      var o: Oid
+      if tryParseOid(sub.lastPathPart & path.lastPathPart, o) and covered(o):
+        discard tryRemoveFile(path)
+    if toSeq(walkDir(sub)).len == 0:
+      try: removeDir(sub) except OSError: discard
 
 proc cmdGc*(c: Ctx, args: seq[string]): int =
-  var quiet = false
-  var expiry = dateNow() - 14 * 24 * 60 * 60   # git's `2.weeks.ago`
-  var i = 0
-  optionValue(args, i)
-  while i < args.len:
-    let a = args[i]
-    if a == "-q" or a == "--quiet": quiet = true
-    elif a == "--no-prune": expiry = low(int64)
-    elif a == "--prune": discard        # the default expiry, spelled out
-    elif a.startsWith("--prune="): expiry = parseExpiry(valueFor(a))
-    elif a == "-h" or a == "--help": (echo usageText; return 0)
-    elif a in ["--aggressive", "--auto", "--detach", "--no-detach", "--cruft",
-               "--no-cruft", "--force", "--keep-largest-pack"]:
-      fail("gittle gc does not support '" & a & "' (docs/07)")
-    else: fail("unknown option '" & a & "'\n" & usageText)
-    inc i
-
-  let repo = c.repo
-
-  pruneWorktrees(repo, dryRun = false, verbose = false)
-
-  repo.refs.packRefs(proc (o: Oid): Oid =
-    # A peel line exists for a ref that names a tag object and for no other,
-    # so this reports the null ID for everything else.
-    if repo.objectInfo(o).kind != otTag: return nullOid
-    try: repo.peelTo(o, otCommit).oid except GittleError: nullOid)
-
-  # The extension says another tool holds references into this object store
-  # that gittle cannot see -- possibly by path, to a loose file.  So the whole
-  # object half is skipped: packing without removing the loose copies would
-  # buy nothing, and removing them is exactly what the extension forbids
-  # (plan.md §6, which promised this when it decided to accept it).
-  if repo.cfg.getBool("extensions.preciousObjects", false): return 0
-
-  let loose = repo.looseObjects()
-  if loose.len == 0: return 0
-  let reachable = repo.reachableSet()
-
-  var toPack, toPrune: seq[Oid]
-  var loosePath: seq[string]
-  for (o, path, age) in loose:
-    if o in reachable:
-      toPack.add o
-      loosePath.add path
-    elif age <= expiry:
-      toPrune.add o
-      loosePath.add path
-
-  if toPack.len > 0:
-    discard repo.packInto(toPack)
-    if not quiet:
-      stderr.write "Packed " & $toPack.len & " loose object" &
-                   (if toPack.len == 1: "" else: "s") & "\n"
-  for path in loosePath: discard tryRemoveFile(path)
-  # The fan-out directories a prune emptied; git's `prune` removes them too,
-  # and 256 empty directories are what a reader would otherwise mistake for a
-  # repository with loose objects in it.
-  for kind, path in walkDir(repo.objDirs[0], checkDir = false):
-    if kind != pcDir or path.lastPathPart.len != 2: continue
-    var empty = true
-    for _, _ in walkDir(path): (empty = false; break)
-    if empty:
-      try: removeDir(path) except OSError: discard
+  ## Entry point: parse, then `gcRepository` against the default remote,
+  ## exactly the one `fetch` with no argument would open.
+  let o = parse(options, args, "gc", synopsis)
+  gcRepository(c, c.repo.defaultRemote(), full = o.has "full", quiet = o.has "quiet")
   0

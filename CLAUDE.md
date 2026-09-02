@@ -4,10 +4,11 @@ A minimal git in Nim. **Read [`docs/plan.md`](docs/plan.md) first** — goals,
 the design rules, the scope cuts, the budget, and the build order. Then the
 current phase document in `docs/`.
 
-**v1 is feature-complete (2026-09-02).** All nine phases are built (nine is
-empty), all 53 commands work, and `tests/oracle.sh --full` passes 187 checks.
-What is next is the optimisation and refactoring pass plan.md §5 defers to
-this point, and the v2 backlog in plan.md §8 — not more scope.
+**v1 is feature-complete and minimised (2026-09-02).** 44 commands,
+11,724 lines of code, every function documented, `tests/oracle.sh` green.
+[`docs/minimize.md`](docs/minimize.md) is the record of the minimisation
+pass: what was cut, why, and what it cost. What is next is the v2 backlog in
+plan.md §8 and the leftovers in minimize.md §9 -- not more scope.
 
 This file is the short version of what a fresh session needs to know before
 touching anything.
@@ -42,16 +43,17 @@ first, by anyone, in every phase:
 | Build | `nim c -d:release --out:build/gittle src/gittle.nim`; add `-d:static` for the single static binary. `nimble` cannot write `~/.nimble` here, so use `nim c` directly. |
 | Test | `tests/oracle.sh`, or `--full` to sweep every object in the reference repository and every commit and tag in it (~4 min). Needs bash, not just a POSIX shell. |
 | Comparing `log` | git applies `.mailmap` to `log` and `show` by **default** (`log.mailmap`, true since 2.34) and gittle does not — 18,512 of the reference repository's 82,130 commits display a different identity. Pass `--no-use-mailmap` to git or you are diffing that and nothing else. |
-| Comparing a diff | Four more of the same kind, all deliberate cuts (`docs/phase-5.md`): `--no-renames` (gittle detects none), `--minimal` (gittle's Myers always is), `--diff-merges=off` (combined diffs are cut — note `show` defaults to `--cc` where `log` does not), and, on the reference repository only, `-c diff.cpp.xfuncname=...` because its `.gitattributes` sets `diff=cpp` and a userdiff driver changes the name on a `@@` line. `tests/oracle.sh` has all four as `$NOREN`, `$NOCC` and `$NOATTR`. |
+| Comparing a diff | The engine is `diff(1)` (`docs/minimize.md` §5), so hunks may sit elsewhere than git's: compare a patch by **applying it**, and compare `--numstat` counts, which a minimal script fixes. The oracle's engine test does exactly that. For the headers, four cuts still apply: `--no-renames`, `--minimal`, `--diff-merges=off` (note `show` defaults to `--cc`), and `-c diff.cpp.xfuncname=...` on the reference repository. |
 | Comparing a **merge** | The same kind again: git's merge asks its diff for the default algorithm and gittle only has `--minimal`, so `merge-file` gets `--diff-algorithm=minimal` and `merge` would get `-Xdiff-algorithm=minimal`. |
 | Comparing a **rename** | And again, from the other side: gittle detects none, so git's `status` says `renamed:` where gittle says a delete and an add. `status.renames=false` goes in the *fixture*, so both copies read the same file — `mv` is the one command that makes a rename on purpose. |
-| Comparing `gc` | gittle does not expire reflogs (a cut, `docs/phase-10.md`), so the fixture sets `gc.reflogExpire=never` and `gc.reflogExpireUnreachable=never`. The packs cannot be compared at all — `gc` is additive (R2a) and gittle's packer has no delta search (R2) — so what is compared is everything a later command reads, plus `git fsck --strict` after. |
+| Comparing `gc` | gittle's `gc` is a fetch from the remote with chosen haves (`docs/minimize.md` §3.4): it needs a remote, packs only pushed history, and never prunes. Compare what a later command reads, that the pushed history's loose objects are gone, that unpushed ones are not, and `git fsck --strict` after. |
 | Testing a command that **writes** | Comparing stdout is not enough: a `checkout` that prints the right thing and leaves the wrong index is the failure worth catching. `oracle.sh`'s `p6mut` runs the command in two identical copies of a fixture and compares every ref, HEAD, the config, every reflog, every working-tree file, the whole index, **every in-progress marker** (`MERGE_HEAD`, `rebase-merge/…`) and **each tool's own `status` and `branch`** (`p6own`). Nine of phase 6's eleven bugs and four of phase 7's were found in those comparisons and not in the output. |
 | Testing a command that writes **under `.git`** | `p6state` looks at refs, reflogs, config, the index and the working tree — and `worktree` writes almost nothing there. `p10` compares both repositories *whole*, contents included, skipping only the packfiles and the index. It is also why `p6state` prints a `.git` **file**'s content rather than its hash: a linked worktree's holds an absolute path, so two copies differ for no reason but their own names. |
 | Testing a command that **resumes** | `$GITX` inside a `PREP` is the tool under test in that copy, so `PREP='$GITX cherry-pick topic' p6mut cherry-pick --continue` asks gittle to continue a state gittle created. Continuing git's state with git's tool proves nothing about interoperability; the two states being interchangeable is the claim. |
 | Testing a command that **talks to a remote** | `p8mut` keeps **two servers as well as two clients** — a bare copy of the source per tool, each client pointed at its own — and compares all four afterwards. A push that prints the right thing and leaves the wrong ref on the far side is caught by the far side and nowhere else. The tests need `$REFREPO` on `PATH` so that `git-upload-pack` and `git-receive-pack` resolve; `oracle.sh` puts it there. |
 | Reaching a remote at all | One transport: **a program with a pipe on each end**. `ssh host "git-upload-pack '<path>'"` and `git-upload-pack <path>` are the same thing with a prefix, so `clone file:///path` exercises every line of the protocol with no server and no network. A local path is *not* an object-store copy — plan.md §6, "A local path is not a second transport". |
-| Naming | gittle says `gittle` where git says `git`, in messages and in hints. The oracle normalises that away (`p6norm`) rather than testing it. |
+| Naming, hints | gittle says `gittle` where git says `git`; git prints `hint:` paragraphs and `(use "git …")` status advice that gittle does not. The oracle normalises the name away and drops hint lines (`p6norm`), and compares `status` against `git -c advice.statusHints=false`. |
+| Adding an option | A row in the command's `options` table (`src/cli.nim` says how); the usage text comes from the row. Refuse a cut option with an `okRefused` row rather than ignoring it. |
 
 ## Documentation
 
@@ -104,7 +106,7 @@ from the other end too — and it is now built: pack checksum, every object's
 own hash, then connectivity, and no ref moves until all three pass
 (`docs/phase-8.md`).
 
-**Phase 10 is done, and it was the last one.** `gc`, `worktree`, `clean`,
+**Phase 10 was the last phase, and the minimisation pass came after it.** `gc`, `worktree`, `clean`,
 `check-ignore`, `mv`, `rm` and `stage` — no new engine, every one of them a
 command over something an earlier phase built. Two rules worth carrying
 forward: **`clean -x` means "there are no ignore files"**, not "delete ignored
