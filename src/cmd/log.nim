@@ -95,6 +95,7 @@ proc cmdLog*(c: Ctx, args: seq[string]): int =
   var decorateMode = "auto"
   var abbrevLen = 0
   var dopts = defaultDiffOpts()
+  dopts.color = isTty()   # git's `color.ui=auto`; `--color`/`--no-color` below can override
   applyDiffOpts(p, dopts)
   var lim = Limiters()
   var greps, authors, committers: seq[string]

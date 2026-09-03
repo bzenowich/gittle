@@ -35,8 +35,9 @@
 ## person's terminal and not another's is a compatibility bug in a tool whose
 ## output gets parsed.
 
-import std/[algorithm, posix, strutils, times]
-import commitobj, ident, oid, objects, refs, repository, util
+import std/[algorithm, strutils, times]
+import color, commitobj, ident, oid, objects, refs, repository, util
+export color
 
 const
   weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
@@ -445,9 +446,3 @@ func entrySeparator*(kind: PrettyKind, nulTerminate = false): string =
   if kind in {pkOneline, pkTFormat}: ""
   elif nulTerminate: "\0"
   else: "\n"
-
-proc isTty*(): bool =
-  ## `--decorate=auto` and `--color=auto` both ask this.  Decoration is for a
-  ## human reading a terminal; a pipe is a program, and a program parsing
-  ## `log` output should not have to strip ref names it never asked for.
-  isatty(stdout.getFileHandle()) != 0

@@ -76,6 +76,7 @@ proc cmdShow*(c: Ctx, args: seq[string]): int =
   let p = parse(@options & @diffOptions, args, "show", synopsis)
   var opts = PrettyOpts(kind: pkMedium, now: dateNow())
   var dopts = defaultDiffOpts()
+  dopts.color = isTty()   # git's `color.ui=auto`; `--color`/`--no-color` below can override
   applyDiffOpts(p, dopts)
   var abbrevLen = 0
   for (k, v) in p.occurrences:

@@ -5,7 +5,8 @@
 ## obvious one: `-z` **implies porcelain v1** rather than merely changing the
 ## terminator, because a NUL-terminated long format would be meaningless.
 
-import ../cli, ../index, ../pathspec, ../repository, ../status, ../util
+import ../cli, ../color, ../index, ../pathspec, ../repository, ../status,
+       ../util
 
 
 const
@@ -17,6 +18,8 @@ const
     opt("-b|--branch", help = "include branch information"),
     opt("-z", help = "NUL-terminate records (implies --porcelain=v1)"),
     opt("-u|--untracked-files", okOptValue, arg = "[<mode>]", help = "no, normal (default) or all"),
+    opt("--color", okOptValue, arg = "[=<when>]", help = "colour the long format: always, never or auto"),
+    opt("--no-color"),
     opt("--ignored|--ignore-submodules|--column|--no-column|--ahead-behind|--no-ahead-behind|" &
         "--renames|--no-renames|--find-renames|--show-stash|-v|--verbose", okRefused, help = "docs/08"),
   ]
@@ -27,6 +30,7 @@ proc cmdStatus*(c: Ctx, args: seq[string]): int =
   var fmt = sfLong
   var nulTerm = false
   var untracked = umNormal
+  var color = isTty()   # git's `color.ui=auto`; `--color`/`--no-color` below can override
   for (k, v) in o.occurrences:        # the last format given wins, as in git
     case k
     of "short": fmt = sfShort
@@ -45,6 +49,8 @@ proc cmdStatus*(c: Ctx, args: seq[string]): int =
         of "no": umNo
         of "all": umAll
         else: fail("invalid untracked files mode '" & v & "'")
+    of "no-color": color = false
+    of "color": color = resolveColor(v)
     else: discard
   let branch = o.has "branch"
   let specs = o.args
@@ -63,6 +69,7 @@ proc cmdStatus*(c: Ctx, args: seq[string]): int =
   let relative = repo.cfg.getBool("status.relativePaths", true) and
                  fmt != sfPorcelainV1
   stdout.write renderStatus(st, fmt, untracked,
-                            (if relative: repo.prefix else: ""), branch, nulTerm)
+                            (if relative: repo.prefix else: ""), branch,
+                            nulTerm, color)
   stdout.flushFile()
   0

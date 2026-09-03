@@ -1184,7 +1184,7 @@ for o in --graph --follow --full-diff --min-parents=1 --max-parents=1 \
          --ancestry-path --cherry-pick --boundary --simplify-merges --objects \
          --walk-reflogs --children --source \
          -M -C --patience --histogram --word-diff --summary \
-         --color --no-color --shortstat --full-index --no-prefix -a --text \
+         --shortstat --full-index --no-prefix -a --text \
          -R -b --ignore-space-change --ignore-space-at-eol \
          --abbrev-commit --no-abbrev-commit --all-match --invert-grep; do
   ndef=$((ndef+1))

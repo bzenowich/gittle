@@ -132,8 +132,8 @@ Subcommands: `start`, `bad`/`new`, `good`/`old`, `terms`, `skip`, `reset`,
 - [x] `-q` / `--quiet` — Suppress non-error messages when creating or deleting.
 - [ ] `--abbrev=<n>` — Set the abbreviation length for object names in listings.
 - [ ] `--no-abbrev` — Print full object names in listings.
-- [ ] `--color[=<when>]` — Colorize the branch listing.
-- [ ] `--no-color` — Disable coloring of the listing.
+- [x] `--color[=<when>]` — Colorize the branch listing: the current branch (or a detached HEAD) green, remote-tracking branches red.
+- [x] `--no-color` — Disable coloring of the listing.
 - [ ] `-i` / `--ignore-case` — Sort and filter case-insensitively.
 - [ ] `--omit-empty` — Suppress the newline for formats that expand to nothing.
 - [ ] `--column[=<options>]` / `--no-column` — Display the listing in columns.

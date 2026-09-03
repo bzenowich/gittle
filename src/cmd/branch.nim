@@ -47,7 +47,7 @@
 ## through this file's own procs.
 
 import std/[os, strutils]
-import ../cli, ../commitobj, ../config, ../refname, ../refs,
+import ../cli, ../color, ../commitobj, ../config, ../refname, ../refs,
        ../repository, ../revision, ../revwalk, ../sequencer, ../util,
        ../worktrees
 import foreachref
@@ -127,7 +127,7 @@ proc tipSubject(repo: Repository, o: Oid): string =
   subject(stripSignature(repo.readCommit(o).message))
 
 proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
-                  verbose: int): int =
+                  verbose: int, color: bool): int =
   ## `kinds` is which namespaces to list: 0 local, 1 remote-tracking.
   let repo = c.repo
   var prefixes: seq[string]
@@ -173,7 +173,20 @@ proc listBranches(c: Ctx, f: RefFilter, kinds: set[range[0 .. 1]],
     ## the upstream state and the subject.  `refName` is empty for the
     ## detached-HEAD row below, which is not a ref: it has no worktree of its
     ## own to name and no upstream to compare against.
-    result = mark & (if verbose > 0: name.alignLeft(width) else: name)
+    #
+    # git colors whichever row wears the `*` -- a real branch or, just as
+    # much, the detached-HEAD row -- green, and every remote-tracking row red
+    # (`branch.c`'s `BRANCH_COLOR_CURRENT`/`_REMOTE`), always the whole name
+    # column and never the `-> target` half of a symbolic ref.  Padding is
+    # applied to the plain name first, so the escape codes wrapped around it
+    # afterwards never throw off `alignLeft`'s column count.
+    let padded = if verbose > 0: name.alignLeft(width) else: name
+    let shown =
+      if not color: padded
+      elif mark == "* ": cGreen & padded & cReset
+      elif refName.startsWith(remotes): cRed & padded & cReset
+      else: padded
+    result = mark & shown
     if symTarget.len > 0:
       # A symbolic ref -- `origin/HEAD` -- names another ref, and that is all
       # there is to say about it: no object ID, no subject.
@@ -343,6 +356,8 @@ const
     opt("-t|--track", help = "set up upstream tracking from the start point"),
     opt("--no-track", help = "do not set up tracking"),
     opt("--contains", okOptNext, arg = "[<commit>]", help = "list only branches containing <commit> (HEAD by default)"),
+    opt("--color", okOptValue, arg = "[=<when>]", help = "colour the current and remote-tracking branches"),
+    opt("--no-color"),
     opt("-c|--copy|-C|--create-reflog", okRefused, help = "docs/06"),
     opt("-u|--set-upstream-to|--unset-upstream", okRefused,
         help = "trimmed (docs/minimize-2.md B4); an upstream is branch.<name>.remote and .merge, and push -u writes them"),
@@ -359,12 +374,15 @@ proc cmdBranch*(c: Ctx, args: seq[string]): int =
   applyFilterOpts(c, o, f)
   var kinds: set[range[0 .. 1]] = {}
   var track, trackGiven = false
-  for (k, _) in o.occurrences:        # the last of -a/-r, and of -t/--no-track, wins
+  var color = isTty()   # git's `color.ui=auto`; `--color`/`--no-color` below can override
+  for (k, v) in o.occurrences:        # the last of -a/-r, and of -t/--no-track, wins
     case k
     of "all": kinds = {0, 1}
     of "remotes": kinds = {1}
     of "track": (track = true; trackGiven = true)
     of "no-track": (track = false; trackGiven = true)
+    of "no-color": color = false
+    of "color": color = resolveColor(v)
     else: discard
   let verbose = o.count "verbose"
   let list = o.has "list"
@@ -410,4 +428,4 @@ proc cmdBranch*(c: Ctx, args: seq[string]): int =
     return 0
 
   f.patterns.add rest
-  listBranches(c, f, kinds, verbose)
+  listBranches(c, f, kinds, verbose, color)

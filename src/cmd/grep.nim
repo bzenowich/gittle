@@ -132,7 +132,8 @@ proc cmdGrep*(c: Ctx, args: seq[string]): int =
   ## Entry point: parse, compile the pattern, choose the blobs (a tree's,
   ## the index's, or the working tree's), and search each.
   let p = parse(options, args, "grep", synopsis)
-  var o: GrepOpts
+  var o = GrepOpts(color: isatty(stdout.getFileHandle()) != 0)
+    # git's `color.ui=auto`; `--color`/`--no-color` below can override.
   failIf(p.vals("e").len > 1, "gittle grep takes one pattern; a second -e, " &
          "--and, --or and -f are out of scope (docs/minimize.md §3)")
   var pattern = p.val "e"

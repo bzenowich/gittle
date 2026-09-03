@@ -17,7 +17,7 @@
 ## is a path, exactly as in `log`; `--` settles it.
 
 import std/strutils
-import ../cli, ../diffcore, ../index, ../pathspec, ../repository,
+import ../cli, ../color, ../diffcore, ../index, ../pathspec, ../repository,
        ../revision, ../revwalk, ../util
 
 
@@ -44,6 +44,7 @@ proc cmdDiff*(c: Ctx, args: seq[string]): int =
   ## the index, the working tree) are being compared, and render.
   let p = parse(@options & @diffOptions, args, "diff", synopsis)
   var o = defaultDiffOpts()
+  o.color = isTty()   # git's `color.ui=auto`; `--color`/`--no-color` below can override
   applyDiffOpts(p, o)
   let cached = p.has "cached"
   let noIndex = p.has "no-index"

@@ -41,18 +41,23 @@
 ## `--diff-merges=off` does and what git did by default before 1.5.
 ##
 ## **The display side of the option surface** (docs/minimize-2.md §B4).  `-R`,
-## `-a`/`--text`, `--full-index`, `--no-prefix`, `--shortstat`, `--color` and
-## the two middle whitespace modes (`-b`, `--ignore-space-at-eol`) are gone:
-## none of them occurs once in the two tool-call logs of docs/minimize.md
-## §2.2, and each cost a branch inside the format writers rather than a line
-## of table.  What is left is what those logs actually ask for -- the patch,
-## `--stat`, `--numstat`, `--raw`, the name formats, `-z`, `-U<n>`, `-S`,
+## `-a`/`--text`, `--full-index`, `--no-prefix`, `--shortstat` and the two
+## middle whitespace modes (`-b`, `--ignore-space-at-eol`) are gone: none of
+## them occurs once in the two tool-call logs of docs/minimize.md §2.2, and
+## each cost a branch inside the format writers rather than a line of table.
+## What is left is what those logs actually ask for -- the patch, `--stat`,
+## `--numstat`, `--raw`, the name formats, `-z`, `-U<n>`, `-S`,
 ## `--diff-filter`, `--abbrev`, and the two whitespace modes anyone used
 ## (`-w` and `--ignore-cr-at-eol`).  Every cut name refuses by name below; a
 ## silently-ignored `-w` would print a *different diff* and say nothing.
+##
+## `--color` was cut in the same pass and restored later: it costs nothing in
+## the option table, only in the writers, so it is not part of the survey
+## above -- a human rereading a patch on a terminal is worth the five escape
+## constants below.
 
 import std/[os, strutils, algorithm, unicode]
-import cli, diff, index, objects, oid, pathspec, repository, trees, util
+import cli, color, diff, index, objects, oid, pathspec, repository, trees, util
 
 type
   DiffFormat* = enum
@@ -66,6 +71,7 @@ type
     nulTerminate*: bool        ## `-z`
     filter*: string            ## `--diff-filter=`, upper-case letters kept
     pickaxe*: string           ## `-S`
+    color*: bool
     exitCode*: bool
     quiet*: bool
     statWidth*: int            ## `--stat=<width>`; 0 means the 80-column default
@@ -87,7 +93,15 @@ func oldName(p: DiffPair): string =
 
 func defaultDiffOpts*(): DiffOpts =
   ## The options with nothing given: three lines of context, exact
-  ## whitespace, an automatic abbreviation width.
+  ## whitespace, an automatic abbreviation width, and no colour.
+  ##
+  ## Colour is the one field callers do not get for free, even at a terminal:
+  ## `commitSummary` and `mergeSummary` (below) call this too, for the
+  ## diffstat under `[main abc1234] subject`, and git never colours that line
+  ## even under `color.ui=always` -- verified against it rather than assumed.
+  ## `diff`, `log` and `show` are the three that face a terminal, and each
+  ## sets `color = isTty()` itself, right where `--color`/`--no-color` can
+  ## still override it.
   DiffOpts(ctxLen: 3, ws: wsExact, abbrev: 0)
 
 func status*(p: DiffPair): char =
@@ -129,13 +143,15 @@ const diffOptions* = [
   opt("--diff-filter", okValue, arg = "<letters>", help = "only these kinds of change: A D M T"),
   opt("-S", okValue, arg = "<string>", help = "changes that add or remove the string"),
   opt("--abbrev", okValue, arg = "<n>", help = "abbreviate object IDs to <n> digits"),
+  opt("--color", okOptValue, arg = "[=<when>]", help = "colour: always, never or auto"),
+  opt("--no-color"),
   # Two refusal rows, and the split is the record of where each name went.
   # This one was implemented and then cut in the second minimization pass: no
   # use in either tool-call log, and each cost a branch inside a writer.  A
   # refusal rather than a silent no-op because `-b` and `-R` change the diff
   # itself -- accepted and ignored, they would print a different answer and
   # say nothing about it.
-  opt("--color|--no-color|--shortstat|--full-index|--no-prefix|-a|--text|-R|" &
+  opt("--shortstat|--full-index|--no-prefix|-a|--text|-R|" &
       "-b|--ignore-space-change|--ignore-space-at-eol",
       okRefused, help = "docs/minimize-2.md §B4"),
   # And this one was never implemented at all.  `--no-renames` is in it because
@@ -198,6 +214,8 @@ proc applyDiffOpts*(p: Opts, o: var DiffOpts) =
                "': gittle detects no renames or copies, so only A, D, M and T occur")
     of "S": o.pickaxe = v
     of "abbrev": o.abbrev = parseInt(v)
+    of "no-color": o.color = false
+    of "color": o.color = resolveColor(v)
     else: discard
 
 # ---------------------------------------------------------------------------
@@ -445,16 +463,19 @@ proc writePatch(repo: Repository, p0: DiffPair, o: DiffOpts, out0: var string) =
   const aPre = "a/"
   const bPre = "b/"
 
-  out0.add "diff --git " & quoteTwo(aPre, p.oldName) & " " &
-           quoteTwo(bPre, p.path) & "\n"
+  template meta(s: string) =
+    ## One header line, coloured when colour is on.
+    if o.color: out0.add cBold & s & cReset & "\n" else: out0.add s & "\n"
+
+  meta "diff --git " & quoteTwo(aPre, p.oldName) & " " & quoteTwo(bPre, p.path)
 
   if p.oldMode != 0 and p.newMode != 0 and p.oldMode != p.newMode:
-    out0.add "old mode " & formatMode(p.oldMode) & "\n"
-    out0.add "new mode " & formatMode(p.newMode) & "\n"
+    meta "old mode " & formatMode(p.oldMode)
+    meta "new mode " & formatMode(p.newMode)
   elif p.oldMode == 0:
-    out0.add "new file mode " & formatMode(p.newMode) & "\n"
+    meta "new file mode " & formatMode(p.newMode)
   elif p.newMode == 0:
-    out0.add "deleted file mode " & formatMode(p.oldMode) & "\n"
+    meta "deleted file mode " & formatMode(p.oldMode)
 
   let a = repo.oldText(p)
   let b = repo.newText(p)
@@ -467,7 +488,7 @@ proc writePatch(repo: Repository, p0: DiffPair, o: DiffOpts, out0: var string) =
             repo.abbrevOf(o, p.oldOid, p.oldValid and p.oldMode != 0) & ".." &
             repo.abbrevOf(o, p.newOid, p.newValid and p.newMode != 0)
   if p.oldMode == p.newMode: idx.add " " & formatMode(p.oldMode)
-  out0.add idx & "\n"
+  meta idx
 
   if isBinary(a) or isBinary(b):
     # git names the two sides the way it named them above, `/dev/null` and all.
@@ -479,25 +500,44 @@ proc writePatch(repo: Repository, p0: DiffPair, o: DiffOpts, out0: var string) =
   let d = diffText(a, b, o.ctxLen, o.ws)
   if d.hunks.len == 0: return      # an empty creation: header only, no body
 
-  out0.add "--- " &
-           (if p.oldMode == 0: "/dev/null" else: quoteTwo(aPre, p.oldName)) & "\n"
-  out0.add "+++ " &
-           (if p.newMode == 0: "/dev/null" else: quoteTwo(bPre, p.path)) & "\n"
+  meta "--- " & (if p.oldMode == 0: "/dev/null" else: quoteTwo(aPre, p.oldName))
+  meta "+++ " & (if p.newMode == 0: "/dev/null" else: quoteTwo(bPre, p.path))
 
   for h in d.hunks:
     var hdr = "@@ -" & (if h.c1 == 0: $(h.s1 - 1) else: $h.s1) &
               (if h.c1 == 1: "" else: "," & $h.c1) &
               " +" & (if h.c2 == 0: $(h.s2 - 1) else: $h.s2) &
               (if h.c2 == 1: "" else: "," & $h.c2) & " @@"
-    out0.add hdr
+    if o.color: out0.add cCyan & hdr & cReset else: out0.add hdr
     if h.funcName.len > 0: out0.add " " & h.funcName
     out0.add "\n"
     for l in h.lines:
-      out0.add (case l.kind
-                of dlContext: " "
-                of dlDelete: "-"
-                of dlAdd: "+") & l.text & "\n"
-      if l.noNewline: out0.add "\\ No newline at end of file\n"
+      # Three shapes, and they are not symmetric (`diff.c:emit_line_0` and
+      # `emit_line_ws_markup`).  A context line has no colour of its own but
+      # still ends in a reset; a deleted line is one red span over the sign
+      # and the text together; an added line is *two* green spans, because
+      # git splits the marker from the content so that a whitespace error in
+      # the content could be repainted without disturbing the `+`.
+      if not o.color:
+        out0.add (case l.kind
+                  of dlContext: " "
+                  of dlDelete: "-"
+                  of dlAdd: "+") & l.text
+      else:
+        case l.kind
+        of dlContext: out0.add " " & l.text & cReset
+        of dlDelete: out0.add cRed & "-" & l.text & cReset
+        of dlAdd:
+          out0.add cGreen & "+" & cReset
+          if l.text.len > 0: out0.add cGreen & l.text & cReset
+      out0.add "\n"
+      if l.noNewline:
+        # git emits this through the *context* colour, which is empty by
+        # default -- so under `--color` it is the bare text plus a reset
+        # (`diff.c`, `DIFF_SYMBOL_CONTEXT_INCOMPLETE`).
+        out0.add "\\ No newline at end of file"
+        if o.color: out0.add cReset
+        out0.add "\n"
 
 proc splitTypeChange(pairs: seq[DiffPair]): seq[DiffPair] =
   ## A `T` pair becomes a deletion followed by a creation.
@@ -598,7 +638,12 @@ proc writeStat(repo: Repository, pairs: seq[DiffPair], o: DiffOpts,
     totalDel += r.deleted
     out0.add align($(r.added + r.deleted), numberWidth) &
              (if r.added + r.deleted > 0: " " else: "")
-    out0.add repeat('+', add) & repeat('-', del) & "\n"
+    if o.color:
+      if add > 0: out0.add cGreen & repeat('+', add) & cReset
+      if del > 0: out0.add cRed & repeat('-', del) & cReset
+    else:
+      out0.add repeat('+', add) & repeat('-', del)
+    out0.add "\n"
   out0.add summaryLine(rows.len, totalAdd, totalDel)
 
 func pathField(o: DiffOpts, path: string): string =

@@ -296,6 +296,7 @@ Subcommands: `push` (default), `save` (deprecated), `list`, `show`, `pop`,
 - [ ] `--show-stash` — Report how many stash entries exist.
 - [ ] `-v` / `--verbose` — Also show the staged diff (twice: the unstaged diff too).
 - [x] `-u[<mode>]` / `--untracked-files[=<mode>]` — *(core)* Control untracked reporting: `no`, `normal`, `all`.  `[log]`
+- [x] `--color[=<when>]` / `--no-color` — Colorize the long format: staged green, unmerged/unstaged/untracked red.  Machine formats are never colored.
 - [ ] `--ignored[=<mode>]` — Also report ignored files (`traditional`, `matching`, `no`).
   Cutting this removes only the ability to *display* ignored files; `status` still
   applies ignore rules to suppress them from untracked output.

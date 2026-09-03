@@ -45,8 +45,8 @@
 ## whose in-progress states have no command behind them in gittle.
 
 import std/[algorithm, os, sets, strutils]
-import diffcore, dir, ignore, index, objects, pathspec, refs, repository,
-       revision, revwalk, sequencer, util
+import color, diffcore, dir, ignore, index, objects, pathspec, refs,
+       repository, revision, revwalk, sequencer, util
 
 type
   Tracking* = object
@@ -456,7 +456,8 @@ proc header(st: Status, fmt: StatusFormat, branch: bool, sep: string): string =
     if st.initial: result.add "\nNo commits yet\n\n"
 
 proc renderStatus*(st: Status, fmt: StatusFormat, untracked: UntrackedMode,
-                   prefix: string, branch = false, nulTerm = false): string =
+                   prefix: string, branch = false, nulTerm = false,
+                   color = false): string =
   ## The report, in whichever of the four formats was asked for.
   ##
   ## `prefix` is the directory paths are printed relative to, and `""` prints
@@ -495,12 +496,22 @@ proc renderStatus*(st: Status, fmt: StatusFormat, untracked: UntrackedMode,
 
   result = header(st, fmt, branch, sep)
   if long: result.add inProgressBlock(st, rows[1].len > 0)
+  # git's default palette: staged rows are green, and unmerged, unstaged and
+  # untracked rows are all red (`wt-status.c`'s `WT_STATUS_UPDATED` versus its
+  # `_UNMERGED`/`_CHANGED`/`_UNTRACKED` colour slots) -- and only the long
+  # format paints at all, which is why `color` never reaches the branches
+  # below that build a machine format.
+  const sectionColor = [cGreen, cRed, cRed, cRed]
   for i, group in rows:
     if group.len == 0: continue
     # A long-format section is a heading, tab-indented rows and a blank line;
     # a machine-format one is the rows and nothing else.
     if long: result.add sectionHeadings[i] & ":\n"
-    for line in group: result.add (if long: "\t" & line & "\n" else: line & sep)
+    for line in group:
+      result.add (
+        if not long: line & sep
+        elif color: "\t" & sectionColor[i] & line & cReset & "\n"
+        else: "\t" & line & "\n")
     if long: result.add "\n"
   if not long: return
 
